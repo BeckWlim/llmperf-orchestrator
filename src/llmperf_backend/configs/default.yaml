@@ -1,0 +1,55 @@
+version: 1
+environment: "${LLMPERF_ENVIRONMENT:-development}"
+
+server:
+  host: "${LLMPERF_SERVER_HOST:-127.0.0.1}"
+  port: "${LLMPERF_SERVER_PORT:-8000}"
+  log_level: "${LLMPERF_LOG_LEVEL:-info}"
+  workers: "${LLMPERF_SERVER_WORKERS:-1}"
+  reload: "${LLMPERF_SERVER_RELOAD:-false}"
+
+database:
+  # The hostless URL uses the local PostgreSQL Unix socket and current Linux user.
+  url: "${DATABASE_URL:-postgresql+asyncpg:///llmperf}"
+  echo: "${LLMPERF_DATABASE_ECHO:-false}"
+  auto_create_schema: "${LLMPERF_DATABASE_AUTO_CREATE_SCHEMA:-true}"
+  pool_size: "${LLMPERF_DATABASE_POOL_SIZE:-5}"
+  max_overflow: "${LLMPERF_DATABASE_MAX_OVERFLOW:-10}"
+
+scheduler:
+  enabled: "${LLMPERF_RUNNER_ENABLED:-true}"
+  max_concurrent_runners: "${LLMPERF_MAX_CONCURRENT_RUNNERS:-1}"
+  poll_interval_seconds: "${LLMPERF_RUNNER_POLL_INTERVAL_SECONDS:-1.0}"
+  cancel_grace_seconds: "${LLMPERF_CANCEL_GRACE_SECONDS:-5.0}"
+  stale_after_seconds: "${LLMPERF_STALE_AFTER_SECONDS:-300}"
+  working_directory: "${LLMPERF_WORKING_DIRECTORY:-.}"
+  worker_module: llmperf_backend.worker
+  log_bytes_limit: "${LLMPERF_LOG_BYTES_LIMIT:-1000000}"
+
+auth:
+  # Enable after generating a trusted ctl private/public PEM key pair.
+  enabled: "${LLMPERF_AUTH_ENABLED:-false}"
+  public_key_path: "${LLMPERF_AUTH_PUBLIC_KEY_PATH:-.secrets/llmperfctl.pub}"
+  algorithm: RS256
+  bootstrap_subject: "${LLMPERF_BOOTSTRAP_SUBJECT:-xffan2}"
+  issuer: "${LLMPERF_AUTH_ISSUER:-llmperfctl}"
+  audience: "${LLMPERF_AUTH_AUDIENCE:-llmperf-api}"
+  leeway_seconds: "${LLMPERF_AUTH_LEEWAY_SECONDS:-5}"
+  reload_interval_seconds: "${LLMPERF_AUTH_RELOAD_INTERVAL_SECONDS:-1.0}"
+  previous_key_grace_seconds: "${LLMPERF_AUTH_PREVIOUS_KEY_GRACE_SECONDS:-120}"
+
+benchmark:
+  provider: "${LLMPERF_DEFAULT_PROVIDER:-default}"
+  model: "${LLMPERF_DEFAULT_MODEL:-meta-llama/Llama-2-7b-chat-hf}"
+  tokenizer:
+    id: "${LLMPERF_DEFAULT_TOKENIZER:-hf-internal-testing/llama-tokenizer}"
+    revision: main
+    use_fast: true
+  timeout_seconds: "${LLMPERF_TIMEOUT_SECONDS:-90}"
+  max_completed_requests: "${LLMPERF_MAX_COMPLETED_REQUESTS:-10}"
+  concurrent_requests: "${LLMPERF_CONCURRENT_REQUESTS:-1}"
+  mean_input_tokens: "${LLMPERF_MEAN_INPUT_TOKENS:-550}"
+  stddev_input_tokens: "${LLMPERF_STDDEV_INPUT_TOKENS:-150}"
+  mean_output_tokens: "${LLMPERF_MEAN_OUTPUT_TOKENS:-150}"
+  stddev_output_tokens: "${LLMPERF_STDDEV_OUTPUT_TOKENS:-80}"
+  additional_sampling_params: {}

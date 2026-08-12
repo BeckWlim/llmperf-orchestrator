@@ -18,13 +18,33 @@ from llmperf.common import SUPPORTED_APIS, construct_clients
 from llmperf.models import RequestConfig
 from llmperf.requests_launcher import RequestsLauncher
 from llmperf.utils import (
+    get_tokenizer,
     randomly_sample_sonnet_lines_prompt,
     LLMPerfResults,
     sample_random_positive_int,
 )
 from tqdm import tqdm
 
-from transformers import LlamaTokenizerFast
+def normalize_request_metrics(
+    request_metrics: Dict[str, Any], generated_text: str, get_token_length
+) -> Dict[str, Any]:
+    """Reconcile provider counters with tokenizer-derived output metrics safely."""
+
+    num_output_tokens = get_token_length(generated_text)
+    inter_token_latency_sum = request_metrics.get(common_metrics.INTER_TOKEN_LAT, 0)
+    request_metrics[common_metrics.INTER_TOKEN_LAT] = (
+        inter_token_latency_sum / num_output_tokens if num_output_tokens else 0
+    )
+    request_metrics[common_metrics.NUM_OUTPUT_TOKENS] = num_output_tokens
+    request_metrics[common_metrics.NUM_TOTAL_TOKENS] = (
+        request_metrics.get(common_metrics.NUM_INPUT_TOKENS, 0) + num_output_tokens
+    )
+    end_to_end_latency = request_metrics.get(common_metrics.E2E_LAT, 0)
+    request_metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = (
+        num_output_tokens / end_to_end_latency if end_to_end_latency > 0 else 0
+    )
+    return request_metrics
+
 
 def get_token_throughput_latencies(
     model: str,
@@ -60,10 +80,10 @@ def get_token_throughput_latencies(
     """
     random.seed(11111)
 
-    tokenizer = LlamaTokenizerFast.from_pretrained(
-        "hf-internal-testing/llama-tokenizer"
+    tokenizer = get_tokenizer()
+    get_token_length = lambda text: len(
+        tokenizer.encode(text, add_special_tokens=False)
     )
-    get_token_length = lambda text: len(tokenizer.encode(text))
     
     if not additional_sampling_params:
         additional_sampling_params = {}
@@ -102,11 +122,15 @@ def get_token_throughput_latencies(
 
             default_sampling_params = {"max_tokens": num_output_tokens_list[request_index] }
             default_sampling_params.update(additional_sampling_params)
+            remaining_seconds = max(
+                0.1, test_timeout_s - (time.monotonic() - start_time) - 1
+            )
             request_config = RequestConfig(
                 model=model,
                 prompt=prompts[request_index],
                 sampling_params=default_sampling_params,
                 llm_api=llm_api,
+                timeout_seconds=remaining_seconds,
             )
             req_launcher.launch_requests(request_config)
 
@@ -114,16 +138,11 @@ def get_token_throughput_latencies(
             all_metrics = []
             for out in outs:
                 request_metrics, gen_text, _ = out
-                num_output_tokens = get_token_length(gen_text)
+                request_metrics = normalize_request_metrics(
+                    request_metrics, gen_text, get_token_length
+                )
                 with completed_requests_lock:
                     if num_completed_requests < max_num_completed_requests:
-                        if num_output_tokens:
-                            request_metrics[common_metrics.INTER_TOKEN_LAT] /= request_metrics[common_metrics.NUM_OUTPUT_TOKENS]
-                        else:
-                            request_metrics[common_metrics.INTER_TOKEN_LAT] = 0
-                        request_metrics[common_metrics.NUM_OUTPUT_TOKENS] = num_output_tokens
-                        request_metrics[common_metrics.NUM_TOTAL_TOKENS] = request_metrics[common_metrics.NUM_INPUT_TOKENS] + num_output_tokens
-                        request_metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = num_output_tokens / request_metrics[common_metrics.E2E_LAT]
                         all_metrics.append(request_metrics)
                         completed_requests.extend(all_metrics)
                         pbar.update(len(all_metrics))
@@ -141,7 +160,8 @@ def get_token_throughput_latencies(
 
     pbar.close()
     end_time = time.monotonic()
-    if end_time - start_time >= test_timeout_s:
+    timed_out = end_time - start_time >= test_timeout_s
+    if timed_out:
         print("Test timed out before all requests could be completed.")
 
     # check one last time that there are no remaining results to collect.
@@ -151,19 +171,15 @@ def get_token_throughput_latencies(
     all_metrics = []
     for out in outs:
         request_metrics, gen_text, _ = out
-        num_output_tokens = get_token_length(gen_text)
+        request_metrics = normalize_request_metrics(
+            request_metrics, gen_text, get_token_length
+        )
         with completed_requests_lock:
             if num_completed_requests < max_num_completed_requests:
-                if num_output_tokens:
-                    request_metrics[common_metrics.INTER_TOKEN_LAT] /= num_output_tokens
-                else:
-                    request_metrics[common_metrics.INTER_TOKEN_LAT] = 0
-                request_metrics[common_metrics.NUM_OUTPUT_TOKENS] = num_output_tokens
-                request_metrics[common_metrics.NUM_TOTAL_TOKENS] = request_metrics[common_metrics.NUM_INPUT_TOKENS] + num_output_tokens
-                request_metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = num_output_tokens / request_metrics[common_metrics.E2E_LAT]
-                completed_requests.extend(request_metrics)
+                completed_requests.append(request_metrics)
+                num_completed_requests += 1
 
-    print(f"\Results for token benchmark for {model} queried with the {llm_api} api.\n")
+    print(f"Results for token benchmark for {model} queried with the {llm_api} api.\n")
     ret = metrics_summary(completed_requests, start_time, end_time)
 
     metadata = {
@@ -174,6 +190,7 @@ def get_token_throughput_latencies(
         "stddev_output_tokens": stddev_output_tokens,
         "num_concurrent_requests": num_concurrent_requests,
         "additional_sampling_params": additional_sampling_params,
+        "timed_out": timed_out,
     }
 
     metadata["results"] = ret
@@ -206,6 +223,34 @@ def metrics_summary(
                 - User throughput (tokens / s)
     """
     ret = {}
+    metric_keys = [
+        common_metrics.INTER_TOKEN_LAT,
+        common_metrics.TTFT,
+        common_metrics.E2E_LAT,
+        common_metrics.REQ_OUTPUT_THROUGHPUT,
+        common_metrics.NUM_INPUT_TOKENS,
+        common_metrics.NUM_OUTPUT_TOKENS,
+    ]
+
+    if not metrics:
+        for key in metric_keys:
+            ret[key] = {
+                "quantiles": {
+                    name: None for name in ("p25", "p50", "p75", "p90", "p95", "p99")
+                },
+                "mean": None,
+                "min": None,
+                "max": None,
+                "stddev": None,
+            }
+        ret[common_metrics.NUM_REQ_STARTED] = 0
+        ret[common_metrics.ERROR_RATE] = 0
+        ret[common_metrics.NUM_ERRORS] = 0
+        ret[common_metrics.ERROR_CODE_FREQ] = {}
+        ret[common_metrics.OUTPUT_THROUGHPUT] = 0
+        ret[common_metrics.NUM_COMPLETED_REQUESTS] = 0
+        ret[common_metrics.COMPLETED_REQUESTS_PER_MIN] = 0
+        return ret
 
     def flatten(item):
         for sub_item in item:
@@ -217,14 +262,7 @@ def metrics_summary(
     df = pd.DataFrame(metrics)
     df_without_errored_req = df[df[common_metrics.ERROR_CODE].isna()]
     
-    for key in [
-        common_metrics.INTER_TOKEN_LAT,
-        common_metrics.TTFT,
-        common_metrics.E2E_LAT,
-        common_metrics.REQ_OUTPUT_THROUGHPUT,
-        common_metrics.NUM_INPUT_TOKENS,
-        common_metrics.NUM_OUTPUT_TOKENS
-    ]:
+    for key in metric_keys:
         print(key)
         ret[key] = {}
         series = pd.Series(list(flatten(df_without_errored_req[key]))).dropna()
@@ -252,23 +290,27 @@ def metrics_summary(
     ret[common_metrics.ERROR_RATE] = num_errors / len(metrics) if len(metrics) else 0
     ret[common_metrics.NUM_ERRORS] = num_errors
     print(f"Number Of Errored Requests: {num_errors}")
-    error_code_frequency = dict(error_codes.value_counts())
+    error_code_frequency = {
+        str(code): int(count) for code, count in error_codes.value_counts().items()
+    }
     if num_errors:
-        error_code_frequency = dict(error_codes.value_counts())
         print("Error Code Frequency")
         print(error_code_frequency)
-    ret[common_metrics.ERROR_CODE_FREQ] = str(error_code_frequency)
+    ret[common_metrics.ERROR_CODE_FREQ] = error_code_frequency
 
-    overall_output_throughput = df_without_errored_req[
-        common_metrics.NUM_OUTPUT_TOKENS
-    ].sum() / (end_time - start_time)
+    duration = end_time - start_time
+    overall_output_throughput = (
+        df_without_errored_req[common_metrics.NUM_OUTPUT_TOKENS].sum() / duration
+        if duration > 0
+        else 0
+    )
 
     print(f"Overall Output Throughput: {overall_output_throughput}")
     ret[common_metrics.OUTPUT_THROUGHPUT] = overall_output_throughput
 
     num_completed_requests = len(df_without_errored_req)
     num_completed_requests_per_min = (
-        num_completed_requests / (end_time - start_time) * 60
+        num_completed_requests / duration * 60 if duration > 0 else 0
     )
     print(f"Number Of Completed Requests: {num_completed_requests}")
     print(f"Completed Requests Per Minute: {num_completed_requests_per_min}")

@@ -1,15 +1,45 @@
 import json
+from functools import lru_cache
 import math
+import os
 import pathlib
 import random
 import subprocess
 import time
 from typing import Any, Dict, Tuple
 
-from transformers import LlamaTokenizerFast
+from transformers import AutoTokenizer
 
 
 RESULTS_VERSION = "2023-08-31"
+DEFAULT_TOKENIZER_ID = "hf-internal-testing/llama-tokenizer"
+TOKENIZER_PATH_ENV = "LLMPERF_TOKENIZER_PATH"
+TOKENIZER_USE_FAST_ENV = "LLMPERF_TOKENIZER_USE_FAST"
+
+
+@lru_cache(maxsize=1)
+def get_tokenizer():
+    """Load one tokenizer per process, preferring an explicit local directory."""
+
+    configured_path = os.environ.get(TOKENIZER_PATH_ENV)
+    if configured_path:
+        tokenizer_path = pathlib.Path(configured_path).expanduser()
+        if not tokenizer_path.is_dir():
+            raise ValueError(
+                f"{TOKENIZER_PATH_ENV} must point to a tokenizer directory: "
+                f"{tokenizer_path}"
+            )
+        load_options = {"local_files_only": True}
+        configured_use_fast = os.environ.get(TOKENIZER_USE_FAST_ENV)
+        if configured_use_fast is not None:
+            load_options["use_fast"] = configured_use_fast.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        return AutoTokenizer.from_pretrained(str(tokenizer_path), **load_options)
+    return AutoTokenizer.from_pretrained(DEFAULT_TOKENIZER_ID)
 
 
 class LLMPerfResults:
@@ -60,8 +90,7 @@ def randomly_sample_sonnet_lines_prompt(
     prompt_tokens_mean: int = 550,
     prompt_tokens_stddev: int = 250,
     expect_output_tokens: int = 150,
-    tokenizer = LlamaTokenizerFast.from_pretrained(
-        "hf-internal-testing/llama-tokenizer")
+    tokenizer=None,
 ) -> Tuple[str, int]:
     """Generate a prompt that randomly samples lines from a the shakespeare sonnet at sonnet.txt.
 
@@ -73,15 +102,15 @@ def randomly_sample_sonnet_lines_prompt(
         will be approximately this many tokens.
 
     Note:
-        tokens will be counted from the sonnet using the Llama tokenizer. Using one tokenizer
-        ensures a fairer comparison across different LLMs. For example, if gpt 3.5 tokenizes
-        a prompt in less tokens than Llama2, then this will be reflected in the results since
-        they will be fed identical prompts.
+        Tokens are counted with the configured benchmark tokenizer. Using one tokenizer
+        ensures a consistent comparison across different LLM providers.
 
     Returns:
         A tuple of the prompt and the length of the prompt.
     """
 
+    if tokenizer is None:
+        tokenizer = get_tokenizer()
     get_token_length = lambda text: len(tokenizer.encode(text))
 
     prompt = (

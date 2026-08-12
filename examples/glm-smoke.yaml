@@ -1,0 +1,25 @@
+# Minimal end-to-end task used to verify API -> PostgreSQL -> Runner -> LLMPerf.
+label: glm-smoke-1x1
+
+metadata:
+  test_type: smoke
+  purpose: verify-end-to-end-persistence
+
+benchmark:
+  # Must match a model ID returned by the configured /v1/models endpoint.
+  provider: aliyun
+  model: glm-5.2
+  # The backend resolves this revision and caches local-only Worker artifacts.
+  tokenizer:
+    id: THUDM/glm-4-9b-chat
+    revision: main
+    use_fast: true
+  timeout_seconds: 30
+  max_completed_requests: 1
+  concurrent_requests: 1
+  mean_input_tokens: 64
+  stddev_input_tokens: 0
+  mean_output_tokens: 16
+  stddev_output_tokens: 0
+  additional_sampling_params:
+    temperature: 0

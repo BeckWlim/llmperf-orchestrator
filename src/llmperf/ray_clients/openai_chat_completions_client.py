@@ -11,6 +11,56 @@ from llmperf.models import RequestConfig
 from llmperf import common_metrics
 
 
+class OpenAIStreamError(RuntimeError):
+    def __init__(self, message: str, code: Any = -1):
+        super().__init__(message)
+        self.code = code
+
+
+def decode_sse_line(chunk: bytes) -> Dict[str, Any]:
+    """Decode one OpenAI-compatible SSE line without assuming a text choice."""
+
+    line = chunk.strip()
+    if not line or line.startswith(b":") or not line.startswith(b"data:"):
+        return {"kind": "ignore"}
+    payload = line[len(b"data:") :].strip()
+    if payload == b"[DONE]":
+        return {"kind": "done"}
+    if not payload:
+        return {"kind": "ignore"}
+
+    document = json.loads(payload)
+    if not isinstance(document, dict):
+        raise ValueError("SSE data payload must be a JSON object")
+    provider_error = document.get("error")
+    if provider_error:
+        if isinstance(provider_error, dict):
+            message = str(provider_error.get("message") or provider_error)
+            code = provider_error.get("code", -1)
+        else:
+            message = str(provider_error)
+            code = -1
+        raise OpenAIStreamError(message, code)
+
+    choices = document.get("choices") or []
+    if not choices:
+        return {"kind": "metadata"}
+    if not isinstance(choices, list) or not isinstance(choices[0], dict):
+        raise ValueError("SSE choices must be a list of objects")
+    delta = choices[0].get("delta") or {}
+    if not isinstance(delta, dict):
+        raise ValueError("SSE choice delta must be an object")
+
+    segments = []
+    for field in ("reasoning_content", "content"):
+        value = delta.get(field)
+        if isinstance(value, str) and value:
+            segments.append(value)
+    if not segments:
+        return {"kind": "metadata"}
+    return {"kind": "text", "text": "".join(segments)}
+
+
 @ray.remote
 class OpenAIChatCompletionsClient(LLMClient):
     """Client for OpenAI Chat Completions API."""
@@ -59,12 +109,13 @@ class OpenAIChatCompletionsClient(LLMClient):
         if not address.endswith("/"):
             address = address + "/"
         address += "chat/completions"
+        request_timeout = request_config.timeout_seconds or 180
         try:
             with requests.post(
                 address,
                 json=body,
                 stream=True,
-                timeout=180,
+                timeout=request_timeout,
                 headers=headers,
             ) as response:
                 if response.status_code != 200:
@@ -72,44 +123,48 @@ class OpenAIChatCompletionsClient(LLMClient):
                     error_response_code = response.status_code
                     response.raise_for_status()
                 for chunk in response.iter_lines(chunk_size=None):
-                    chunk = chunk.strip()
-
-                    if not chunk:
+                    event = decode_sse_line(chunk)
+                    if event["kind"] in {"ignore", "metadata"}:
                         continue
-                    stem = "data: "
-                    chunk = chunk[len(stem) :]
-                    if chunk == b"[DONE]":
-                        continue
+                    if event["kind"] == "done":
+                        break
+                    text = event["text"]
                     tokens_received += 1
-                    data = json.loads(chunk)
+                    if not ttft:
+                        ttft = time.monotonic() - start_time
+                        time_to_next_token.append(ttft)
+                    else:
+                        time_to_next_token.append(
+                            time.monotonic() - most_recent_received_token_time
+                        )
+                    most_recent_received_token_time = time.monotonic()
+                    generated_text += text
 
-                    if "error" in data:
-                        error_msg = data["error"]["message"]
-                        error_response_code = data["error"]["code"]
-                        raise RuntimeError(data["error"]["message"])
-                        
-                    delta = data["choices"][0]["delta"]
-                    if delta.get("content", None):
-                        if not ttft:
-                            ttft = time.monotonic() - start_time
-                            time_to_next_token.append(ttft)
-                        else:
-                            time_to_next_token.append(
-                                time.monotonic() - most_recent_received_token_time
-                            )
-                        most_recent_received_token_time = time.monotonic()
-                        generated_text += delta["content"]
+            if not generated_text:
+                raise ValueError("Stream completed without text content")
 
-            total_request_time = time.monotonic() - start_time
-            output_throughput = tokens_received / total_request_time
-
-        except Exception as e:
+        except OpenAIStreamError as exc:
+            error_response_code = exc.code
+            if not error_msg:
+                error_msg = str(exc)
             metrics[common_metrics.ERROR_MSG] = error_msg
             metrics[common_metrics.ERROR_CODE] = error_response_code
-            print(f"Warning Or Error: {e}")
+            print(f"Warning Or Error: {exc}")
             print(error_response_code)
+        except Exception as exc:
+            if not error_msg:
+                error_msg = f"{type(exc).__name__}: {exc}"
+            metrics[common_metrics.ERROR_MSG] = error_msg
+            metrics[common_metrics.ERROR_CODE] = error_response_code
+            print(f"Warning Or Error: {error_msg}")
+            print(error_response_code)
+        finally:
+            total_request_time = time.monotonic() - start_time
+            output_throughput = (
+                tokens_received / total_request_time if total_request_time > 0 else 0
+            )
 
-        metrics[common_metrics.INTER_TOKEN_LAT] = sum(time_to_next_token) #This should be same as metrics[common_metrics.E2E_LAT]. Leave it here for now
+        metrics[common_metrics.INTER_TOKEN_LAT] = sum(time_to_next_token)
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
         metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = output_throughput

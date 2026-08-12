@@ -35,7 +35,7 @@
 *.pyc
 python/.eggs
 *.egg-info
-
+.venv
 # Backup files
 *.bak
 
@@ -129,6 +129,11 @@ scripts/nodes.txt
 .llvm-local.bazelrc
 
 # Sensitive or high-churn files:
+.env
+.env.*
+!.env.template
+.secrets/
+
 .idea/**/dataSources/
 .idea/**/dataSources.ids
 .idea/**/dataSources.xml

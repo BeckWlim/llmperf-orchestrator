@@ -9,6 +9,243 @@ cd llmperf
 pip install -e .
 ```
 
+Ray is part of the benchmark execution path: request clients run as Ray Actors.
+The project therefore installs `ray[default]`, not the minimal `ray` package;
+the default extra supplies the dashboard, event, and metrics-agent dependencies
+used during `ray.init()`. If an existing environment was created with minimal
+Ray, refresh it with `python -m pip install -e .` before running benchmarks.
+
+## Configuration Backend
+
+LLMPerf includes an optional FastAPI backend for validating and reloading YAML
+runtime configuration. The default configuration is packaged at
+`src/llmperf_backend/configs/default.yaml`.
+
+Start the backend after installation:
+
+```bash
+cp .env.template .env
+# Edit DATABASE_URL, the model endpoint, and credentials in .env.
+llmperf-backend
+```
+
+The backend automatically loads `.env` from its current working directory.
+Exported process variables take precedence. Set `LLMPERF_ENV_FILE` before
+startup to select another dotenv file; changing dotenv values requires a
+service restart. Workers and Ray actors inherit the resolved provider
+credentials, while task payloads and JSON exports never contain those secrets.
+
+`.env.template` intentionally contains only PostgreSQL, provider credentials,
+default provider/model, and a few optional service controls. Benchmark workload
+parameters belong in submitted YAML. The real `.env`, `.env.*`, and `.secrets/`
+are ignored by Git; `.env.template` is the only allowed dotenv template.
+
+Each submitted Runner can select its own tokenizer. The backend resolves and caches
+the tokenizer before accepting the Runner, records the resolved revision with the
+immutable benchmark configuration, and gives the Worker only a local directory:
+
+```yaml
+benchmark:
+  provider: aliyun
+  model: glm-5.2
+  tokenizer:
+    id: THUDM/glm-4-9b-chat
+    revision: main
+    use_fast: true
+```
+
+`source` defaults to `huggingface`. Remote tokenizer code is never trusted or
+executed. Cache location and offline-only lookup are controlled by the backend:
+
+```dotenv
+LLMPERF_TOKENIZER_CACHE_DIR=/var/cache/llmperf/tokenizers
+LLMPERF_TOKENIZER_PROXY=http://proxy.example.com:3128
+LLMPERF_TOKENIZER_LOCAL_FILES_ONLY=false
+```
+
+`LLMPERF_TOKENIZER_PROXY` is passed directly to Transformers for both HTTP and
+HTTPS Hugging Face requests. It is useful when the backend service cannot see a
+desktop or system proxy. Standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`
+environment variables remain available for process-wide networking.
+
+Workers always pass `local_files_only=True`, fail immediately when their resolved
+directory is invalid, and cache one tokenizer instance per process. Runner YAML
+that omits `tokenizer` uses the backend default
+`hf-internal-testing/llama-tokenizer`, resolved through the same cache.
+
+To use another configuration file, set its path before starting the server:
+
+```bash
+export LLMPERF_BACKEND_CONFIG=/path/to/backend.yaml
+llmperf-backend
+```
+
+The backend exposes:
+
+- `GET /health`
+- `GET /api/v1/scheduler/status`
+- `GET /api/v1/providers`
+- `GET /api/v1/providers/{provider_id}/models`
+- `GET /api/v1/config`
+- `GET /api/v1/config/schema`
+- `POST /api/v1/config/validate`
+- `POST /api/v1/config/reload`
+- `POST/GET /api/v1/campaigns`
+- `GET /api/v1/campaigns/{campaign_id}`
+- `POST /api/v1/campaigns/{campaign_id}/cancel`
+- `POST /api/v1/campaigns/{campaign_id}/runners`
+- `GET /api/v1/campaigns/{campaign_id}/export`
+- `POST/GET /api/v1/runners`
+- `POST /api/v1/runners/{runner_id}/cancel`
+- `GET /api/v1/runners/{runner_id}/results`
+- `GET /api/v1/runners/{runner_id}/export`
+
+YAML environment placeholders use `${NAME}` for required values or
+`${NAME:-default}` for optional values. Configuration files are parsed with
+`yaml.safe_load`; keep API keys and other secrets in environment variables.
+
+The backend also provides PostgreSQL-backed asynchronous task orchestration.
+Results are committed to the database first and JSON is generated only through
+the export endpoints. See [the architecture guide](docs/ARCHITECTURE.md) for the
+data model, task state machine, API, and lightweight `llmperfctl` workflow.
+
+Provider credentials are backend-owned profiles. A task selects only a profile
+and a model, so its YAML does not carry an API key or endpoint:
+
+```dotenv
+LLMPERF_PROVIDER_DEEPSEEK_URL=https://api.deepseek.com/v1
+LLMPERF_PROVIDER_DEEPSEEK_KEY=replace-with-real-key
+LLMPERF_DEFAULT_PROVIDER=deepseek
+LLMPERF_DEFAULT_MODEL=deepseek-chat
+```
+
+For an OpenAI-compatible endpoint, `ADAPTER=openai`, model discovery through
+`/models`, and a 300-second cache are inferred. At least one Provider Profile is
+required; legacy `API_BASE`, `API_KEY`, `LLM_API`, and implicit `default`
+Provider fields and implicit `default` profiles are not supported.
+
+```yaml
+label: deepseek-smoke
+benchmark:
+  provider: deepseek
+  model: deepseek-chat
+  timeout_seconds: 30
+  max_completed_requests: 1
+  concurrent_requests: 1
+  mean_input_tokens: 64
+  stddev_input_tokens: 0
+  mean_output_tokens: 16
+  stddev_output_tokens: 0
+```
+
+The backend derives `llm_api`, endpoint, and key from the selected profile.
+Inspect configured profiles and discover the models visible to a profile key
+through the CLI:
+
+```bash
+llmperfctl provider list
+llmperfctl provider models deepseek
+llmperfctl provider models deepseek --refresh
+```
+
+Discovery uses the provider's configured `/models` endpoint when compatible,
+or an administrator-maintained static model list. It establishes catalog
+visibility for the key, not that a completion request will succeed.
+
+For example, upload and orchestrate a complete GLM campaign with:
+
+```bash
+llmperfctl campaign start -f examples/glm-campaign.yaml --wait
+```
+
+The public control model has four distinct responsibilities:
+
+- `Scheduler`: backend-owned queue consumer; query with
+  `llmperfctl scheduler status`.
+- `Runner`: one durable benchmark execution; manage with
+  `runner start/status/list/wait/cancel/logs/export`.
+- `Worker`: temporary subprocess for one Runner attempt; its PID, exit code,
+  stdout, and stderr are reported through Runner status/logs.
+- `Campaign`: durable grouping of Runners; manage with
+  `campaign start/status/list/cancel/export`.
+
+Schedulers and Workers follow the backend lifecycle and cannot be started
+directly through the remote CLI.
+
+`runner start` is non-blocking by default. It prints submission logs to stderr,
+prints the accepted Runner (including `runner_id` and `status`) to stdout, and
+then exits so the ID can be used later:
+
+```bash
+llmperfctl runner start -f examples/glm-smoke.yaml
+llmperfctl runner status RUNNER_ID
+```
+
+Wait explicitly with `-w` or `--wait`:
+
+```bash
+llmperfctl runner start -f examples/glm-smoke.yaml -w
+```
+
+Runner listings use a compact table and return at most 20 rows by default:
+
+```bash
+llmperfctl runner list
+llmperfctl runner list --status failed --limit 10
+llmperfctl runner list --json   # lightweight machine-readable records
+llmperfctl runner list --full   # complete Runners, summaries, stdout and stderr
+```
+
+The default list API is also a lightweight projection, so large benchmark
+summaries and captured logs are not transferred only to be hidden by the CLI.
+Use `full=true` (or CLI `--full`) only for diagnostics.
+The CLI and backend use one strict list-response contract.
+
+`runner wait` and `runner start --wait` print a compact outcome by default. Add
+`--full` only when the complete Runner document and captured stdout/stderr are
+needed. Status transitions (`queued`, `running`, terminal status) are printed as
+timestamped logs on stderr as they occur; JSON/table results remain on stdout.
+Set `--log-level debug` or `LLMPERFCTL_LOG_LEVEL=debug` for more CLI detail.
+Interactive terminals highlight log levels by default. Use `--color always` when
+redirecting to a color-capable viewer, `--color never` for plain output, or
+`LLMPERFCTL_LOG_COLOR` as the CLI default. Backend and Worker logs use
+`LLMPERF_LOG_COLOR=auto|always|never`.
+`runner status RUNNER_ID --summary` provides the same compact view.
+A failed or cancelled waited Runner exits with code 2 for shell/CI use.
+`--timeout` limits only local CLI waiting and does not cancel the durable Runner.
+
+A Worker process exiting normally is not sufficient for benchmark success.
+Runners with zero completed model requests are stored as `failed` together with
+their summary and request errors; partially successful runs remain `succeeded`
+with `summary.outcome.status=degraded`. Failed runs with persisted results can
+still be exported for diagnosis.
+
+The benchmark `timeout_seconds` also bounds each OpenAI-compatible HTTP request;
+the client no longer uses an unrelated fixed 180-second timeout. This prevents
+a stalled provider request from making a short smoke run appear hung.
+
+When neither `--token` nor `--private-key` is supplied, `llmperfctl` discovers
+secure, unencrypted RSA private keys in `~/.ssh` and retries the request with the
+next key only after an HTTP 401 response. It prioritizes `~/.ssh/llmperfctl` and
+`~/.ssh/id_rsa`. Use `--ssh-dir`, `LLMPERF_SSH_DIR`, or
+`--no-key-discovery` to control this behavior. Explicit credentials always win.
+
+The API can trust only designated CLI instances using a fixed PEM public key.
+The service verifies short-lived RS256 tokens while `llmperfctl` retains the
+private key and refreshes tokens automatically. Setup and key-generation steps
+are documented in [the architecture guide](docs/ARCHITECTURE.md#固定公钥认证配置).
+
+Initialize a PostgreSQL database explicitly with:
+
+```bash
+psql -v ON_ERROR_STOP=1 -d llmperf -f sql/postgresql/init.sql
+```
+
+The SQL creates task, metric, user, trusted-key, and audit tables but does not
+seed a database superuser. Bootstrap public-key authentication handles the
+first trusted CLI call. Real PostgreSQL repository tests are opt-in through
+`LLMPERF_TEST_DATABASE_URL`; details are in the architecture guide.
+
 # Basic Usage
 
 We implement 2 tests for evaluating LLMs: a load test to check for performance and a correctness test to check for correctness.
@@ -348,13 +585,13 @@ The correctness tests were implemented with the following workflow in mind:
 
 ```python
 import ray
-from transformers import LlamaTokenizerFast
 
 from llmperf.ray_clients.openai_chat_completions_client import (
     OpenAIChatCompletionsClient,
 )
 from llmperf.models import RequestConfig
 from llmperf.requests_launcher import RequestsLauncher
+from llmperf.utils import get_tokenizer
 
 
 # Copying the environment variables and passing them to ray.init() is necessary
@@ -363,9 +600,7 @@ ray.init(runtime_env={"env_vars": {"OPENAI_API_BASE" : "https://api.endpoints.an
                                    "OPENAI_API_KEY" : "YOUR_API_KEY"}})
 
 base_prompt = "hello_world"
-tokenizer = LlamaTokenizerFast.from_pretrained(
-    "hf-internal-testing/llama-tokenizer"
-)
+tokenizer = get_tokenizer()
 base_prompt_len = len(tokenizer.encode(base_prompt))
 prompt = (base_prompt, base_prompt_len)
 

@@ -1,0 +1,21 @@
+# Minimal end-to-end task for a DeepSeek OpenAI-compatible endpoint.
+label: deepseek-smoke-1x1
+
+metadata:
+  test_type: smoke
+  provider: aliyun
+  purpose: verify-end-to-end-persistence
+
+benchmark:
+  # Replace this with the exact ID returned by the configured /v1/models API.
+  provider: aliyun
+  model: deepseek-v4-pro
+  timeout_seconds: 30
+  max_completed_requests: 1
+  concurrent_requests: 1
+  mean_input_tokens: 64
+  stddev_input_tokens: 0
+  mean_output_tokens: 16
+  stddev_output_tokens: 0
+  additional_sampling_params:
+    temperature: 0
