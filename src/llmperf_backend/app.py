@@ -13,6 +13,7 @@ from llmperf_backend.auth import TokenVerifier, normalize_public_key
 from llmperf_backend.config import ConfigError, ConfigStore, ConfigSnapshot
 from llmperf_backend.models import (
     BenchmarkCampaignCreate,
+    BenchmarkCampaignStart,
     BenchmarkRunnerBatchCreate,
     BenchmarkRunnerCreate,
     TrustedClientWrite,
@@ -38,6 +39,7 @@ from llmperf_backend.providers import (
 )
 from llmperf_backend.scheduler import Scheduler
 from llmperf_backend.tokenizers import TokenizerCache, TokenizerResolutionError
+from llmperf_backend.datasets import DatasetCache
 
 
 RUNNER_STATUSES = {QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED}
@@ -72,6 +74,7 @@ def create_app(
     provider_registry: Optional[ProviderRegistry] = None,
     model_discovery: Optional[ProviderModelDiscovery] = None,
     tokenizer_cache: Optional[TokenizerCache] = None,
+    dataset_cache: Optional[DatasetCache] = None,
 ) -> FastAPI:
     store = config_store or ConfigStore()
     validated_config = store.current()
@@ -80,6 +83,7 @@ def create_app(
     providers = provider_registry or ProviderRegistry.from_environment()
     discovery = model_discovery or ProviderModelDiscovery(providers)
     tokenizers = tokenizer_cache or TokenizerCache()
+    datasets = dataset_cache or DatasetCache()
     token_verifier = TokenVerifier(validated_config.auth, repository)
     active_scheduler = scheduler or Scheduler(
         repository,
@@ -87,6 +91,7 @@ def create_app(
         validated_config.database,
         providers,
         tokenizers,
+        datasets,
     )
 
     @asynccontextmanager
@@ -113,6 +118,7 @@ def create_app(
     application.state.provider_registry = providers
     application.state.model_discovery = discovery
     application.state.tokenizer_cache = tokenizers
+    application.state.dataset_cache = datasets
     api = APIRouter(
         prefix="/api/v1",
         dependencies=[Depends(token_verifier)],
@@ -233,6 +239,42 @@ def create_app(
         actor = require_role(request, "operator")
         return await request.app.state.runner_repository.create_campaign(
             payload.name, payload.description, payload.tags, actor
+        )
+
+    @api.post(
+        "/campaigns/start",
+        tags=["campaigns", "runners"],
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def start_campaign(
+        request: Request, payload: BenchmarkCampaignStart
+    ) -> Dict[str, Any]:
+        """Validate first, then atomically persist a Campaign and its Runners."""
+
+        actor = require_role(request, "operator")
+        default_benchmark = request.app.state.config_store.snapshot().config[
+            "benchmark"
+        ]
+        runners = []
+        for runner in payload.runners:
+            benchmark = (
+                default_benchmark
+                if runner.benchmark is None
+                else dump_model(runner.benchmark)
+            )
+            runners.append(
+                {
+                    "label": runner.label,
+                    "metadata": runner.metadata,
+                    "benchmark": await resolve_benchmark(request, benchmark),
+                }
+            )
+        return await request.app.state.runner_repository.create_campaign_with_runners(
+            payload.campaign.name,
+            payload.campaign.description,
+            payload.campaign.tags,
+            runners,
+            actor,
         )
 
     @api.post(

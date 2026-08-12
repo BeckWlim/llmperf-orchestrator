@@ -63,10 +63,11 @@ LLMPERF_TOKENIZER_PROXY=http://proxy.example.com:3128
 LLMPERF_TOKENIZER_LOCAL_FILES_ONLY=false
 ```
 
-`LLMPERF_TOKENIZER_PROXY` is passed directly to Transformers for both HTTP and
-HTTPS Hugging Face requests. It is useful when the backend service cannot see a
-desktop or system proxy. Standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`
-environment variables remain available for process-wide networking.
+`LLMPERF_TOKENIZER_PROXY` is shared by tokenizer and dataset resolution and is
+passed directly to their HTTP and HTTPS Hugging Face requests. It is useful when
+the backend service cannot see a desktop or system proxy. Standard `HTTP_PROXY`,
+`HTTPS_PROXY`, and `NO_PROXY` environment variables remain available for
+process-wide networking.
 
 Workers always pass `local_files_only=True`, fail immediately when their resolved
 directory is invalid, and cache one tokenizer instance per process. Runner YAML
@@ -158,6 +159,38 @@ For example, upload and orchestrate a complete GLM campaign with:
 llmperfctl campaign start -f examples/glm-campaign.yaml --wait
 ```
 
+`campaign start` validates every Runner and creates the Campaign, Runners, and
+initial Runner events in one database transaction. A rejected Runner batch does
+not leave an empty Campaign behind. Empty Campaigns created by older two-request
+CLI versions remain valid historical records but can contain no results.
+
+To measure provider-reported KV-cache reuse with the standard ShareGPT serving
+dataset, select a persistent backend cache and run the DeepSeek campaign:
+
+```bash
+# Set this in the backend service environment (or its .env), then restart it:
+LLMPERF_DATASET_CACHE_DIR=/var/cache/llmperf/datasets
+
+# Run the client after the backend is ready:
+llmperfctl campaign start \
+  -f examples/deepseek-v4-pro-kvcache-campaign.yaml --full
+```
+
+The CLI submits the Hugging Face dataset specification from the Campaign and
+receives queued Runners immediately. The Scheduler downloads the declared
+artifact once, stores it under `LLMPERF_DATASET_CACHE_DIR` (default
+`~/.cache/llmperf/datasets`), and gives Workers only its resolved local path.
+Large downloads therefore cannot time out the Runner-submission HTTP request;
+download failures become durable failed Runner outcomes. Hugging Face's standard
+environment variables control authentication, proxies, and offline operation.
+
+The unique control issues eight different first-turn prompts. The repeated
+workload samples two different prompts and issues each four times, matching the
+repeat strategy used by vLLM's automatic-prefix-caching benchmark. Look for
+`summary.results.kv_cache.hit_ratio` in each completed Runner. Input prompts are
+filtered to 1,024-5,120 tokens; change `mean_input_tokens` and
+`stddev_input_tokens` together to select another range.
+
 The public control model has four distinct responsibilities:
 
 - `Scheduler`: backend-owned queue consumer; query with
@@ -185,6 +218,7 @@ Wait explicitly with `-w` or `--wait`:
 
 ```bash
 llmperfctl runner start -f examples/glm-smoke.yaml -w
+llmperfctl runner status RUNNER_ID -w
 ```
 
 Runner listings use a compact table and return at most 20 rows by default:
@@ -210,9 +244,20 @@ Interactive terminals highlight log levels by default. Use `--color always` when
 redirecting to a color-capable viewer, `--color never` for plain output, or
 `LLMPERFCTL_LOG_COLOR` as the CLI default. Backend and Worker logs use
 `LLMPERF_LOG_COLOR=auto|always|never`.
-`runner status RUNNER_ID --summary` provides the same compact view.
+`runner status RUNNER_ID --summary` provides the same compact view, and adding
+`--wait` reconnects to an already submitted Runner until it becomes terminal.
 A failed or cancelled waited Runner exits with code 2 for shell/CI use.
 `--timeout` limits only local CLI waiting and does not cancel the durable Runner.
+
+Campaign status is aggregate by default. Request the complete JSON report,
+including Runner summaries and captured logs, with `--full`; add
+`--include-requests` for individual request metrics:
+
+```bash
+llmperfctl campaign status CAMPAIGN_ID --full
+llmperfctl campaign status CAMPAIGN_ID --full --include-requests
+llmperfctl campaign export CAMPAIGN_ID -o campaign-report.json
+```
 
 A Worker process exiting normally is not sufficient for benchmark success.
 Runners with zero completed model requests are stored as `failed` together with

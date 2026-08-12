@@ -10,6 +10,7 @@ from typing import Any, Dict, Sequence, Tuple
 from llmperf import common_metrics
 from llmperf.logging import configure_logging
 from llmperf_backend.models import DatabaseConfig
+from llmperf_backend.datasets import WORKER_DATASET_PATH_ENV
 from llmperf_backend.persistence import (
     Database,
     FAILED,
@@ -34,6 +35,16 @@ def _calculate(
     runtime_environment.pop(WORKER_DATABASE_URL_ENV, None)
     ray.init(runtime_env={"env_vars": runtime_environment})
     try:
+        dataset = benchmark.get("dataset")
+        dataset_path = None
+        dataset_format = "sharegpt"
+        if dataset is not None:
+            dataset_path = os.environ.get(WORKER_DATASET_PATH_ENV)
+            if not dataset_path:
+                raise RuntimeError(
+                    f"{WORKER_DATASET_PATH_ENV} is required for dataset workloads"
+                )
+            dataset_format = dataset["format"]
         return get_token_throughput_latencies(
             model=benchmark["model"],
             llm_api=benchmark["llm_api"],
@@ -42,6 +53,11 @@ def _calculate(
             num_concurrent_requests=benchmark["concurrent_requests"],
             mean_input_tokens=benchmark["mean_input_tokens"],
             stddev_input_tokens=benchmark["stddev_input_tokens"],
+            shared_prefix_tokens=benchmark.get("shared_prefix_tokens", 0),
+            dataset_path=dataset_path,
+            dataset_format=dataset_format,
+            dataset_repeat_count=benchmark.get("dataset_repeat_count", 1),
+            dataset_seed=benchmark.get("dataset_seed", 11111),
             mean_output_tokens=benchmark["mean_output_tokens"],
             stddev_output_tokens=benchmark["stddev_output_tokens"],
             additional_sampling_params=benchmark["additional_sampling_params"],

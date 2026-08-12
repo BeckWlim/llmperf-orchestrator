@@ -27,10 +27,6 @@ class FakeClient:
     def __init__(self):
         self.payloads = []
 
-    def create_campaign(self, name, description, tags):
-        assert name == "glm-study"
-        return {"campaign_id": "campaign-1"}
-
     def start_runner(self, payload):
         self.payloads.append(payload)
         return {
@@ -46,6 +42,18 @@ class FakeClient:
             payload["campaign_id"] = campaign_id
             payloads.append(self.start_runner(payload))
         return {"items": payloads}
+
+    def create_campaign_with_runners(self, campaign, runners):
+        assert campaign["name"] == "glm-study"
+        payloads = []
+        for runner in runners:
+            payload = dict(runner)
+            payload["campaign_id"] = "campaign-1"
+            payloads.append(self.start_runner(payload))
+        return {
+            "campaign": {"campaign_id": "campaign-1"},
+            "items": payloads,
+        }
 
 
 def test_campaign_start(tmp_path):
@@ -76,6 +84,26 @@ runners:
     assert result["campaign_id"] == "campaign-1"
     assert result["runners"][0]["runner_id"] == "runner-1"
     assert client.payloads[0]["campaign_id"] == "campaign-1"
+
+
+def test_campaign_status_full_uses_export_report():
+    class CampaignClient:
+        def export_campaign(self, campaign_id, include_requests=False):
+            return {
+                "campaign": {"campaign_id": campaign_id},
+                "aggregate": {"runner_count": 1},
+                "runners": [{"requests": []}] if include_requests else [{}],
+            }
+
+    arguments = build_parser().parse_args(
+        ["campaign", "status", "campaign-1", "--full", "--include-requests"]
+    )
+
+    report = execute(CampaignClient(), arguments)
+
+    assert report["campaign"]["campaign_id"] == "campaign-1"
+    assert report["aggregate"]["runner_count"] == 1
+    assert report["runners"][0]["requests"] == []
 
 
 def _write_rsa_private_key(path):
@@ -252,6 +280,24 @@ ARG_CASES = [
     pytest.param(
         {
             "argv": [
+                "campaign",
+                "status",
+                "campaign-1",
+                "--full",
+                "--include-requests",
+            ],
+            "expected": {
+                "campaign_command": "status",
+                "campaign_id": "campaign-1",
+                "full": True,
+                "include_requests": True,
+            },
+        },
+        id="campaign-status-full",
+    ),
+    pytest.param(
+        {
+            "argv": [
                 "runner",
                 "start",
                 "-f",
@@ -270,6 +316,30 @@ ARG_CASES = [
             },
         },
         id="runner-wait",
+    ),
+    pytest.param(
+        {
+            "argv": [
+                "runner",
+                "status",
+                "runner-1",
+                "-w",
+                "--poll-interval",
+                "0.25",
+                "--timeout",
+                "30",
+                "--summary",
+            ],
+            "expected": {
+                "runner_command": "status",
+                "runner_id": "runner-1",
+                "wait": True,
+                "poll_interval": 0.25,
+                "timeout": 30,
+                "summary": True,
+            },
+        },
+        id="runner-status-wait",
     ),
     pytest.param(
         {
@@ -467,6 +537,45 @@ def test_wait_summary(caplog):
     assert "Runner runner-1 status: failed" in caplog.text
     assert "Runner runner-1: No benchmark requests completed" in caplog.text
     assert _has_unsuccessful_runner(reports) is True
+
+
+def test_status_wait_reconnects_to_existing_runner():
+    class SucceededRunnerClient:
+        def get_runner(self, runner_id):
+            return {
+                "runner_id": runner_id,
+                "status": "succeeded",
+                "label": "recovered",
+                "benchmark": {
+                    "provider": "aliyun",
+                    "model": "deepseek-v4-pro",
+                },
+                "summary": {
+                    "results": {
+                        "num_requests_started": 8,
+                        "num_completed_requests": 8,
+                        "number_errors": 0,
+                        "error_rate": 0,
+                    },
+                    "outcome": {
+                        "status": "succeeded",
+                        "requests_started": 8,
+                        "requests_completed": 8,
+                        "requests_failed": 0,
+                        "message": "8 benchmark requests completed",
+                    },
+                },
+            }
+
+    arguments = build_parser().parse_args(
+        ["runner", "status", "runner-1", "--wait", "--summary"]
+    )
+
+    result = execute(SucceededRunnerClient(), arguments)
+
+    assert result["runner_id"] == "runner-1"
+    assert result["status"] == "succeeded"
+    assert result["requests"]["completed"] == 8
 
 
 def test_worker_error_summary():

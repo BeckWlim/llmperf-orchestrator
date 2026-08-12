@@ -44,7 +44,11 @@ def decode_sse_line(chunk: bytes) -> Dict[str, Any]:
 
     choices = document.get("choices") or []
     if not choices:
-        return {"kind": "metadata"}
+        event = {"kind": "metadata"}
+        usage = document.get("usage")
+        if isinstance(usage, dict):
+            event["usage"] = usage
+        return event
     if not isinstance(choices, list) or not isinstance(choices[0], dict):
         raise ValueError("SSE choices must be a list of objects")
     delta = choices[0].get("delta") or {}
@@ -59,6 +63,41 @@ def decode_sse_line(chunk: bytes) -> Dict[str, Any]:
     if not segments:
         return {"kind": "metadata"}
     return {"kind": "text", "text": "".join(segments)}
+
+
+def cache_metrics_from_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize cache token counters from OpenAI-compatible providers."""
+
+    hit_tokens = usage.get("prompt_cache_hit_tokens")
+    miss_tokens = usage.get("prompt_cache_miss_tokens")
+
+    if hit_tokens is None:
+        details = usage.get("prompt_tokens_details")
+        total_tokens = usage.get("prompt_tokens")
+        if not isinstance(details, dict):
+            details = usage.get("input_tokens_details")
+            total_tokens = usage.get("input_tokens")
+        if isinstance(details, dict):
+            hit_tokens = details.get("cached_tokens")
+            if hit_tokens is not None and total_tokens is not None:
+                miss_tokens = max(0, total_tokens - hit_tokens)
+
+    if hit_tokens is None:
+        return {}
+    if miss_tokens is None:
+        total_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+        if total_tokens is None:
+            return {common_metrics.KV_CACHE_HIT_TOKENS: hit_tokens}
+        miss_tokens = max(0, total_tokens - hit_tokens)
+
+    cacheable_tokens = hit_tokens + miss_tokens
+    return {
+        common_metrics.KV_CACHE_HIT_TOKENS: hit_tokens,
+        common_metrics.KV_CACHE_MISS_TOKENS: miss_tokens,
+        common_metrics.KV_CACHE_HIT_RATE: (
+            hit_tokens / cacheable_tokens if cacheable_tokens else 0
+        ),
+    }
 
 
 @ray.remote
@@ -89,6 +128,7 @@ class OpenAIChatCompletionsClient(LLMClient):
         error_msg = ""
         output_throughput = 0
         total_request_time = 0
+        usage = {}
 
         metrics = {}
 
@@ -124,7 +164,10 @@ class OpenAIChatCompletionsClient(LLMClient):
                     response.raise_for_status()
                 for chunk in response.iter_lines(chunk_size=None):
                     event = decode_sse_line(chunk)
-                    if event["kind"] in {"ignore", "metadata"}:
+                    if event["kind"] == "metadata":
+                        usage.update(event.get("usage") or {})
+                        continue
+                    if event["kind"] == "ignore":
                         continue
                     if event["kind"] == "done":
                         break
@@ -171,5 +214,6 @@ class OpenAIChatCompletionsClient(LLMClient):
         metrics[common_metrics.NUM_TOTAL_TOKENS] = tokens_received + prompt_len
         metrics[common_metrics.NUM_OUTPUT_TOKENS] = tokens_received
         metrics[common_metrics.NUM_INPUT_TOKENS] = prompt_len
+        metrics.update(cache_metrics_from_usage(usage))
 
         return metrics, generated_text, request_config

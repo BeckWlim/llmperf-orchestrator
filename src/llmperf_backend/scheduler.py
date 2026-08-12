@@ -23,6 +23,10 @@ from llmperf_backend.tokenizers import (
     WORKER_TOKENIZER_PATH_ENV,
     WORKER_TOKENIZER_USE_FAST_ENV,
 )
+from llmperf_backend.datasets import (
+    DatasetCache,
+    WORKER_DATASET_PATH_ENV,
+)
 
 
 WORKER_DATABASE_URL_ENV = "LLMPERF_WORKER_DATABASE_URL"
@@ -39,12 +43,14 @@ class Scheduler:
         database_config: DatabaseConfig,
         provider_registry: ProviderRegistry,
         tokenizer_cache: Optional[TokenizerCache] = None,
+        dataset_cache: Optional[DatasetCache] = None,
     ):
         self.repository = repository
         self.config = config
         self.database_config = database_config
         self.provider_registry = provider_registry
         self.tokenizer_cache = tokenizer_cache or TokenizerCache()
+        self.dataset_cache = dataset_cache or DatasetCache()
         self.scheduler_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
         self._slots: List[asyncio.Task] = []
         self._stop: Optional[asyncio.Event] = None
@@ -153,6 +159,10 @@ class Scheduler:
             environment[WORKER_TOKENIZER_USE_FAST_ENV] = (
                 "true" if resolution.use_fast else "false"
             )
+        dataset = runner["benchmark"].get("dataset")
+        if dataset is not None:
+            resolution = await self.dataset_cache.resolve(dataset)
+            environment[WORKER_DATASET_PATH_ENV] = str(resolution.path)
         return environment
 
     async def _execute(self, runner: Dict[str, Any]) -> None:

@@ -154,6 +154,15 @@ class LLMPerfClient:
             {"runners": runners},
         )
 
+    def create_campaign_with_runners(
+        self, campaign: Dict[str, Any], runners: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v1/campaigns/start",
+            {"campaign": campaign, "runners": runners},
+        )
+
     def list_runners(
         self,
         status: Optional[str] = None,

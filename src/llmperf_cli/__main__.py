@@ -1,15 +1,18 @@
 """Command-line task orchestration and export client."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import getpass
 import json
 import logging
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
 import yaml
+from tqdm import tqdm
 
 from llmperf.logging import LOG_COLOR_MODES, LOG_LEVELS, configure_logging
 from llmperf_cli.client import ClientError, LLMPerfClient, write_json
@@ -73,6 +76,27 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 
 def print_json(document: Any) -> None:
     print(json.dumps(document, ensure_ascii=False, indent=2, default=str))
+
+
+def submit_with_artifact_progress(action):
+    """Render one indicator for backend tokenizer and dataset resolution."""
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(action)
+        if future.done():
+            return future.result()
+        with tqdm(
+            total=None,
+            desc="Backend artifact download/cache lookup",
+            file=sys.stderr,
+            dynamic_ncols=True,
+            leave=False,
+            bar_format="{desc}: {elapsed}",
+        ) as progress:
+            while not future.done():
+                time.sleep(1)
+                progress.refresh()
+        return future.result()
 
 
 def _table_value(value: Any, default: str = "-") -> str:
@@ -272,13 +296,6 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
     campaign_spec = plan.get("campaign")
     if not isinstance(campaign_spec, dict) or not campaign_spec.get("name"):
         raise ClientError("campaign.start file must define campaign.name")
-    campaign = client.create_campaign(
-        campaign_spec["name"],
-        campaign_spec.get("description"),
-        campaign_spec.get("tags", {}),
-    )
-    campaign_id = campaign["campaign_id"]
-    LOGGER.info("Campaign created: %s", campaign_id)
     runners = plan.get("runners")
     if not isinstance(runners, list) or not runners:
         raise ClientError("campaign.start file must define a non-empty runners list")
@@ -287,7 +304,13 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
         if not isinstance(runner, dict):
             raise ClientError(f"plan.runners[{index}] must be a mapping")
         prepared_runners.append(dict(runner))
-    batch = client.start_campaign_runners(campaign_id, prepared_runners)
+    batch = submit_with_artifact_progress(
+        lambda: client.create_campaign_with_runners(
+            campaign_spec, prepared_runners
+        )
+    )
+    campaign_id = batch["campaign"]["campaign_id"]
+    LOGGER.info("Campaign created: %s", campaign_id)
     created = batch["items"]
     runner_ids = [runner["runner_id"] for runner in created]
     LOGGER.info("Submitted %d Runner(s) to Campaign %s", len(created), campaign_id)
@@ -625,10 +648,25 @@ Examples:
         "status",
         help="Show aggregate Campaign status",
         description="Show Campaign metadata and aggregate Runner status counts.",
-        epilog="Example:\n  llmperfctl campaign status <campaign-id>",
+        epilog=(
+            "Examples:\n"
+            "  llmperfctl campaign status <campaign-id>\n"
+            "  llmperfctl campaign status <campaign-id> --full\n"
+            "  llmperfctl campaign status <campaign-id> --full --include-requests"
+        ),
     )
     campaign_status.add_argument(
         "campaign_id", metavar="CAMPAIGN_ID", help="Campaign identifier"
+    )
+    campaign_status.add_argument(
+        "--full",
+        action="store_true",
+        help="Return complete Campaign and Runner result documents",
+    )
+    campaign_status.add_argument(
+        "--include-requests",
+        action="store_true",
+        help="Include per-request metrics; implies --full",
     )
     campaign_list = _command_parser(
         campaign_commands,
@@ -759,6 +797,7 @@ Examples:
         epilog="""\
 Examples:
   llmperfctl runner status <runner-id>
+  llmperfctl runner status <runner-id> --wait
   llmperfctl runner status <runner-id> --summary
 """,
     )
@@ -769,6 +808,25 @@ Examples:
         "--summary",
         action="store_true",
         help="Print a compact outcome instead of the complete Runner",
+    )
+    runner_status.add_argument(
+        "-w",
+        "--wait",
+        action="store_true",
+        help="Reconnect and wait until the Runner reaches a terminal state",
+    )
+    runner_status.add_argument(
+        "--poll-interval",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="Status polling interval while waiting (default: 2)",
+    )
+    runner_status.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Maximum local wait time; does not cancel the Runner",
     )
     runner_list = _command_parser(
         runner_commands,
@@ -910,6 +968,11 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
         if arguments.campaign_command == "start":
             return start_campaign(client, arguments)
         if arguments.campaign_command == "status":
+            if arguments.full or arguments.include_requests:
+                return client.export_campaign(
+                    arguments.campaign_id,
+                    include_requests=arguments.include_requests,
+                )
             return client.get_campaign(arguments.campaign_id)
         if arguments.campaign_command == "list":
             return client.list_campaigns(arguments.limit, arguments.offset)
@@ -933,7 +996,9 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
                 "Validating and submitting Runner (request timeout: %g seconds)",
                 arguments.request_timeout,
             )
-            created = client.start_runner(payload)
+            created = submit_with_artifact_progress(
+                lambda: client.start_runner(payload)
+            )
             runner_id = created["runner_id"]
             runner_status = created.get("status", "submitted")
             LOGGER.info("Runner accepted: %s (%s)", runner_id, runner_status)
@@ -953,6 +1018,14 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
                 full_output=arguments.full,
             )[0]
         if arguments.runner_command == "status":
+            if arguments.wait:
+                return wait_for_runners(
+                    client,
+                    [arguments.runner_id],
+                    arguments.poll_interval,
+                    arguments.timeout,
+                    full_output=not arguments.summary,
+                )[0]
             runner = client.get_runner(arguments.runner_id)
             return summarize_runner(runner) if arguments.summary else runner
         if arguments.runner_command == "list":

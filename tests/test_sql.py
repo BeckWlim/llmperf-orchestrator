@@ -1,4 +1,4 @@
-"""Opt-in repository tests against a dedicated disposable PostgreSQL database."""
+"""Opt-in tests against a dedicated disposable PostgreSQL database."""
 
 import asyncio
 import os

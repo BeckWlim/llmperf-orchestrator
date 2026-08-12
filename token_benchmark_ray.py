@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import time
 import random
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -46,12 +47,75 @@ def normalize_request_metrics(
     return request_metrics
 
 
+def sample_sharegpt_requests(
+    dataset_path: str,
+    num_requests: int,
+    repeat_count: int,
+    min_input_tokens: int,
+    max_input_tokens: int,
+    get_token_length,
+    seed: int = 11111,
+) -> List[Tuple[str, int]]:
+    """Sample and repeat first-turn ShareGPT prompts like vLLM's APC benchmark."""
+
+    path = Path(dataset_path).expanduser()
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"Unable to read ShareGPT dataset {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"ShareGPT dataset is not valid JSON: {path}") from exc
+    if not isinstance(document, list):
+        raise ValueError("ShareGPT dataset must be a JSON array")
+
+    candidates = []
+    for record in document:
+        if not isinstance(record, dict):
+            continue
+        conversations = record.get("conversations")
+        if not isinstance(conversations, list) or len(conversations) < 2:
+            continue
+        first_turn = conversations[0]
+        if not isinstance(first_turn, dict):
+            continue
+        prompt = first_turn.get("value")
+        if not isinstance(prompt, str) or not prompt:
+            continue
+        candidates.append(prompt)
+
+    rng = random.Random(seed)
+    rng.shuffle(candidates)
+    unique_request_count = math.ceil(num_requests / repeat_count)
+    sampled = []
+    for prompt in candidates:
+        prompt_len = get_token_length(prompt)
+        if min_input_tokens <= prompt_len <= max_input_tokens:
+            sampled.append((prompt, prompt_len))
+            if len(sampled) == unique_request_count:
+                break
+    if len(sampled) < unique_request_count:
+        raise ValueError(
+            "ShareGPT dataset has only "
+            f"{len(sampled)} matching prompts; {unique_request_count} required in "
+            f"token range {min_input_tokens}:{max_input_tokens}"
+        )
+
+    repeated = (sampled * repeat_count)[:num_requests]
+    rng.shuffle(repeated)
+    return repeated
+
+
 def get_token_throughput_latencies(
     model: str,
     mean_input_tokens: int,
     stddev_input_tokens: int,
     mean_output_tokens: int,
     stddev_output_tokens: int,
+    shared_prefix_tokens: int = 0,
+    dataset_path: Optional[str] = None,
+    dataset_format: str = "sharegpt",
+    dataset_repeat_count: int = 1,
+    dataset_seed: int = 11111,
     additional_sampling_params: Optional[Dict[str, Any]] = None,
     num_concurrent_requests: int = 1,
     max_num_completed_requests: int = 500,
@@ -64,6 +128,11 @@ def get_token_throughput_latencies(
         model: The name of the model to query.
         mean_input_tokens: The mean number of tokens to send in the prompt for the request.
         stddev_input_tokens: The standard deviation of the number of tokens to send in the prompt for the request.
+        shared_prefix_tokens: Number of leading prompt tokens reused by every request.
+        dataset_path: Optional path to a ShareGPT JSON dataset.
+        dataset_format: Dataset schema. Currently only ``sharegpt`` is supported.
+        dataset_repeat_count: Number of times to issue every sampled dataset prompt.
+        dataset_seed: Seed used to select and order dataset prompts.
         mean_output_tokens: The mean number of tokens to generate per request.
         stddev_output_tokens: The standard deviation of the number of tokens to generate per request.
         additional_sampling_params: Additional sampling parameters to send with the request.
@@ -91,21 +160,53 @@ def get_token_throughput_latencies(
     completed_requests_lock = threading.Lock()
     completed_requests = []
     num_completed_requests = 0
-    # make up prompts outside of send loop for faster benchmarking loop
-    num_output_tokens_list = []
-    prompts = []
-    for i in range(max_num_completed_requests):
-        num_output_tokens = (sample_random_positive_int(
-            mean_output_tokens, stddev_output_tokens
-        ))
-        num_output_tokens_list.append(num_output_tokens)
+    if shared_prefix_tokens >= mean_input_tokens:
+        raise ValueError("shared_prefix_tokens must be less than mean_input_tokens")
+    if dataset_path and shared_prefix_tokens:
+        raise ValueError("dataset_path and shared_prefix_tokens cannot be used together")
+    if dataset_path and dataset_format != "sharegpt":
+        raise ValueError(f"Unsupported dataset format: {dataset_format}")
+    if dataset_repeat_count < 1:
+        raise ValueError("dataset_repeat_count must be at least 1")
 
-        prompts.append(randomly_sample_sonnet_lines_prompt(
-            prompt_tokens_mean=mean_input_tokens,
-            prompt_tokens_stddev=stddev_input_tokens,
-            expect_output_tokens=num_output_tokens,
-            tokenizer=tokenizer
-        ))
+    # Make up prompts outside of the send loop for faster benchmarking. A shared
+    # prefix creates a controlled provider KV-cache workload while each suffix
+    # remains unique.
+    num_output_tokens_list = [
+        sample_random_positive_int(mean_output_tokens, stddev_output_tokens)
+        for _ in range(max_num_completed_requests)
+    ]
+    if dataset_path:
+        min_input_tokens = max(1, mean_input_tokens - stddev_input_tokens)
+        max_input_tokens = mean_input_tokens + stddev_input_tokens
+        prompts = sample_sharegpt_requests(
+            dataset_path=dataset_path,
+            num_requests=max_num_completed_requests,
+            repeat_count=dataset_repeat_count,
+            min_input_tokens=min_input_tokens,
+            max_input_tokens=max_input_tokens,
+            get_token_length=get_token_length,
+            seed=dataset_seed,
+        )
+    else:
+        prompts = []
+        shared_prefix = ""
+        if shared_prefix_tokens:
+            shared_prefix, _ = randomly_sample_sonnet_lines_prompt(
+                prompt_tokens_mean=shared_prefix_tokens,
+                prompt_tokens_stddev=0,
+                expect_output_tokens=mean_output_tokens,
+                tokenizer=tokenizer,
+            )
+        for i in range(max_num_completed_requests):
+            suffix = randomly_sample_sonnet_lines_prompt(
+                prompt_tokens_mean=mean_input_tokens - shared_prefix_tokens,
+                prompt_tokens_stddev=stddev_input_tokens,
+                expect_output_tokens=num_output_tokens_list[i],
+                tokenizer=tokenizer
+            )[0]
+            prompt = shared_prefix + suffix
+            prompts.append((prompt, get_token_length(prompt)))
     start_time = time.monotonic()
     pbar = tqdm(total=max_num_completed_requests)
 
@@ -186,6 +287,11 @@ def get_token_throughput_latencies(
         "model": model,
         "mean_input_tokens": mean_input_tokens,
         "stddev_input_tokens": stddev_input_tokens,
+        "shared_prefix_tokens": shared_prefix_tokens,
+        "dataset_path": dataset_path,
+        "dataset_format": dataset_format if dataset_path else None,
+        "dataset_repeat_count": dataset_repeat_count if dataset_path else None,
+        "dataset_seed": dataset_seed if dataset_path else None,
         "mean_output_tokens": mean_output_tokens,
         "stddev_output_tokens": stddev_output_tokens,
         "num_concurrent_requests": num_concurrent_requests,
@@ -250,6 +356,12 @@ def metrics_summary(
         ret[common_metrics.OUTPUT_THROUGHPUT] = 0
         ret[common_metrics.NUM_COMPLETED_REQUESTS] = 0
         ret[common_metrics.COMPLETED_REQUESTS_PER_MIN] = 0
+        ret[common_metrics.KV_CACHE] = {
+            "measured_requests": 0,
+            "hit_tokens": 0,
+            "miss_tokens": 0,
+            "hit_ratio": None,
+        }
         return ret
 
     def flatten(item):
@@ -317,6 +429,32 @@ def metrics_summary(
 
     ret[common_metrics.NUM_COMPLETED_REQUESTS] = num_completed_requests
     ret[common_metrics.COMPLETED_REQUESTS_PER_MIN] = num_completed_requests_per_min
+
+    cache_metrics = (
+        df_without_errored_req.dropna(
+            subset=[common_metrics.KV_CACHE_HIT_TOKENS],
+        )
+        if common_metrics.KV_CACHE_HIT_TOKENS in df_without_errored_req
+        else pd.DataFrame()
+    )
+    cache_hit_tokens = (
+        cache_metrics[common_metrics.KV_CACHE_HIT_TOKENS].sum()
+        if not cache_metrics.empty
+        else 0
+    )
+    cache_miss_tokens = (
+        cache_metrics[common_metrics.KV_CACHE_MISS_TOKENS].sum()
+        if not cache_metrics.empty
+        and common_metrics.KV_CACHE_MISS_TOKENS in cache_metrics
+        else 0
+    )
+    cache_tokens = cache_hit_tokens + cache_miss_tokens
+    ret[common_metrics.KV_CACHE] = {
+        "measured_requests": len(cache_metrics),
+        "hit_tokens": cache_hit_tokens,
+        "miss_tokens": cache_miss_tokens,
+        "hit_ratio": cache_hit_tokens / cache_tokens if cache_tokens else None,
+    }
     
     return ret
 

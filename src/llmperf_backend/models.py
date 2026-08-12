@@ -34,6 +34,16 @@ class TokenizerSpec(StrictModel):
     use_fast: bool = True
 
 
+class DatasetSpec(StrictModel):
+    """A backend-resolved Hugging Face dataset artifact."""
+
+    source: Literal["huggingface"] = "huggingface"
+    id: str = Field(min_length=1, max_length=200)
+    filename: str = Field(min_length=1, max_length=500)
+    revision: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    format: Literal["sharegpt"] = "sharegpt"
+
+
 class BenchmarkConfig(StrictModel):
     """Defaults matching the existing token benchmark command-line options."""
 
@@ -47,6 +57,10 @@ class BenchmarkConfig(StrictModel):
     concurrent_requests: int = Field(default=1, gt=0)
     mean_input_tokens: int = Field(default=550, gt=0)
     stddev_input_tokens: int = Field(default=150, ge=0)
+    shared_prefix_tokens: int = Field(default=0, ge=0)
+    dataset: Optional[DatasetSpec] = None
+    dataset_repeat_count: int = Field(default=1, ge=1)
+    dataset_seed: int = 11111
     mean_output_tokens: int = Field(default=150, gt=0)
     stddev_output_tokens: int = Field(default=80, ge=0)
     additional_sampling_params: Dict[str, Any] = Field(default_factory=dict)
@@ -132,6 +146,13 @@ class BenchmarkCampaignCreate(StrictModel):
     name: str = Field(min_length=1, max_length=200)
     description: Optional[str] = Field(default=None, max_length=2000)
     tags: Dict[str, Any] = Field(default_factory=dict)
+
+
+class BenchmarkCampaignStart(StrictModel):
+    """Atomically create one Campaign and its initial Runners."""
+
+    campaign: BenchmarkCampaignCreate
+    runners: List[BenchmarkRunnerSpec] = Field(min_items=1, max_items=100)
 
 
 class TrustedClientWrite(StrictModel):

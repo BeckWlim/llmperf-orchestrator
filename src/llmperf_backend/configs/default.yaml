@@ -50,6 +50,10 @@ benchmark:
   concurrent_requests: "${LLMPERF_CONCURRENT_REQUESTS:-1}"
   mean_input_tokens: "${LLMPERF_MEAN_INPUT_TOKENS:-550}"
   stddev_input_tokens: "${LLMPERF_STDDEV_INPUT_TOKENS:-150}"
+  shared_prefix_tokens: "${LLMPERF_SHARED_PREFIX_TOKENS:-0}"
+  dataset: null
+  dataset_repeat_count: 1
+  dataset_seed: 11111
   mean_output_tokens: "${LLMPERF_MEAN_OUTPUT_TOKENS:-150}"
   stddev_output_tokens: "${LLMPERF_STDDEV_OUTPUT_TOKENS:-80}"
   additional_sampling_params: {}

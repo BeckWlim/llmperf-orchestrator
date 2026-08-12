@@ -387,6 +387,49 @@ class RunnerRepository:
             await session.flush()
         return self._campaign_dict(campaign)
 
+    async def create_campaign_with_runners(
+        self,
+        name: str,
+        description: Optional[str],
+        tags: Dict[str, Any],
+        runners: Sequence[Dict[str, Any]],
+        created_by: str,
+    ) -> Dict[str, Any]:
+        """Create a Campaign and all initial Runners in one transaction."""
+
+        campaign = BenchmarkCampaignRecord(
+            id=str(uuid4()),
+            name=name,
+            description=description,
+            tags=json_safe(tags),
+            created_by=created_by,
+        )
+        records = [
+            BenchmarkRunnerRecord(
+                id=str(uuid4()),
+                campaign_id=campaign.id,
+                label=runner.get("label"),
+                created_by=created_by,
+                status=QUEUED,
+                benchmark_config=json_safe(runner["benchmark"]),
+                user_metadata=json_safe(runner.get("metadata", {})),
+            )
+            for runner in runners
+        ]
+        async with self.database.sessions() as session, session.begin():
+            session.add(campaign)
+            session.add_all(records)
+            await session.flush()
+            session.add_all(
+                self._event(runner.id, QUEUED, "Runner accepted in Campaign")
+                for runner in records
+            )
+            await session.flush()
+        return {
+            "campaign": self._campaign_dict(campaign),
+            "items": [_runner_dict(runner) for runner in records],
+        }
+
     @staticmethod
     def _campaign_dict(campaign: BenchmarkCampaignRecord) -> Dict[str, Any]:
         return {
@@ -832,19 +875,7 @@ class RunnerRepository:
                     request_map.setdefault(record.runner_id, []).append(record.metrics)
             for runner in runner_records:
                 status_counts[runner.status] = status_counts.get(runner.status, 0) + 1
-                item = {
-                    "runner_id": runner.id,
-                    "label": runner.label,
-                    "status": runner.status,
-                    "benchmark": runner.benchmark_config,
-                    "metadata": runner.user_metadata,
-                    "created_at": runner.created_at,
-                    "started_at": runner.started_at,
-                    "finished_at": runner.finished_at,
-                    "summary": runner.summary,
-                    "request_count": runner.request_count,
-                    "error_message": runner.error_message,
-                }
+                item = _runner_dict(runner)
                 if include_requests:
                     item["requests"] = request_map.get(runner.id, [])
                 runners.append(item)
