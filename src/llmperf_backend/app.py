@@ -2,6 +2,8 @@
 
 from contextlib import asynccontextmanager
 import copy
+from datetime import datetime, timezone
+import logging
 import re
 from typing import Any, Dict, Optional
 
@@ -16,6 +18,8 @@ from llmperf_backend.models import (
     BenchmarkCampaignStart,
     BenchmarkRunnerBatchCreate,
     BenchmarkRunnerCreate,
+    RunnerPlanCreate,
+    RunnerPlanPreview,
     TrustedClientWrite,
     YAMLValidationRequest,
     app_config_schema,
@@ -30,7 +34,9 @@ from llmperf_backend.persistence import (
     Database,
     RunnerRepository,
     json_safe,
+    PLAN_STATUSES,
 )
+from llmperf_backend.planner import Planner, preview_fires
 from llmperf_backend.providers import (
     ProviderConfigError,
     ProviderDiscoveryError,
@@ -39,10 +45,11 @@ from llmperf_backend.providers import (
 )
 from llmperf_backend.scheduler import Scheduler
 from llmperf_backend.tokenizers import TokenizerCache, TokenizerResolutionError
-from llmperf_backend.datasets import DatasetCache
+from llmperf_backend.datasets import DatasetCache, DatasetResolutionError
 
 
 RUNNER_STATUSES = {QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED}
+LOGGER = logging.getLogger(__name__)
 
 
 def _redact_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -75,6 +82,7 @@ def create_app(
     model_discovery: Optional[ProviderModelDiscovery] = None,
     tokenizer_cache: Optional[TokenizerCache] = None,
     dataset_cache: Optional[DatasetCache] = None,
+    planner: Optional[Planner] = None,
 ) -> FastAPI:
     store = config_store or ConfigStore()
     validated_config = store.current()
@@ -93,15 +101,18 @@ def create_app(
         tokenizers,
         datasets,
     )
+    active_planner = planner or Planner(repository, validated_config.planner)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         if validated_config.database.auto_create_schema:
             await db.create_schema()
-        await active_scheduler.start()
         try:
+            await active_planner.start()
+            await active_scheduler.start()
             yield
         finally:
+            await active_planner.stop()
             await active_scheduler.stop()
             await db.dispose()
 
@@ -115,6 +126,7 @@ def create_app(
     application.state.database = db
     application.state.runner_repository = repository
     application.state.scheduler = active_scheduler
+    application.state.planner = active_planner
     application.state.provider_registry = providers
     application.state.model_discovery = discovery
     application.state.tokenizer_cache = tokenizers
@@ -144,10 +156,93 @@ def create_app(
             tokenizer = resolved.get("tokenizer")
             if tokenizer is not None:
                 resolution = await request.app.state.tokenizer_cache.resolve(tokenizer)
-                resolved["tokenizer"] = resolution.benchmark_spec()
+                tokenizer_spec = resolution.benchmark_spec(
+                    selection=tokenizer.get("selection", "global_default"),
+                    accuracy=tokenizer.get("accuracy", "approximate"),
+                    requested_revision=(
+                        tokenizer.get("requested_revision")
+                        or tokenizer.get("revision")
+                        or "main"
+                    ),
+                )
+                if (
+                    resolved.get("cache_probe") is not None
+                    and not tokenizer_spec["immutable_revision"]
+                ):
+                    LOGGER.warning(
+                        "Rejected cache_probe tokenizer: id=%s requested=%s "
+                        "resolved=%s immutable=false",
+                        tokenizer_spec["id"],
+                        tokenizer_spec.get("requested_revision"),
+                        tokenizer_spec["revision"],
+                    )
+                    raise TokenizerResolutionError(
+                        "cache_probe tokenizer did not resolve to an immutable "
+                        "Hugging Face commit revision: "
+                        f"{tokenizer_spec['id']} requested "
+                        f"{tokenizer_spec.get('requested_revision')!r}, resolved "
+                        f"{tokenizer_spec['revision']!r}"
+                    )
+                LOGGER.info(
+                    "Tokenizer requirement validated: id=%s requested=%s "
+                    "resolved=%s immutable=%s cache_probe=%s",
+                    tokenizer_spec["id"],
+                    tokenizer_spec.get("requested_revision"),
+                    tokenizer_spec["revision"],
+                    tokenizer_spec["immutable_revision"],
+                    resolved.get("cache_probe") is not None,
+                )
+                resolved["tokenizer"] = tokenizer_spec
+            dataset = resolved.get("dataset")
+            if dataset is not None:
+                dataset_resolution = await request.app.state.dataset_cache.resolve(
+                    dataset
+                )
+                resolved["dataset"] = dataset_resolution.benchmark_spec()
             return resolved
-        except (ProviderConfigError, TokenizerResolutionError) as exc:
+        except (
+            DatasetResolutionError,
+            ProviderConfigError,
+            TokenizerResolutionError,
+        ) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    async def resolve_runner(
+        request: Request,
+        runner: Any,
+        default_benchmark: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        benchmark = (
+            default_benchmark
+            if runner.benchmark is None
+            else dump_model(runner.benchmark)
+        )
+        return {
+            "label": runner.label,
+            "metadata": runner.metadata,
+            "benchmark": await resolve_benchmark(request, benchmark),
+        }
+
+    async def resolve_plan(
+        request: Request,
+        runner_plan: RunnerPlanCreate,
+        default_benchmark: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "plan": {
+                "name": runner_plan.name,
+                "timezone": runner_plan.timezone,
+                "starts_at": runner_plan.starts_at,
+                "ends_at": runner_plan.ends_at,
+                "max_occurrences": runner_plan.max_occurrences,
+                "recurrence": dump_model(runner_plan.recurrence),
+                "overlap_policy": runner_plan.overlap_policy,
+                "misfire_grace_seconds": runner_plan.misfire_grace_seconds,
+            },
+            "runner_template": await resolve_runner(
+                request, runner_plan.runner, default_benchmark
+            ),
+        }
 
     @application.get("/health", tags=["system"])
     async def health(request: Request) -> Dict[str, Any]:
@@ -162,6 +257,7 @@ def create_app(
             "database": "connected" if database_ok else "unavailable",
             "auth": auth_status,
             "providers": len(request.app.state.provider_registry.list_public()),
+            "planner": request.app.state.planner.status()["status"],
             "config_source": snapshot.source,
             "config_generation": snapshot.generation,
         }
@@ -170,6 +266,11 @@ def create_app(
     async def scheduler_status(request: Request) -> Dict[str, Any]:
         require_role(request, "viewer")
         return request.app.state.scheduler.status()
+
+    @api.get("/planner/status", tags=["planner"])
+    async def planner_status(request: Request) -> Dict[str, Any]:
+        require_role(request, "viewer")
+        return request.app.state.planner.status()
 
     @api.get("/config", tags=["configuration"])
     def get_config(request: Request) -> Dict[str, Any]:
@@ -243,39 +344,49 @@ def create_app(
 
     @api.post(
         "/campaigns/start",
-        tags=["campaigns", "runners"],
+        tags=["campaigns", "runners", "planner"],
         status_code=status.HTTP_202_ACCEPTED,
     )
     async def start_campaign(
         request: Request, payload: BenchmarkCampaignStart
     ) -> Dict[str, Any]:
-        """Validate first, then atomically persist a Campaign and its Runners."""
+        """Validate first, then atomically distribute one Campaign workload."""
 
         actor = require_role(request, "operator")
         default_benchmark = request.app.state.config_store.snapshot().config[
             "benchmark"
         ]
-        runners = []
-        for runner in payload.runners:
-            benchmark = (
-                default_benchmark
-                if runner.benchmark is None
-                else dump_model(runner.benchmark)
-            )
-            runners.append(
-                {
-                    "label": runner.label,
-                    "metadata": runner.metadata,
-                    "benchmark": await resolve_benchmark(request, benchmark),
-                }
-            )
-        return await request.app.state.runner_repository.create_campaign_with_runners(
+        runners = [
+            await resolve_runner(request, runner, default_benchmark)
+            for runner in payload.runners
+        ]
+        runner_plans = [
+            await resolve_plan(request, runner_plan, default_benchmark)
+            for runner_plan in payload.runner_plans
+        ]
+        workload = await request.app.state.runner_repository.create_campaign_workload(
             payload.campaign.name,
             payload.campaign.description,
             payload.campaign.tags,
             runners,
+            runner_plans,
             actor,
         )
+        campaign_id = workload["campaign"]["campaign_id"]
+        LOGGER.info(
+            "Campaign %s workload accepted: runners=%d runner_plans=%d",
+            campaign_id,
+            len(workload["items"]),
+            len(workload["runner_plans"]),
+        )
+        for runner_plan in workload["runner_plans"]:
+            LOGGER.info(
+                "RunnerPlan %s registered in Campaign %s: next_fire_at=%s",
+                runner_plan["runner_plan_id"],
+                campaign_id,
+                runner_plan["next_fire_at"],
+            )
+        return workload
 
     @api.post(
         "/campaigns/{campaign_id}/runners",
@@ -289,26 +400,137 @@ def create_app(
         default_benchmark = request.app.state.config_store.snapshot().config[
             "benchmark"
         ]
-        runners = []
-        for runner in payload.runners:
-            benchmark = (
-                default_benchmark
-                if runner.benchmark is None
-                else dump_model(runner.benchmark)
-            )
-            runners.append(
-                {
-                    "label": runner.label,
-                    "metadata": runner.metadata,
-                    "benchmark": await resolve_benchmark(request, benchmark),
-                }
-            )
+        runners = [
+            await resolve_runner(request, runner, default_benchmark)
+            for runner in payload.runners
+        ]
         created = await request.app.state.runner_repository.create_runners(
             campaign_id, runners, actor
         )
         if created is None:
             raise HTTPException(status_code=404, detail="Campaign not found")
         return {"campaign_id": campaign_id, "items": created}
+
+    @api.post("/runner-plans/preview", tags=["planner"])
+    async def preview_runner_plan(
+        request: Request, payload: RunnerPlanPreview
+    ) -> Dict[str, Any]:
+        require_role(request, "viewer")
+        timing = {
+            "timezone": payload.timezone,
+            "starts_at": payload.starts_at,
+            "ends_at": payload.ends_at,
+            "max_occurrences": payload.max_occurrences,
+            "recurrence": dump_model(payload.recurrence),
+        }
+        effective_starts_at = payload.starts_at or datetime.now(timezone.utc)
+        return {
+            "start_mode": "explicit" if payload.starts_at else "immediate",
+            "effective_starts_at": effective_starts_at,
+            "items": preview_fires(
+                timing,
+                payload.count,
+                default_starts_at=effective_starts_at,
+            ),
+        }
+
+    @api.post(
+        "/campaigns/{campaign_id}/runner-plans",
+        tags=["planner"],
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_runner_plan(
+        request: Request, campaign_id: str, payload: RunnerPlanCreate
+    ) -> Dict[str, Any]:
+        actor = require_role(request, "operator")
+        default_benchmark = request.app.state.config_store.snapshot().config[
+            "benchmark"
+        ]
+        resolved_plan = await resolve_plan(request, payload, default_benchmark)
+        plan = await request.app.state.runner_repository.create_runner_plan(
+            campaign_id,
+            resolved_plan["plan"],
+            resolved_plan["runner_template"],
+            actor,
+        )
+        if plan is None:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        LOGGER.info(
+            "RunnerPlan %s registered in Campaign %s: next_fire_at=%s",
+            plan["runner_plan_id"],
+            campaign_id,
+            plan["next_fire_at"],
+        )
+        return plan
+
+    @api.get("/runner-plans", tags=["planner"])
+    async def list_runner_plans(
+        request: Request,
+        plan_status: Optional[str] = Query(default=None, alias="status"),
+        campaign_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> Dict[str, Any]:
+        require_role(request, "viewer")
+        if plan_status is not None and plan_status not in PLAN_STATUSES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"status must be one of {sorted(PLAN_STATUSES)}",
+            )
+        items = await request.app.state.runner_repository.list_runner_plans(
+            plan_status, campaign_id, limit, offset
+        )
+        return {"items": items, "limit": limit, "offset": offset}
+
+    @api.get("/runner-plans/{runner_plan_id}", tags=["planner"])
+    async def get_runner_plan(request: Request, runner_plan_id: str) -> Dict[str, Any]:
+        require_role(request, "viewer")
+        plan = await request.app.state.runner_repository.get_runner_plan(runner_plan_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail="RunnerPlan not found")
+        return plan
+
+    @api.get("/runner-plans/{runner_plan_id}/events", tags=["planner"])
+    async def get_plan_events(request: Request, runner_plan_id: str) -> Dict[str, Any]:
+        require_role(request, "viewer")
+        events = await request.app.state.runner_repository.get_plan_events(
+            runner_plan_id
+        )
+        if events is None:
+            raise HTTPException(status_code=404, detail="RunnerPlan not found")
+        return {"runner_plan_id": runner_plan_id, "items": events}
+
+    async def change_plan(
+        request: Request, runner_plan_id: str, action: str
+    ) -> Dict[str, Any]:
+        require_role(request, "operator")
+        plan = await request.app.state.runner_repository.change_runner_plan(
+            runner_plan_id, action
+        )
+        if plan is None:
+            raise HTTPException(status_code=404, detail="RunnerPlan not found")
+        error = plan.pop("transition_error", None)
+        if error:
+            raise HTTPException(status_code=409, detail=error)
+        return plan
+
+    @api.post("/runner-plans/{runner_plan_id}/pause", tags=["planner"])
+    async def pause_runner_plan(
+        request: Request, runner_plan_id: str
+    ) -> Dict[str, Any]:
+        return await change_plan(request, runner_plan_id, "pause")
+
+    @api.post("/runner-plans/{runner_plan_id}/resume", tags=["planner"])
+    async def resume_runner_plan(
+        request: Request, runner_plan_id: str
+    ) -> Dict[str, Any]:
+        return await change_plan(request, runner_plan_id, "resume")
+
+    @api.post("/runner-plans/{runner_plan_id}/cancel", tags=["planner"])
+    async def cancel_runner_plan(
+        request: Request, runner_plan_id: str
+    ) -> Dict[str, Any]:
+        return await change_plan(request, runner_plan_id, "cancel")
 
     @api.get("/providers", tags=["providers"])
     async def list_providers(request: Request) -> Dict[str, Any]:
@@ -383,6 +605,7 @@ def create_app(
     async def list_runners(
         request: Request,
         runner_status: Optional[str] = Query(default=None, alias="status"),
+        campaign_id: Optional[str] = Query(default=None),
         limit: int = Query(default=20, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
         full: bool = Query(default=False),
@@ -393,13 +616,18 @@ def create_app(
                 detail=f"status must be one of {sorted(RUNNER_STATUSES)}",
             )
         runners = await request.app.state.runner_repository.list_runners(
-            runner_status, limit, offset, full=full
+            runner_status,
+            limit,
+            offset,
+            full=full,
+            campaign_id=campaign_id,
         )
         return {
             "items": runners,
             "limit": limit,
             "offset": offset,
             "full": full,
+            "campaign_id": campaign_id,
         }
 
     @api.get("/runners/{runner_id}", tags=["runners"])

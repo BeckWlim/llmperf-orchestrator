@@ -1,0 +1,4 @@
+interface:
+  display_name: "Operate LLMPerf"
+  short_description: "Configure and operate LLMPerf campaigns safely"
+  default_prompt: "Use $operate-llmperf to prepare and run an LLMPerf campaign YAML."

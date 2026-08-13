@@ -61,6 +61,8 @@ def _calculate(
             mean_output_tokens=benchmark["mean_output_tokens"],
             stddev_output_tokens=benchmark["stddev_output_tokens"],
             additional_sampling_params=benchmark["additional_sampling_params"],
+            cache_probe=benchmark.get("cache_probe"),
+            tokenizer_provenance=benchmark.get("tokenizer"),
         )
     finally:
         ray.shutdown()

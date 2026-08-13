@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A framework for load testing LLM APIs"
 authors = [{name="Avnish Narayan", email="avnish@anyscale.com"}]
 license = {text= "Apache-2.0"}
-requires-python = ">=3.8, <3.11"
+requires-python = ">=3.9, <3.11"
 dependencies = ["pydantic>=2.5,<2.6",
                 "fastapi>=0.103,<0.110",
                 "uvicorn>=0.23,<0.28",
@@ -38,6 +38,9 @@ llmperfctl = "llmperf_cli.__main__:main"
 llmperf_backend = ["configs/*.yaml"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
+test_name_max_underscores = "3"
+postgresql_url_env = "LLMPERF_TEST_DB"
 markers = [
-    "postgresql: tests requiring a dedicated disposable PostgreSQL database",
+    "postgresql: tests requiring an explicitly configured disposable PostgreSQL database",
 ]

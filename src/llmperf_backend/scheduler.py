@@ -47,6 +47,7 @@ class Scheduler:
         self.dataset_cache = dataset_cache or DatasetCache()
         self.scheduler_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
         self._slots: List[asyncio.Task] = []
+        self._busy_slots = set()
         self._stop: Optional[asyncio.Event] = None
 
     async def start(self) -> None:
@@ -74,6 +75,7 @@ class Scheduler:
         if self._slots:
             await asyncio.gather(*self._slots, return_exceptions=True)
         self._slots.clear()
+        self._busy_slots.clear()
         self._stop = None
         LOGGER.info("Scheduler %s stopped", self.scheduler_id)
 
@@ -83,11 +85,13 @@ class Scheduler:
             if not self.config.enabled
             else ("running" if self._stop is not None else "stopped")
         )
+        busy_slots = len(self._busy_slots)
         return {
             "scheduler_id": self.scheduler_id,
             "status": state,
             "max_concurrent_runners": self.config.max_concurrent_runners,
-            "active_slots": sum(not slot.done() for slot in self._slots),
+            "live_slots": sum(not slot.done() for slot in self._slots),
+            "busy_slots": busy_slots,
             "worker_module": self.config.worker_module,
         }
 
@@ -122,7 +126,11 @@ class Scheduler:
                 scheduler_slot_id,
                 runner["runner_id"],
             )
-            await self._execute(runner)
+            self._busy_slots.add(index)
+            try:
+                await self._execute(runner)
+            finally:
+                self._busy_slots.discard(index)
 
     def _working_directory(self) -> Path:
         return Path(self.config.working_directory).expanduser().resolve()

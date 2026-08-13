@@ -1,4 +1,5 @@
 from argparse import Namespace
+from datetime import datetime, timezone
 from io import BytesIO
 import json
 import logging
@@ -15,10 +16,12 @@ from llmperf_cli.__main__ import (
     _validate_runner_list,
     build_parser,
     execute,
+    print_campaign_status,
     print_campaign_table,
     print_runner_table,
     start_campaign,
     summarize_runner,
+    wait_for_campaign,
     wait_for_runners,
 )
 from llmperf_cli.auth import discover_private_key_providers
@@ -28,6 +31,7 @@ from llmperf_cli.client import ClientError, LLMPerfClient
 class FakeClient:
     def __init__(self):
         self.payloads = []
+        self.plan_payloads = []
 
     def start_runner(self, payload):
         self.payloads.append(payload)
@@ -45,16 +49,27 @@ class FakeClient:
             payloads.append(self.start_runner(payload))
         return {"items": payloads}
 
-    def create_campaign_with_runners(self, campaign, runners):
+    def start_campaign(self, campaign, runners, runner_plans):
         assert campaign["name"] == "glm-study"
         payloads = []
         for runner in runners:
             payload = dict(runner)
             payload["campaign_id"] = "campaign-1"
             payloads.append(self.start_runner(payload))
+        plans = []
+        for runner_plan in runner_plans:
+            self.plan_payloads.append(runner_plan)
+            plans.append(
+                {
+                    "runner_plan_id": f"plan-{len(self.plan_payloads)}",
+                    "campaign_id": "campaign-1",
+                    "status": "active",
+                }
+            )
         return {
             "campaign": {"campaign_id": "campaign-1"},
             "items": payloads,
+            "runner_plans": plans,
         }
 
 
@@ -88,7 +103,44 @@ runners:
     assert client.payloads[0]["campaign_id"] == "campaign-1"
 
 
-def test_campaign_status_full_uses_export_report():
+def test_planned_campaign(tmp_path):
+    plan = tmp_path / "planned.yaml"
+    plan.write_text(
+        """
+campaign:
+  name: glm-study
+runner_plans:
+  - name: interval-study
+    timezone: Asia/Shanghai
+    starts_at: 2026-08-14T00:00:00+08:00
+    max_occurrences: 8
+    recurrence:
+      kind: interval
+      every_seconds: 30
+    runner:
+      benchmark:
+        model: glm-test
+""",
+        encoding="utf-8",
+    )
+    arguments = Namespace(
+        file=str(plan),
+        wait=False,
+        poll_interval=0.01,
+        timeout=None,
+        output=None,
+        include_requests=False,
+    )
+    client = FakeClient()
+
+    result = start_campaign(client, arguments)
+
+    assert result["runners"] == []
+    assert result["runner_plans"][0]["runner_plan_id"] == "plan-1"
+    assert client.plan_payloads[0]["recurrence"]["every_seconds"] == 30
+
+
+def test_campaign_export_status():
     class CampaignClient:
         def export_campaign(self, campaign_id, include_requests=False):
             return {
@@ -227,6 +279,7 @@ def test_main_help():
     output = build_parser().format_help()
 
     assert "Runner     One durable benchmark execution" in output
+    assert "Planner    The backend component" in output
     assert "Scheduler  The backend component" in output
     assert "llmperfctl provider models <provider-id>" in output
     assert "llmperfctl runner start -f runner.yaml" in output
@@ -271,10 +324,22 @@ ARG_CASES = [
     ),
     pytest.param(
         {
+            "argv": ["planner", "list", "--status", "active"],
+            "expected": {
+                "planner_command": "list",
+                "status": "active",
+                "limit": 50,
+            },
+        },
+        id="planner-list",
+    ),
+    pytest.param(
+        {
             "argv": ["campaign", "status", "campaign-1"],
             "expected": {
                 "campaign_command": "status",
                 "campaign_id": "campaign-1",
+                "json": False,
             },
         },
         id="campaign-status",
@@ -425,8 +490,10 @@ def test_campaign_list_table(capsys):
             {
                 "campaign_id": "cc895606-89d4-4562-811d-2e12a1e1a7de",
                 "name": "deepseek-v4-pro-kvcache-reality",
-                "status": "succeeded",
+                "status": "completed",
+                "outcome": "succeeded",
                 "runner_count": 2,
+                "runner_plan_count": 1,
                 "status_counts": {
                     "queued": 0,
                     "running": 0,
@@ -447,13 +514,108 @@ def test_campaign_list_table(capsys):
 
     output = capsys.readouterr().out
     assert "CAMPAIGN ID" in output
+    assert "OUTCOME" in output
+    assert "completed" in output
+    assert "succeeded" in output
     assert "cc895606-89d4-4562-811d-2e12a1e1a7de" in output
     assert "0/0/2/0/0" in output
+    assert "2/1" in output
     assert "deepseek-v4-pro-kvcac" in output
     assert "must not be rendered" not in output
 
 
-def test_bad_campaign_list_schema():
+def test_campaign_status_view(capsys):
+    class CampaignClient:
+        def get_campaign(self, campaign_id):
+            return {
+                "campaign_id": campaign_id,
+                "name": "cache-study",
+                "status": "completed",
+                "outcome": "partial_failed",
+                "runner_count": 2,
+                "runner_plan_count": 1,
+                "status_counts": {
+                    "queued": 0,
+                    "running": 0,
+                    "succeeded": 1,
+                    "failed": 1,
+                    "cancelled": 0,
+                },
+                "runner_plan_status_counts": {
+                    "active": 0,
+                    "paused": 0,
+                    "completed": 1,
+                    "cancelled": 0,
+                },
+            }
+
+        def list_runners(
+            self, status, limit, offset, full=False, campaign_id=None
+        ):
+            assert status is None
+            assert limit == 200
+            assert offset == 0
+            assert full is False
+            assert campaign_id == "campaign-1"
+            return {
+                "items": [
+                    {
+                        "runner_id": "runner-2",
+                        "status": "failed",
+                        "provider": "aliyun",
+                        "model": "deepseek-v4-pro",
+                        "requests": {
+                            "started": None,
+                            "completed": None,
+                            "failed": None,
+                        },
+                        "plan_occurrence": 1,
+                        "scheduled_for": "2026-08-13T08:55:02Z",
+                        "created_at": "2026-08-13T08:55:02Z",
+                    },
+                    {
+                        "runner_id": "runner-1",
+                        "status": "succeeded",
+                        "provider": "aliyun",
+                        "model": "deepseek-v4-pro",
+                        "requests": {
+                            "started": 10,
+                            "completed": 9,
+                            "failed": 1,
+                        },
+                        "plan_occurrence": 0,
+                        "scheduled_for": "2026-08-13T08:54:32Z",
+                        "created_at": "2026-08-13T08:54:32Z",
+                    },
+                ],
+                "limit": limit,
+                "offset": offset,
+                "full": full,
+                "campaign_id": campaign_id,
+            }
+
+    arguments = build_parser().parse_args(
+        ["campaign", "status", "campaign-1"]
+    )
+    document = execute(CampaignClient(), arguments)
+    print_campaign_status(document)
+
+    assert [runner["runner_id"] for runner in document["runners"]] == [
+        "runner-1",
+        "runner-2",
+    ]
+    output = capsys.readouterr().out
+    assert "Campaign: cache-study (campaign-1)" in output
+    assert "Status: completed  Outcome: partial_failed" in output
+    assert "succeeded=1" in output
+    assert "ROUND" in output
+    assert "runner-1" in output
+    assert "10 started; 9 ok; 1 err" in output
+    assert "runner-2" in output
+    assert '"campaign"' not in output
+
+
+def test_campaign_schema_error():
     with pytest.raises(ClientError, match="missing required fields"):
         _validate_campaign_list({"items": [{"campaign_id": "campaign-1"}]})
 
@@ -490,6 +652,27 @@ def test_full_list_request(monkeypatch):
     assert requested_urls == [
         "http://127.0.0.1:8000/api/v1/runners?status=failed&limit=5&offset=10&full=true"
     ]
+
+
+def test_datetime_payload(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured.update(json.loads(request.data))
+        return _FakeResponse(
+            {"campaign": {"campaign_id": "campaign-1"}, "items": [], "runner_plans": []}
+        )
+
+    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    client = LLMPerfClient("http://127.0.0.1:8000")
+
+    client.start_campaign(
+        {"name": "planned"},
+        [],
+        [{"starts_at": datetime(2026, 8, 14, tzinfo=timezone.utc)}],
+    )
+
+    assert captured["runner_plans"][0]["starts_at"] == "2026-08-14T00:00:00+00:00"
 
 
 def test_provider_encoding(monkeypatch):
@@ -533,6 +716,8 @@ def test_wait_summary(caplog):
                 "status": "failed",
                 "label": "smoke",
                 "benchmark": {"provider": "aliyun", "model": "deepseek-v4-pro"},
+                "scheduler_id": "scheduler-1",
+                "worker": {"process_id": 62791, "exit_code": 1},
                 "summary": {
                     "results": {
                         "num_requests_started": 1,
@@ -574,19 +759,123 @@ def test_wait_summary(caplog):
             },
             "error": {"code": -1, "message": "invalid stream"},
             "message": "No benchmark requests completed",
-            "scheduler_id": None,
-            "worker": None,
+            "scheduler_id": "scheduler-1",
+            "worker": {"process_id": 62791, "exit_code": 1},
             "started_at": None,
             "finished_at": None,
         }
     ]
     assert "large output" not in str(reports)
     assert "Runner runner-1 status: failed" in caplog.text
+    assert "scheduler=scheduler-1 worker_pid=62791 exit_code=1" in caplog.text
+    assert "requests[started=1 completed=0 failed=1]" in caplog.text
     assert "Runner runner-1: No benchmark requests completed" in caplog.text
     assert _has_unsuccessful_runner(reports) is True
+    assert _has_unsuccessful_runner(
+        {"status": "completed", "outcome": "partial_failed"}
+    ) is True
+    assert _has_unsuccessful_runner(
+        {"status": "completed", "outcome": "succeeded"}
+    ) is False
 
 
-def test_status_wait_reconnects_to_existing_runner():
+def test_campaign_wait_logs(caplog):
+    class CampaignClient:
+        def __init__(self):
+            self.index = -1
+            self.campaigns = [
+                self._campaign("planned", 0, 0, 0, "active"),
+                self._campaign("running", 1, 0, 1, "active"),
+                self._campaign("completed", 1, 1, 0, "completed"),
+            ]
+
+        @staticmethod
+        def _campaign(status, runner_count, succeeded, running, plan_status):
+            return {
+                "status": status,
+                "outcome": "succeeded" if status == "completed" else "pending",
+                "has_failures": False,
+                "runner_count": runner_count,
+                "status_counts": {
+                    "queued": 0,
+                    "running": running,
+                    "succeeded": succeeded,
+                    "failed": 0,
+                    "cancelled": 0,
+                },
+                "runner_plan_count": 1,
+                "runner_plan_status_counts": {
+                    "active": int(plan_status == "active"),
+                    "paused": 0,
+                    "completed": int(plan_status == "completed"),
+                    "cancelled": 0,
+                },
+            }
+
+        def get_campaign(self, campaign_id):
+            self.index += 1
+            return self.campaigns[self.index]
+
+        def list_runner_plans(self, **kwargs):
+            completed = self.index == 2
+            return {
+                "items": [
+                    {
+                        "runner_plan_id": "plan-1",
+                        "status": "completed" if completed else "active",
+                        "occurrence_cursor": self.index,
+                        "emitted_count": self.index,
+                        "skipped_count": 0,
+                        "next_fire_at": None if completed else f"fire-{self.index}",
+                        "next_fire_local": None if completed else f"local-{self.index}",
+                    }
+                ]
+            }
+
+        def list_runners(self, **kwargs):
+            if self.index == 0:
+                return {"items": []}
+            succeeded = self.index == 2
+            return {
+                "items": [
+                    {
+                        "runner_id": "runner-1",
+                        "runner_plan_id": "plan-1",
+                        "plan_occurrence": 0,
+                        "status": "succeeded" if succeeded else "running",
+                        "scheduler_id": "scheduler-1",
+                        "worker": {
+                            "process_id": 70001,
+                            "exit_code": 0 if succeeded else None,
+                        },
+                        "requests": {
+                            "started": 1,
+                            "completed": 1 if succeeded else 0,
+                            "failed": 0,
+                        },
+                    }
+                ]
+            }
+
+    with caplog.at_level(logging.INFO, logger="llmperfctl"):
+        result = wait_for_campaign(CampaignClient(), "campaign-1", 0, 1)
+
+    assert result["status"] == "completed"
+    assert result["outcome"] == "succeeded"
+    assert "status=planned" in caplog.text
+    assert "runners=1 [queued=0 running=1" in caplog.text
+    assert "RunnerPlan plan-1 updated" in caplog.text
+    assert "occurrence=2 emitted=2" in caplog.text
+    assert "Runner runner-1 status: running" in caplog.text
+    assert "plan=plan-1 occurrence=0 scheduler=scheduler-1" in caplog.text
+    assert "worker_pid=70001 exit_code=0" in caplog.text
+    assert (
+        "Campaign campaign-1 finished: status=completed outcome=succeeded"
+        in caplog.text
+    )
+
+
+def test_wait_runner_reconnect():
     class SucceededRunnerClient:
         def get_runner(self, runner_id):
             return {

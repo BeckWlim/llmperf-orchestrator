@@ -14,6 +14,12 @@ import pandas as pd
 import ray
 
 from llmperf import common_metrics
+from llmperf.cache_analysis import analyze_cache_probe, summarize_cache_counters
+from llmperf.cache_probe import (
+    CacheProbeRequest,
+    DependentPlanQueue,
+    build_cache_probe_plan,
+)
 from llmperf.common import SUPPORTED_APIS, construct_clients
 
 from llmperf.models import RequestConfig
@@ -26,12 +32,17 @@ from llmperf.utils import (
 )
 from tqdm import tqdm
 
+
 def normalize_request_metrics(
-    request_metrics: Dict[str, Any], generated_text: str, get_token_length
+    request_metrics: Dict[str, Any],
+    generated_text: str,
+    get_token_length,
+    tokenizer_divergence_warning_ratio: float = 0.05,
 ) -> Dict[str, Any]:
     """Reconcile provider counters with tokenizer-derived output metrics safely."""
 
     num_output_tokens = get_token_length(generated_text)
+    request_metrics[common_metrics.LOCAL_OUTPUT_TOKENS] = num_output_tokens
     inter_token_latency_sum = request_metrics.get(common_metrics.INTER_TOKEN_LAT, 0)
     request_metrics[common_metrics.INTER_TOKEN_LAT] = (
         inter_token_latency_sum / num_output_tokens if num_output_tokens else 0
@@ -44,6 +55,29 @@ def normalize_request_metrics(
     request_metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = (
         num_output_tokens / end_to_end_latency if end_to_end_latency > 0 else 0
     )
+    provider_input = request_metrics.get(common_metrics.PROVIDER_INPUT_TOKENS)
+    local_input = request_metrics.get(
+        common_metrics.LOCAL_INPUT_TOKENS,
+        request_metrics.get(common_metrics.NUM_INPUT_TOKENS),
+    )
+    if isinstance(provider_input, (int, float)) and isinstance(
+        local_input, (int, float)
+    ):
+        divergence = (
+            abs(provider_input - local_input) / provider_input
+            if provider_input
+            else (0 if local_input == 0 else 1)
+        )
+        request_metrics[common_metrics.TOKENIZER_DIVERGENCE] = divergence
+        if divergence > tokenizer_divergence_warning_ratio:
+            request_metrics["tokenizer_mismatch"] = True
+    if common_metrics.TPOT not in request_metrics and num_output_tokens > 1:
+        ttft = request_metrics.get(common_metrics.TTFT)
+        e2e = request_metrics.get(common_metrics.E2E_LAT)
+        if isinstance(ttft, (int, float)) and isinstance(e2e, (int, float)):
+            request_metrics[common_metrics.TPOT] = max(0, e2e - ttft) / (
+                num_output_tokens - 1
+            )
     return request_metrics
 
 
@@ -105,6 +139,167 @@ def sample_sharegpt_requests(
     return repeated
 
 
+def _execute_cache_probe(
+    plan: List[CacheProbeRequest],
+    model: str,
+    llm_api: str,
+    num_concurrent_requests: int,
+    num_output_tokens_list: List[int],
+    additional_sampling_params: Dict[str, Any],
+    test_timeout_s: float,
+    get_token_length,
+    cache_probe: Dict[str, Any],
+    tokenizer_provenance: Optional[Dict[str, Any]],
+    benchmark_metadata: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Execute a dependency-aware probe without changing the global Scheduler."""
+
+    started = time.monotonic()
+    deadline = started + test_timeout_s
+    queue = DependentPlanQueue(plan)
+    completed: List[Dict[str, Any]] = []
+    errors = []
+    lock = threading.Lock()
+    dispatch_counter = 0
+    completion_counter = 0
+    pbar = tqdm(total=len(plan))
+
+    def execute_slot() -> None:
+        nonlocal dispatch_counter, completion_counter
+        try:
+            clients = construct_clients(llm_api=llm_api, num_clients=1)
+            launcher = RequestsLauncher(clients)
+            while time.monotonic() < deadline:
+                planned = queue.claim(deadline=deadline)
+                if planned is None:
+                    return
+                with lock:
+                    actual_dispatch_index = dispatch_counter
+                    dispatch_counter += 1
+                dispatched_at = time.monotonic()
+                metadata = planned.metadata()
+                metadata["plan_index"] = planned.dispatch_index
+                metadata["dispatch_index"] = actual_dispatch_index
+                metadata["scheduled_monotonic"] = started
+                metadata["dispatched_monotonic"] = dispatched_at
+                sampling_params = {
+                    "max_tokens": num_output_tokens_list[planned.dispatch_index]
+                }
+                sampling_params.update(additional_sampling_params)
+                config = RequestConfig(
+                    model=model,
+                    prompt=(planned.prompt, planned.local_input_tokens),
+                    sampling_params=sampling_params,
+                    llm_api=llm_api,
+                    metadata=metadata,
+                    timeout_seconds=max(0.1, deadline - time.monotonic()),
+                )
+                launcher.launch_requests(config)
+                outputs = launcher.get_next_ready(block=True)
+                if not outputs:
+                    raise RuntimeError("Cache probe request completed without a result")
+                request_succeeded = True
+                for request_metrics, generated_text, returned_config in outputs:
+                    request_metrics = normalize_request_metrics(
+                        request_metrics,
+                        generated_text,
+                        get_token_length,
+                        float(
+                            cache_probe.get("tokenizer_divergence_warning_ratio", 0.05)
+                        ),
+                    )
+                    request_metrics[common_metrics.REQUEST_METADATA] = dict(
+                        request_metrics.get(common_metrics.REQUEST_METADATA)
+                        or returned_config.metadata
+                        or metadata
+                    )
+                    with lock:
+                        request_metrics[common_metrics.REQUEST_METADATA][
+                            "completion_index"
+                        ] = completion_counter
+                        completion_counter += 1
+                        completed.append(request_metrics)
+                        pbar.update(1)
+                    request_succeeded = request_succeeded and (
+                        request_metrics.get(common_metrics.ERROR_CODE) is None
+                    )
+                queue.complete(planned, request_succeeded)
+        except Exception as exc:
+            queue.close()
+            with lock:
+                if not errors:
+                    errors.append((exc, exc.__traceback__))
+
+    thread_count = min(max(1, num_concurrent_requests), int(cache_probe["trials"]))
+    threads = [threading.Thread(target=execute_slot) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    pbar.close()
+    if errors:
+        error, traceback = errors[0]
+        raise error.with_traceback(traceback)
+
+    finished = time.monotonic()
+    completed.sort(
+        key=lambda request: request.get(common_metrics.REQUEST_METADATA, {}).get(
+            "completion_index", 0
+        )
+    )
+    results = metrics_summary(completed, started, finished)
+    analysis = analyze_cache_probe(
+        completed,
+        bootstrap_samples=int(cache_probe.get("bootstrap_samples", 2_000)),
+        confidence_level=float(cache_probe.get("confidence_level", 0.95)),
+        seed=int(benchmark_metadata.get("dataset_seed") or 11111),
+        minimum_counter_coverage=float(
+            cache_probe.get("minimum_counter_coverage", 0.8)
+        ),
+    )
+    mismatches = sum(bool(item.get("tokenizer_mismatch")) for item in completed)
+    analysis["quality_flags"] = {
+        "tokenizer_mismatch_requests": mismatches,
+        "skipped_dependency_requests": len(queue.skipped),
+        "timed_out": finished >= deadline and len(completed) < len(plan),
+    }
+    if mismatches:
+        analysis["verdict_before_quality_guard"] = analysis["verdict"]
+        analysis["verdict"] = "inconclusive"
+
+    provenance = dict(tokenizer_provenance or {})
+    if not provenance:
+        provenance = {
+            "id": "hf-internal-testing/llama-tokenizer",
+            "selection": "global_default",
+            "accuracy": "approximate",
+        }
+    provenance["warning"] = (
+        "Tokenizer was not explicitly selected for this model"
+        if provenance.get("accuracy") == "approximate"
+        else None
+    )
+    metadata = {
+        "model": model,
+        **benchmark_metadata,
+        "num_concurrent_requests": num_concurrent_requests,
+        "additional_sampling_params": additional_sampling_params,
+        "cache_probe": cache_probe,
+        "cache_probe_plan": {
+            "requests": len(plan),
+            "families": int(cache_probe["trials"]),
+            "prompt_hash_algorithm": "sha256",
+            "persist_prompt_text": bool(cache_probe.get("persist_prompt_text", False)),
+            "skipped_request_ids": [item.request_id for item in queue.skipped],
+        },
+        "tokenizer": provenance,
+        "timed_out": finished >= deadline and len(completed) < len(plan),
+        "cache_probe_analysis": analysis,
+        "results": results,
+    }
+    return metadata, completed
+
+
 def get_token_throughput_latencies(
     model: str,
     mean_input_tokens: int,
@@ -121,6 +316,8 @@ def get_token_throughput_latencies(
     max_num_completed_requests: int = 500,
     test_timeout_s=90,
     llm_api="openai",
+    cache_probe: Optional[Dict[str, Any]] = None,
+    tokenizer_provenance: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Get the token throughput and latencies for the given model.
 
@@ -147,23 +344,28 @@ def get_token_throughput_latencies(
         (e.g. throughput, latencies, etc.)
         The individual metrics for each request.
     """
-    random.seed(11111)
+    random.seed(dataset_seed if cache_probe else 11111)
 
     tokenizer = get_tokenizer()
     get_token_length = lambda text: len(
         tokenizer.encode(text, add_special_tokens=False)
     )
-    
+
     if not additional_sampling_params:
         additional_sampling_params = {}
 
     completed_requests_lock = threading.Lock()
     completed_requests = []
     num_completed_requests = 0
+    request_threads_stop = threading.Event()
+    request_thread_errors = []
+    request_thread_errors_lock = threading.Lock()
     if shared_prefix_tokens >= mean_input_tokens:
         raise ValueError("shared_prefix_tokens must be less than mean_input_tokens")
     if dataset_path and shared_prefix_tokens:
-        raise ValueError("dataset_path and shared_prefix_tokens cannot be used together")
+        raise ValueError(
+            "dataset_path and shared_prefix_tokens cannot be used together"
+        )
     if dataset_path and dataset_format != "sharegpt":
         raise ValueError(f"Unsupported dataset format: {dataset_format}")
     if dataset_repeat_count < 1:
@@ -172,17 +374,28 @@ def get_token_throughput_latencies(
     # Make up prompts outside of the send loop for faster benchmarking. A shared
     # prefix creates a controlled provider KV-cache workload while each suffix
     # remains unique.
+    probe_request_count = (
+        int(cache_probe["trials"])
+        * (1 + int(cache_probe.get("repeats_after_prime", 1)))
+        if cache_probe
+        else max_num_completed_requests
+    )
+    base_prompt_count = (
+        int(cache_probe["trials"]) if cache_probe else max_num_completed_requests
+    )
     num_output_tokens_list = [
         sample_random_positive_int(mean_output_tokens, stddev_output_tokens)
-        for _ in range(max_num_completed_requests)
+        for _ in range(probe_request_count)
     ]
     if dataset_path:
         min_input_tokens = max(1, mean_input_tokens - stddev_input_tokens)
         max_input_tokens = mean_input_tokens + stddev_input_tokens
         prompts = sample_sharegpt_requests(
             dataset_path=dataset_path,
-            num_requests=max_num_completed_requests,
-            repeat_count=dataset_repeat_count,
+            num_requests=(
+                base_prompt_count if cache_probe else max_num_completed_requests
+            ),
+            repeat_count=1 if cache_probe else dataset_repeat_count,
             min_input_tokens=min_input_tokens,
             max_input_tokens=max_input_tokens,
             get_token_length=get_token_length,
@@ -198,57 +411,105 @@ def get_token_throughput_latencies(
                 expect_output_tokens=mean_output_tokens,
                 tokenizer=tokenizer,
             )
-        for i in range(max_num_completed_requests):
+        for i in range(base_prompt_count):
             suffix = randomly_sample_sonnet_lines_prompt(
                 prompt_tokens_mean=mean_input_tokens - shared_prefix_tokens,
                 prompt_tokens_stddev=stddev_input_tokens,
                 expect_output_tokens=num_output_tokens_list[i],
-                tokenizer=tokenizer
+                tokenizer=tokenizer,
             )[0]
             prompt = shared_prefix + suffix
             prompts.append((prompt, get_token_length(prompt)))
+    if cache_probe:
+        probe_config = dict(cache_probe)
+        if probe_config.get("shared_prefix_tokens") is None:
+            probe_config["shared_prefix_tokens"] = shared_prefix_tokens
+        plan = build_cache_probe_plan(
+            prompts,
+            probe_config,
+            tokenizer,
+            dataset_seed,
+        )
+        return _execute_cache_probe(
+            plan=plan,
+            model=model,
+            llm_api=llm_api,
+            num_concurrent_requests=num_concurrent_requests,
+            num_output_tokens_list=num_output_tokens_list,
+            additional_sampling_params=additional_sampling_params,
+            test_timeout_s=test_timeout_s,
+            get_token_length=get_token_length,
+            cache_probe=probe_config,
+            tokenizer_provenance=tokenizer_provenance,
+            benchmark_metadata={
+                "mean_input_tokens": mean_input_tokens,
+                "stddev_input_tokens": stddev_input_tokens,
+                "shared_prefix_tokens": shared_prefix_tokens,
+                "dataset_path": dataset_path,
+                "dataset_format": dataset_format if dataset_path else None,
+                "dataset_repeat_count": dataset_repeat_count if dataset_path else None,
+                "dataset_seed": dataset_seed if dataset_path else None,
+                "mean_output_tokens": mean_output_tokens,
+                "stddev_output_tokens": stddev_output_tokens,
+            },
+        )
     start_time = time.monotonic()
     pbar = tqdm(total=max_num_completed_requests)
 
     def launch_request(thread_index):
         nonlocal num_completed_requests
-        clients = construct_clients(llm_api=llm_api, num_clients=1)
-        req_launcher = RequestsLauncher(clients)
-        request_index = thread_index % max_num_completed_requests
+        try:
+            clients = construct_clients(llm_api=llm_api, num_clients=1)
+            req_launcher = RequestsLauncher(clients)
+            request_index = thread_index % max_num_completed_requests
 
-        while (
-            time.monotonic() - start_time < test_timeout_s
-            and num_completed_requests < max_num_completed_requests
-        ):
+            while (
+                not request_threads_stop.is_set()
+                and time.monotonic() - start_time < test_timeout_s
+                and num_completed_requests < max_num_completed_requests
+            ):
 
-            default_sampling_params = {"max_tokens": num_output_tokens_list[request_index] }
-            default_sampling_params.update(additional_sampling_params)
-            remaining_seconds = max(
-                0.1, test_timeout_s - (time.monotonic() - start_time) - 1
-            )
-            request_config = RequestConfig(
-                model=model,
-                prompt=prompts[request_index],
-                sampling_params=default_sampling_params,
-                llm_api=llm_api,
-                timeout_seconds=remaining_seconds,
-            )
-            req_launcher.launch_requests(request_config)
-
-            outs = req_launcher.get_next_ready()
-            all_metrics = []
-            for out in outs:
-                request_metrics, gen_text, _ = out
-                request_metrics = normalize_request_metrics(
-                    request_metrics, gen_text, get_token_length
+                default_sampling_params = {
+                    "max_tokens": num_output_tokens_list[request_index]
+                }
+                default_sampling_params.update(additional_sampling_params)
+                remaining_seconds = max(
+                    0.1, test_timeout_s - (time.monotonic() - start_time) - 1
                 )
-                with completed_requests_lock:
-                    if num_completed_requests < max_num_completed_requests:
-                        all_metrics.append(request_metrics)
-                        completed_requests.extend(all_metrics)
-                        pbar.update(len(all_metrics))
-                        num_completed_requests += len(all_metrics)
-                        request_index = (request_index + num_concurrent_requests) % max_num_completed_requests
+                request_config = RequestConfig(
+                    model=model,
+                    prompt=prompts[request_index],
+                    sampling_params=default_sampling_params,
+                    llm_api=llm_api,
+                    timeout_seconds=remaining_seconds,
+                )
+                req_launcher.launch_requests(request_config)
+
+                outs = req_launcher.get_next_ready()
+                all_metrics = []
+                for out in outs:
+                    request_metrics, gen_text, _ = out
+                    request_metrics = normalize_request_metrics(
+                        request_metrics, gen_text, get_token_length
+                    )
+                    with completed_requests_lock:
+                        if num_completed_requests < max_num_completed_requests:
+                            all_metrics.append(request_metrics)
+                            completed_requests.extend(all_metrics)
+                            pbar.update(len(all_metrics))
+                            num_completed_requests += len(all_metrics)
+                            request_index = (
+                                request_index + num_concurrent_requests
+                            ) % max_num_completed_requests
+        except Exception as exc:
+            # Python does not propagate exceptions from child threads to their
+            # caller. Retain the first failure and stop launching more paid API
+            # requests; the main benchmark thread re-raises it after joining all
+            # request threads so the Worker exits non-zero.
+            with request_thread_errors_lock:
+                if not request_thread_errors:
+                    request_thread_errors.append((exc, exc.__traceback__))
+            request_threads_stop.set()
 
     threads = []
     for i in range(num_concurrent_requests):
@@ -260,6 +521,10 @@ def get_token_throughput_latencies(
         thread.join()
 
     pbar.close()
+    if request_thread_errors:
+        error, traceback = request_thread_errors[0]
+        raise error.with_traceback(traceback)
+
     end_time = time.monotonic()
     timed_out = end_time - start_time >= test_timeout_s
     if timed_out:
@@ -296,11 +561,20 @@ def get_token_throughput_latencies(
         "stddev_output_tokens": stddev_output_tokens,
         "num_concurrent_requests": num_concurrent_requests,
         "additional_sampling_params": additional_sampling_params,
+        "tokenizer": dict(
+            tokenizer_provenance
+            or {
+                "id": "hf-internal-testing/llama-tokenizer",
+                "selection": "global_default",
+                "accuracy": "approximate",
+                "warning": "Tokenizer was not explicitly selected for this model",
+            }
+        ),
         "timed_out": timed_out,
     }
 
     metadata["results"] = ret
-        
+
     return metadata, completed_requests
 
 
@@ -356,12 +630,7 @@ def metrics_summary(
         ret[common_metrics.OUTPUT_THROUGHPUT] = 0
         ret[common_metrics.NUM_COMPLETED_REQUESTS] = 0
         ret[common_metrics.COMPLETED_REQUESTS_PER_MIN] = 0
-        ret[common_metrics.KV_CACHE] = {
-            "measured_requests": 0,
-            "hit_tokens": 0,
-            "miss_tokens": 0,
-            "hit_ratio": None,
-        }
+        ret[common_metrics.KV_CACHE] = summarize_cache_counters([])
         return ret
 
     def flatten(item):
@@ -373,7 +642,7 @@ def metrics_summary(
 
     df = pd.DataFrame(metrics)
     df_without_errored_req = df[df[common_metrics.ERROR_CODE].isna()]
-    
+
     for key in metric_keys:
         print(key)
         ret[key] = {}
@@ -430,32 +699,10 @@ def metrics_summary(
     ret[common_metrics.NUM_COMPLETED_REQUESTS] = num_completed_requests
     ret[common_metrics.COMPLETED_REQUESTS_PER_MIN] = num_completed_requests_per_min
 
-    cache_metrics = (
-        df_without_errored_req.dropna(
-            subset=[common_metrics.KV_CACHE_HIT_TOKENS],
-        )
-        if common_metrics.KV_CACHE_HIT_TOKENS in df_without_errored_req
-        else pd.DataFrame()
+    ret[common_metrics.KV_CACHE] = summarize_cache_counters(
+        df_without_errored_req.to_dict(orient="records")
     )
-    cache_hit_tokens = (
-        cache_metrics[common_metrics.KV_CACHE_HIT_TOKENS].sum()
-        if not cache_metrics.empty
-        else 0
-    )
-    cache_miss_tokens = (
-        cache_metrics[common_metrics.KV_CACHE_MISS_TOKENS].sum()
-        if not cache_metrics.empty
-        and common_metrics.KV_CACHE_MISS_TOKENS in cache_metrics
-        else 0
-    )
-    cache_tokens = cache_hit_tokens + cache_miss_tokens
-    ret[common_metrics.KV_CACHE] = {
-        "measured_requests": len(cache_metrics),
-        "hit_tokens": cache_hit_tokens,
-        "miss_tokens": cache_miss_tokens,
-        "hit_ratio": cache_hit_tokens / cache_tokens if cache_tokens else None,
-    }
-    
+
     return ret
 
 

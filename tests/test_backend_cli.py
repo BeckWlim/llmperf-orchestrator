@@ -18,7 +18,7 @@ def _arguments(*values):
     return build_parser().parse_args(["config", *values])
 
 
-def test_config_set_get_list_unset(tmp_path, monkeypatch):
+def test_config_crud(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     path = backend_environment_path()
 
@@ -51,7 +51,7 @@ def test_config_set_get_list_unset(tmp_path, monkeypatch):
     assert "LLMPERF_SERVER_HOST" not in read_environment_file(path)
 
 
-def test_user_config_is_default_and_process_environment_wins(tmp_path, monkeypatch):
+def test_env_precedence(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     path = backend_environment_path()
     execute_config(_arguments("set", "DEPLOYMENT_TEST_VALUE", "from-file"))
@@ -64,7 +64,7 @@ def test_user_config_is_default_and_process_environment_wins(tmp_path, monkeypat
     assert os.environ["DEPLOYMENT_TEST_VALUE"] == "from-process"
 
 
-def test_config_set_reads_secret_from_stdin(tmp_path, monkeypatch):
+def test_secret_stdin(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr("sys.stdin", io.StringIO("stdin-secret\n"))
 
@@ -77,14 +77,14 @@ def test_config_set_reads_secret_from_stdin(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("values", [(), ("value", "--stdin")])
-def test_config_set_requires_exactly_one_value_source(tmp_path, monkeypatch, values):
+def test_value_source_guard(tmp_path, monkeypatch, values):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
 
     with pytest.raises(UserConfigError, match="exactly one"):
         execute_config(_arguments("set", "VALID_NAME", *values))
 
 
-def test_legacy_local_env_is_fallback(tmp_path, monkeypatch):
+def test_legacy_env_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty-xdg"))
     monkeypatch.delenv("LLMPERF_ENV_FILE", raising=False)
     monkeypatch.chdir(tmp_path)

@@ -59,7 +59,7 @@ def test_fast_mode(tmp_path, monkeypatch):
     loader.assert_called_once_with(str(tmp_path), local_files_only=True, use_fast=False)
 
 
-def test_tokenizers_backend_compatibility(tmp_path, monkeypatch):
+def test_backend_compatibility(tmp_path, monkeypatch):
     error = ValueError(
         "Tokenizer class TokenizersBackend does not exist or is not currently imported."
     )

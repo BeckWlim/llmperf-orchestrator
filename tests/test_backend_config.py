@@ -10,6 +10,7 @@ from llmperf_backend.config import (
     load_config_text,
 )
 from llmperf_backend.environment import load_environment
+from llmperf_backend.models import BenchmarkCampaignStart, DatabaseConfig
 
 
 VALID_CONFIG = """
@@ -33,6 +34,39 @@ def test_defaults():
     assert config.server.port == 9000
     assert config.benchmark.concurrent_requests == 2
     assert config.benchmark.timeout_seconds == 90
+    assert config.benchmark.tokenizer.selection == "global_default"
+    assert config.benchmark.tokenizer.accuracy == "approximate"
+    assert config.planner.enabled is True
+    assert config.planner.batch_size == 20
+
+
+def test_postgres_only():
+    with pytest.raises(ValueError, match=r"postgresql\+asyncpg"):
+        DatabaseConfig(url="mysql+aiomysql:///unsupported")
+
+
+def test_campaign_workload():
+    with pytest.raises(ValueError, match="runners or runner_plans"):
+        BenchmarkCampaignStart.model_validate({"campaign": {"name": "empty"}})
+
+    campaign = BenchmarkCampaignStart.model_validate(
+        {
+            "campaign": {"name": "planned"},
+            "runner_plans": [
+                {
+                    "name": "every-30s",
+                    "timezone": "Asia/Shanghai",
+                    "max_occurrences": 8,
+                    "recurrence": {"kind": "interval", "every_seconds": 30},
+                    "runner": {},
+                }
+            ],
+        }
+    )
+
+    assert campaign.runners == []
+    assert campaign.runner_plans[0].max_occurrences == 8
+    assert campaign.runner_plans[0].starts_at is None
 
 
 def test_runner_tokenizer():
@@ -49,6 +83,37 @@ def test_runner_tokenizer():
     assert config.benchmark.tokenizer.id == "Qwen/Qwen2.5-7B-Instruct"
     assert config.benchmark.tokenizer.revision == "tokenizer-release"
     assert config.benchmark.tokenizer.use_fast is False
+    assert config.benchmark.tokenizer.selection == "explicit"
+    assert config.benchmark.tokenizer.accuracy == "compatible"
+
+
+def test_probe_tokenizer_rejection():
+    with pytest.raises(ConfigError, match="allow_approximate_tokenizer"):
+        load_config_text(
+            VALID_CONFIG
+            + """
+  cache_probe:
+    mode: exact_repeat
+    trials: 2
+"""
+        )
+
+
+def test_probe_tokenizer_acceptance():
+    config = load_config_text(
+        VALID_CONFIG
+        + """
+  tokenizer:
+    id: organization/model-tokenizer
+    revision: release
+  cache_probe:
+    mode: exact_repeat
+    trials: 2
+"""
+    )
+
+    assert config.benchmark.cache_probe.trials == 2
+    assert config.benchmark.tokenizer.selection == "explicit"
 
 
 def test_environment_expansion(monkeypatch):

@@ -94,6 +94,9 @@ def test_list_projection():
     runner = SimpleNamespace(
         id="runner-1",
         campaign_id=None,
+        runner_plan_id=None,
+        plan_occurrence=None,
+        scheduled_for=None,
         label="smoke",
         created_by="tester",
         status=FAILED,
@@ -111,6 +114,9 @@ def test_list_projection():
         created_at=created_at,
         started_at=None,
         finished_at=created_at,
+        scheduler_id="scheduler-1",
+        process_id=62791,
+        exit_code=1,
         stdout="large stdout",
         stderr="large stderr",
     )
@@ -125,6 +131,8 @@ def test_list_projection():
         "failed": 1,
         "error_rate": 1.0,
     }
+    assert listed["scheduler_id"] == "scheduler-1"
+    assert listed["worker"] == {"process_id": 62791, "exit_code": 1}
     assert "summary" not in listed
     assert "stdout" not in listed
     assert "stderr" not in listed

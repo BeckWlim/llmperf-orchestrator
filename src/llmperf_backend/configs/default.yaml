@@ -26,6 +26,11 @@ scheduler:
   worker_module: llmperf_backend.worker
   log_bytes_limit: "${LLMPERF_LOG_LIMIT:-1000000}"
 
+planner:
+  enabled: "${LLMPERF_PLANNER_ENABLED:-true}"
+  poll_interval_seconds: "${LLMPERF_PLANNER_POLL:-1.0}"
+  batch_size: "${LLMPERF_PLANNER_BATCH:-20}"
+
 auth:
   # Enable after generating a trusted ctl private/public PEM key pair.
   enabled: "${LLMPERF_AUTH_ENABLED:-false}"
@@ -45,6 +50,8 @@ benchmark:
     id: "${LLMPERF_DEFAULT_TOKENIZER:-hf-internal-testing/llama-tokenizer}"
     revision: main
     use_fast: true
+    selection: global_default
+    accuracy: approximate
   timeout_seconds: "${LLMPERF_TIMEOUT_SECONDS:-90}"
   max_completed_requests: "${LLMPERF_REQUESTS_MAX:-10}"
   concurrent_requests: "${LLMPERF_CONCURRENT_REQUESTS:-1}"

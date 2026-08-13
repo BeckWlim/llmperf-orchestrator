@@ -2,9 +2,12 @@ import asyncio
 from pathlib import Path
 
 import httpx
+import pytest
 
 from llmperf_backend.app import create_app
 from llmperf_backend.config import ConfigStore
+from llmperf_backend.models import DatabaseConfig
+from llmperf_backend.persistence import Base, Database
 from llmperf_backend.providers import ProviderRegistry
 from llmperf_backend.tokenizers import TokenizerResolution
 from llmperf_backend.datasets import DatasetResolution
@@ -17,13 +20,18 @@ server:
   host: 127.0.0.1
   port: 8000
 database:
-  url: "sqlite+aiosqlite:///{database_path}"
+  url: "{database_url}"
 scheduler:
+  enabled: false
+planner:
   enabled: false
 benchmark:
   provider: test
   model: test-model
 """
+
+
+pytestmark = pytest.mark.postgresql
 
 
 class FakeTokenizerCache:
@@ -93,12 +101,10 @@ class ASGITestClient:
 
 
 def make_client(
-    tmp_path: Path, tokenizer_cache=None, dataset_cache=None
+    tmp_path: Path, database_url: str, tokenizer_cache=None, dataset_cache=None
 ) -> ASGITestClient:
     config_path = tmp_path / "backend.yaml"
-    config_path.write_text(
-        CONFIG.format(database_path=tmp_path / "backend.db"), encoding="utf-8"
-    )
+    config_path.write_text(CONFIG.format(database_url=database_url), encoding="utf-8")
     providers = ProviderRegistry.from_environment(
         {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
     )
@@ -120,8 +126,38 @@ def make_client(
     )
 
 
-def test_health(tmp_path: Path):
-    with make_client(tmp_path) as client:
+@pytest.fixture(autouse=True)
+def clean_postgres(postgresql_url):
+    async def reset():
+        database = Database(
+            DatabaseConfig(url=postgresql_url, auto_create_schema=False)
+        )
+        try:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+        finally:
+            await database.dispose()
+
+    asyncio.run(reset())
+    yield
+    asyncio.run(reset())
+
+
+@pytest.fixture
+def client_factory(tmp_path: Path, postgresql_url):
+    def factory(tokenizer_cache=None, dataset_cache=None):
+        return make_client(
+            tmp_path,
+            postgresql_url,
+            tokenizer_cache=tokenizer_cache,
+            dataset_cache=dataset_cache,
+        )
+
+    return factory
+
+
+def test_health(client_factory):
+    with client_factory() as client:
         health = client.get("/health")
         assert health.status_code == 200
         assert health.json()["status"] == "ok"
@@ -132,9 +168,9 @@ def test_health(tmp_path: Path):
         assert response.json()["config"]["benchmark"]["model"] == "test-model"
 
 
-def test_config_validation(tmp_path: Path):
-    rendered_config = CONFIG.format(database_path=tmp_path / "validated.db")
-    with make_client(tmp_path) as client:
+def test_config_validation(client_factory, postgresql_url):
+    rendered_config = CONFIG.format(database_url=postgresql_url)
+    with client_factory() as client:
         response = client.post(
             "/api/v1/config/validate", json={"yaml_content": rendered_config}
         )
@@ -147,8 +183,8 @@ def test_config_validation(tmp_path: Path):
         assert invalid.status_code == 422
 
 
-def test_runner_lifecycle(tmp_path: Path):
-    with make_client(tmp_path) as client:
+def test_runner_lifecycle(client_factory):
+    with client_factory() as client:
         campaign = client.post(
             "/api/v1/campaigns",
             json={
@@ -203,6 +239,7 @@ def test_runner_lifecycle(tmp_path: Path):
         campaign_status = client.get(f"/api/v1/campaigns/{campaign_id}")
         assert campaign_status.status_code == 200
         assert campaign_status.json()["status"] == "cancelled"
+        assert campaign_status.json()["outcome"] == "cancelled"
         assert campaign_status.json()["runner_count"] == 1
 
         campaigns = client.get("/api/v1/campaigns")
@@ -210,14 +247,17 @@ def test_runner_lifecycle(tmp_path: Path):
 
         exported = client.get(f"/api/v1/campaigns/{campaign_id}/export")
         assert exported.status_code == 200
+        assert exported.json()["version"] == 3
+        assert exported.json()["aggregate"]["status"] == "cancelled"
+        assert exported.json()["aggregate"]["outcome"] == "cancelled"
         assert exported.json()["aggregate"]["runner_count"] == 1
         assert exported.json()["aggregate"]["status_counts"]["cancelled"] == 1
         assert "worker" in exported.json()["runners"][0]
         assert "stdout" in exported.json()["runners"][0]
 
 
-def test_campaign_cancel(tmp_path: Path):
-    with make_client(tmp_path) as client:
+def test_campaign_cancel(client_factory):
+    with client_factory() as client:
         campaign_id = client.post(
             "/api/v1/campaigns", json={"name": "cancel-study"}
         ).json()["campaign_id"]
@@ -234,8 +274,14 @@ def test_campaign_cancel(tmp_path: Path):
         assert cancelled.json()["status_counts"]["cancelled"] == 2
 
 
-def test_atomic_campaign_start(tmp_path: Path):
-    with make_client(tmp_path) as client:
+def test_atomic_campaign_start(client_factory):
+    with client_factory() as client:
+        empty = client.post(
+            "/api/v1/campaigns/start",
+            json={"campaign": {"name": "empty-study"}},
+        )
+        assert empty.status_code == 422
+
         invalid = client.post(
             "/api/v1/campaigns/start",
             json={
@@ -274,21 +320,52 @@ def test_atomic_campaign_start(tmp_path: Path):
         assert status["runner_count"] == 2
         assert status["status"] == "queued"
 
+        planned = client.post(
+            "/api/v1/campaigns/start",
+            json={
+                "campaign": {"name": "planned-study"},
+                "runner_plans": [
+                    {
+                        "name": "interval-study",
+                        "timezone": "Asia/Shanghai",
+                        "starts_at": "2099-08-14T00:00:00+08:00",
+                        "max_occurrences": 8,
+                        "recurrence": {
+                            "kind": "interval",
+                            "every_seconds": 30,
+                        },
+                        "overlap_policy": "queue",
+                        "runner": {"label": "periodic"},
+                    }
+                ],
+            },
+        )
 
-def test_scheduler_status(tmp_path: Path):
-    with make_client(tmp_path) as client:
+        assert planned.status_code == 202
+        planned_document = planned.json()
+        assert planned_document["items"] == []
+        assert len(planned_document["runner_plans"]) == 1
+        planned_id = planned_document["campaign"]["campaign_id"]
+        planned_status = client.get(f"/api/v1/campaigns/{planned_id}").json()
+        assert planned_status["status"] == "planned"
+        assert planned_status["runner_plan_count"] == 1
+
+
+def test_scheduler_status(client_factory):
+    with client_factory() as client:
         response = client.get("/api/v1/scheduler/status")
 
         assert response.status_code == 200
         assert response.json()["status"] == "disabled"
-        assert response.json()["active_slots"] == 0
+        assert response.json()["busy_slots"] == 0
+        assert response.json()["live_slots"] == 0
 
 
-def test_runner_tokenizer(tmp_path: Path):
+def test_runner_tokenizer(tmp_path: Path, client_factory):
     tokenizer_directory = tmp_path / "tokenizer"
     tokenizer_directory.mkdir()
     cache = FakeTokenizerCache(tokenizer_directory)
-    with make_client(tmp_path, tokenizer_cache=cache) as client:
+    with client_factory(tokenizer_cache=cache) as client:
         created = client.post(
             "/api/v1/runners",
             json={
@@ -305,20 +382,25 @@ def test_runner_tokenizer(tmp_path: Path):
         )
 
         assert created.status_code == 202
-        assert created.json()["benchmark"]["tokenizer"] == {
+        tokenizer = created.json()["benchmark"]["tokenizer"]
+        assert tokenizer == {
             "source": "huggingface",
             "id": "organization/model-tokenizer",
             "revision": "resolved-commit",
             "use_fast": False,
+            "selection": "explicit",
+            "accuracy": "compatible",
+            "requested_revision": "release",
+            "immutable_revision": False,
         }
         assert cache.specs[0]["revision"] == "release"
 
 
-def test_runner_dataset(tmp_path: Path):
+def test_runner_dataset(tmp_path: Path, client_factory):
     dataset_path = tmp_path / "sharegpt.json"
     dataset_path.write_text("[]", encoding="utf-8")
     cache = FakeDatasetCache(dataset_path)
-    with make_client(tmp_path, dataset_cache=cache) as client:
+    with client_factory(dataset_cache=cache) as client:
         created = client.post(
             "/api/v1/runners",
             json={
@@ -340,7 +422,41 @@ def test_runner_dataset(tmp_path: Path):
             "source": "huggingface",
             "id": "organization/sharegpt",
             "filename": "sharegpt.json",
-            "revision": "release",
+            "revision": "resolved-dataset-commit",
             "format": "sharegpt",
         }
-        assert cache.specs == []
+        assert cache.specs[0]["revision"] == "release"
+
+
+def test_runner_plan(client_factory):
+    with client_factory() as client:
+        campaign_id = client.post(
+            "/api/v1/campaigns", json={"name": "planner-study"}
+        ).json()["campaign_id"]
+        created = client.post(
+            f"/api/v1/campaigns/{campaign_id}/runner-plans",
+            json={
+                "name": "shanghai-hourly",
+                "timezone": "Asia/Shanghai",
+                "starts_at": "2026-08-13T00:00:00Z",
+                "max_occurrences": 2,
+                "recurrence": {"kind": "interval", "every_seconds": 3600},
+                "overlap_policy": "skip",
+                "runner": {"label": "planned"},
+            },
+        )
+
+        assert created.status_code == 201
+        plan = created.json()
+        plan_id = plan["runner_plan_id"]
+        assert plan["status"] == "active"
+        assert plan["overlap_policy"] == "skip"
+        assert plan["runner"]["benchmark"]["model"] == "test-model"
+        listed = client.get("/api/v1/runner-plans")
+        assert listed.json()["items"][0]["runner_plan_id"] == plan_id
+        paused = client.post(f"/api/v1/runner-plans/{plan_id}/pause")
+        assert paused.json()["status"] == "paused"
+        resumed = client.post(f"/api/v1/runner-plans/{plan_id}/resume")
+        assert resumed.json()["status"] == "active"
+        cancelled = client.post(f"/api/v1/runner-plans/{plan_id}/cancel")
+        assert cancelled.json()["status"] == "cancelled"

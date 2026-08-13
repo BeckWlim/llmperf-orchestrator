@@ -100,7 +100,7 @@ def test_shared_huggingface_proxy(tmp_path, monkeypatch):
     }
 
 
-def test_shared_huggingface_proxy_environment(tmp_path, monkeypatch):
+def test_shared_proxy_env(tmp_path, monkeypatch):
     monkeypatch.setenv("LLMPERF_HUGGINGFACE_PROXY", "http://proxy.environment:8080")
 
     cache = DatasetCache(cache_directory=tmp_path)

@@ -1,35 +1,20 @@
 """Opt-in tests against a dedicated disposable PostgreSQL database."""
 
 import asyncio
-import os
-
+from datetime import datetime, timedelta, timezone
 import pytest
 
 pytest.importorskip("sqlalchemy")
 pytest.importorskip("asyncpg")
 
-from sqlalchemy.engine import make_url
-
 from llmperf_backend.models import DatabaseConfig
 from llmperf_backend.persistence import Base, Database, RunnerRepository
 
 
-TEST_DATABASE_URL = os.environ.get("LLMPERF_TEST_DB")
-
-
 @pytest.mark.postgresql
-def test_lifecycle():
-    if not TEST_DATABASE_URL:
-        pytest.skip("LLMPERF_TEST_DB is not configured")
-    url = make_url(TEST_DATABASE_URL)
-    database_name = url.database or ""
-    assert url.drivername == "postgresql+asyncpg"
-    assert (
-        "test" in database_name.lower()
-    ), "Refusing to reset a PostgreSQL database whose name does not contain 'test'"
-
+def test_postgres_lifecycle(postgresql_url):
     async def exercise_repository():
-        database = Database(DatabaseConfig(url=TEST_DATABASE_URL))
+        database = Database(DatabaseConfig(url=postgresql_url))
         try:
             async with database.engine.begin() as connection:
                 await connection.run_sync(Base.metadata.drop_all)
@@ -89,6 +74,79 @@ def test_lifecycle():
             assert user["role"] == "operator"
             trusted = await repository.get_trusted_client_by_key_id("0123456789abcdef")
             assert trusted["username"] == "postgres-operator"
+
+            plan = await repository.create_runner_plan(
+                campaign["campaign_id"],
+                {
+                    "name": "postgres-plan",
+                    "timezone": "Asia/Shanghai",
+                    "starts_at": datetime.now(timezone.utc) - timedelta(seconds=31),
+                    "ends_at": None,
+                    "max_occurrences": 2,
+                    "recurrence": {"kind": "interval", "every_seconds": 30},
+                    "overlap_policy": "queue",
+                    "misfire_grace_seconds": 60,
+                },
+                {
+                    "label": "planned-runner",
+                    "metadata": {"suite": "planner"},
+                    "benchmark": {
+                        "provider": "test",
+                        "model": "planned-model",
+                        "llm_api": "openai",
+                    },
+                },
+                "bootstrap-test",
+            )
+            assert plan["status"] == "active"
+            emitted = await asyncio.gather(
+                repository.materialize_due_plans(10),
+                repository.materialize_due_plans(10),
+            )
+            emitted_count = sum(emitted) + await repository.materialize_due_plans(10)
+            assert emitted_count == 2
+            persisted_plan = await repository.get_runner_plan(plan["runner_plan_id"])
+            assert persisted_plan["status"] == "completed"
+            assert persisted_plan["emitted_count"] == 2
+            queued = await repository.list_runners("queued", 100, 0, full=True)
+            planned = [
+                runner
+                for runner in queued
+                if runner["runner_plan_id"] == plan["runner_plan_id"]
+            ]
+            assert {runner["plan_occurrence"] for runner in planned} == {0, 1}
+
+            skip_plan = await repository.create_runner_plan(
+                campaign["campaign_id"],
+                {
+                    "name": "postgres-skip-plan",
+                    "timezone": "Asia/Shanghai",
+                    "starts_at": datetime.now(timezone.utc) - timedelta(seconds=31),
+                    "ends_at": None,
+                    "max_occurrences": 2,
+                    "recurrence": {"kind": "interval", "every_seconds": 30},
+                    "overlap_policy": "skip",
+                    "misfire_grace_seconds": 60,
+                },
+                {
+                    "label": "skip-planned-runner",
+                    "metadata": {"suite": "planner"},
+                    "benchmark": {
+                        "provider": "test",
+                        "model": "planned-model",
+                        "llm_api": "openai",
+                    },
+                },
+                "bootstrap-test",
+            )
+            assert await repository.materialize_due_plans(10) == 1
+            assert await repository.materialize_due_plans(10) == 0
+            persisted_skip = await repository.get_runner_plan(
+                skip_plan["runner_plan_id"]
+            )
+            assert persisted_skip["status"] == "completed"
+            assert persisted_skip["emitted_count"] == 1
+            assert persisted_skip["skipped_count"] == 1
         finally:
             async with database.engine.begin() as connection:
                 await connection.run_sync(Base.metadata.drop_all)

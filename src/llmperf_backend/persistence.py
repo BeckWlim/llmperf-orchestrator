@@ -2,14 +2,15 @@
 
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import (
-    JSON,
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -19,6 +20,7 @@ from sqlalchemy import (
     func,
     or_,
     select,
+    text,
     update,
 )
 from sqlalchemy.ext.asyncio import (
@@ -31,6 +33,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from llmperf_backend.models import DatabaseConfig
+from llmperf_backend.planner import as_utc, next_fire_details
 
 
 QUEUED = "queued"
@@ -39,7 +42,12 @@ SUCCEEDED = "succeeded"
 FAILED = "failed"
 CANCELLED = "cancelled"
 TERMINAL_STATUSES = {SUCCEEDED, FAILED, CANCELLED}
-JSON_DOCUMENT = JSON().with_variant(JSONB, "postgresql")
+PLAN_ACTIVE = "active"
+PLAN_PAUSED = "paused"
+PLAN_COMPLETED = "completed"
+PLAN_CANCELLED = "cancelled"
+PLAN_STATUSES = {PLAN_ACTIVE, PLAN_PAUSED, PLAN_COMPLETED, PLAN_CANCELLED}
+JSON_DOCUMENT = JSONB
 
 
 def utcnow() -> datetime:
@@ -82,8 +90,82 @@ class BenchmarkCampaignRecord(Base):
     )
 
 
+class BenchmarkRunnerPlanRecord(Base):
+    __tablename__ = "benchmark_runner_plans"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'paused', 'completed', 'cancelled')",
+            name="ck_runner_plan_status",
+        ),
+        CheckConstraint(
+            "ends_at IS NOT NULL OR max_occurrences IS NOT NULL",
+            name="ck_runner_plan_boundary",
+        ),
+        CheckConstraint(
+            "ends_at IS NULL OR ends_at > starts_at",
+            name="ck_runner_plan_time_range",
+        ),
+        CheckConstraint(
+            "overlap_policy IN ('queue', 'skip')",
+            name="ck_runner_plan_overlap_policy",
+        ),
+        Index(
+            "ix_runner_plan_due",
+            "next_fire_at",
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index("ix_runner_plan_campaign", "campaign_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("benchmark_campaigns.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default=PLAN_ACTIVE, nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    recurrence: Mapped[Dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
+    overlap_policy: Mapped[str] = mapped_column(String(20), nullable=False)
+    runner_template: Mapped[Dict[str, Any]] = mapped_column(
+        JSON_DOCUMENT, nullable=False
+    )
+    template_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    max_occurrences: Mapped[Optional[int]] = mapped_column(Integer)
+    next_fire_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_fire_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    occurrence_cursor: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    emitted_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    misfire_grace_seconds: Mapped[int] = mapped_column(
+        Integer, default=60, nullable=False
+    )
+    created_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
 class BenchmarkRunnerRecord(Base):
     __tablename__ = "benchmark_runners"
+    __table_args__ = (
+        UniqueConstraint(
+            "runner_plan_id", "plan_occurrence", name="uq_runner_plan_occurrence"
+        ),
+        Index(
+            "ix_runners_queue_created_at",
+            "created_at",
+            postgresql_where=text("status = 'queued'"),
+        ),
+        Index("ix_runners_status_created_at", "status", "created_at"),
+        Index("ix_runner_plan_time", "runner_plan_id", "scheduled_for"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     campaign_id: Mapped[Optional[str]] = mapped_column(
@@ -91,9 +173,16 @@ class BenchmarkRunnerRecord(Base):
         ForeignKey("benchmark_campaigns.id", ondelete="SET NULL"),
         index=True,
     )
+    runner_plan_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("benchmark_runner_plans.id", ondelete="SET NULL"),
+    )
+    plan_occurrence: Mapped[Optional[int]] = mapped_column(Integer)
+    scheduled_for: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    plan_template_version: Mapped[Optional[int]] = mapped_column(Integer)
     label: Mapped[Optional[str]] = mapped_column(String(200))
     created_by: Mapped[str] = mapped_column(String(64), nullable=False)
-    status: Mapped[str] = mapped_column(String(20), index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
     benchmark_config: Mapped[Dict[str, Any]] = mapped_column(
         JSON_DOCUMENT, nullable=False
     )
@@ -156,6 +245,33 @@ class BenchmarkRunnerEventRecord(Base):
     )
 
 
+class BenchmarkRunnerPlanEventRecord(Base):
+    __tablename__ = "benchmark_runner_plan_events"
+    __table_args__ = (
+        Index("ix_runner_plan_event_time", "runner_plan_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    runner_plan_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("benchmark_runner_plans.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    occurrence: Mapped[Optional[int]] = mapped_column(Integer)
+    scheduled_for: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    runner_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("benchmark_runners.id", ondelete="SET NULL")
+    )
+    message: Mapped[Optional[str]] = mapped_column(Text)
+    details: Mapped[Dict[str, Any]] = mapped_column(
+        JSON_DOCUMENT, default=dict, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
 class UserRecord(Base):
     __tablename__ = "users"
 
@@ -213,11 +329,10 @@ class Database:
             "echo": config.echo,
             "pool_pre_ping": True,
         }
-        if not config.url.startswith("sqlite+"):
-            engine_options.update(
-                pool_size=config.pool_size,
-                max_overflow=config.max_overflow,
-            )
+        engine_options.update(
+            pool_size=config.pool_size,
+            max_overflow=config.max_overflow,
+        )
         self.engine: AsyncEngine = create_async_engine(config.url, **engine_options)
         self.sessions = async_sessionmaker(
             self.engine, expire_on_commit=False, class_=AsyncSession
@@ -240,9 +355,19 @@ class Database:
 
 
 def _runner_dict(runner: BenchmarkRunnerRecord) -> Dict[str, Any]:
+    dispatch_lag = (
+        (runner.started_at - runner.scheduled_for).total_seconds()
+        if runner.started_at is not None and runner.scheduled_for is not None
+        else None
+    )
     return {
         "runner_id": runner.id,
         "campaign_id": runner.campaign_id,
+        "runner_plan_id": runner.runner_plan_id,
+        "plan_occurrence": runner.plan_occurrence,
+        "scheduled_for": runner.scheduled_for,
+        "dispatch_lag_seconds": dispatch_lag,
+        "plan_template_version": runner.plan_template_version,
         "label": runner.label,
         "created_by": runner.created_by,
         "status": runner.status,
@@ -273,9 +398,18 @@ def _runner_list_dict(runner: BenchmarkRunnerRecord) -> Dict[str, Any]:
     summary = runner.summary or {}
     results = summary.get("results") or {}
     outcome = summary.get("outcome") or {}
+    dispatch_lag = (
+        (runner.started_at - runner.scheduled_for).total_seconds()
+        if runner.started_at is not None and runner.scheduled_for is not None
+        else None
+    )
     return {
         "runner_id": runner.id,
         "campaign_id": runner.campaign_id,
+        "runner_plan_id": runner.runner_plan_id,
+        "plan_occurrence": runner.plan_occurrence,
+        "scheduled_for": runner.scheduled_for,
+        "dispatch_lag_seconds": dispatch_lag,
         "label": runner.label,
         "created_by": runner.created_by,
         "status": runner.status,
@@ -294,6 +428,43 @@ def _runner_list_dict(runner: BenchmarkRunnerRecord) -> Dict[str, Any]:
         "created_at": runner.created_at,
         "started_at": runner.started_at,
         "finished_at": runner.finished_at,
+        "scheduler_id": runner.scheduler_id,
+        "worker": {
+            "process_id": runner.process_id,
+            "exit_code": runner.exit_code,
+        },
+    }
+
+
+def _runner_plan_dict(plan: BenchmarkRunnerPlanRecord) -> Dict[str, Any]:
+    next_fire_local = (
+        plan.next_fire_at.astimezone(ZoneInfo(plan.timezone)).isoformat()
+        if plan.next_fire_at is not None
+        else None
+    )
+    return {
+        "runner_plan_id": plan.id,
+        "campaign_id": plan.campaign_id,
+        "name": plan.name,
+        "status": plan.status,
+        "timezone": plan.timezone,
+        "recurrence": plan.recurrence,
+        "overlap_policy": plan.overlap_policy,
+        "runner": plan.runner_template,
+        "template_version": plan.template_version,
+        "starts_at": plan.starts_at,
+        "ends_at": plan.ends_at,
+        "max_occurrences": plan.max_occurrences,
+        "next_fire_at": plan.next_fire_at,
+        "next_fire_local": next_fire_local,
+        "last_fire_at": plan.last_fire_at,
+        "occurrence_cursor": plan.occurrence_cursor,
+        "emitted_count": plan.emitted_count,
+        "skipped_count": plan.skipped_count,
+        "misfire_grace_seconds": plan.misfire_grace_seconds,
+        "created_by": plan.created_by,
+        "created_at": plan.created_at,
+        "updated_at": plan.updated_at,
     }
 
 
@@ -307,6 +478,92 @@ class RunnerRepository:
     def _event(runner_id: str, status: str, message: Optional[str] = None):
         return BenchmarkRunnerEventRecord(
             runner_id=runner_id, status=status, message=message
+        )
+
+    @staticmethod
+    def _plan_event(
+        runner_plan_id: str,
+        event_type: str,
+        occurrence: Optional[int] = None,
+        scheduled_for: Optional[datetime] = None,
+        runner_id: Optional[str] = None,
+        message: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> BenchmarkRunnerPlanEventRecord:
+        return BenchmarkRunnerPlanEventRecord(
+            runner_plan_id=runner_plan_id,
+            event_type=event_type,
+            occurrence=occurrence,
+            scheduled_for=scheduled_for,
+            runner_id=runner_id,
+            message=message,
+            details=json_safe(details or {}),
+        )
+
+    def _dst_events(
+        self,
+        session: AsyncSession,
+        runner_plan_id: str,
+        occurrence: int,
+        adjustments: Sequence[Dict[str, Any]],
+        planner_id: Optional[str] = None,
+    ) -> None:
+        for adjustment in adjustments:
+            details = dict(adjustment)
+            details["planner_id"] = planner_id
+            session.add(
+                self._plan_event(
+                    runner_plan_id,
+                    "dst_adjusted",
+                    occurrence=occurrence,
+                    message=(
+                        f"DST policy {adjustment['policy']} applied to "
+                        f"{adjustment['local_time']} {adjustment['timezone']}"
+                    ),
+                    details=details,
+                )
+            )
+
+    @staticmethod
+    def _new_runner_plan(
+        campaign_id: str,
+        payload: Dict[str, Any],
+        runner_template: Dict[str, Any],
+        created_by: str,
+        default_starts_at: datetime,
+    ) -> Tuple[BenchmarkRunnerPlanRecord, Sequence[Dict[str, Any]]]:
+        immediate_first = payload.get("starts_at") is None
+        starts_at = as_utc(payload.get("starts_at") or default_starts_at)
+        ends_at = as_utc(payload["ends_at"]) if payload.get("ends_at") else None
+        recurrence = json_safe(payload["recurrence"])
+        if immediate_first:
+            first_fire, adjustments = starts_at, []
+        else:
+            first_fire, adjustments = next_fire_details(
+                payload["timezone"], recurrence, starts_at, after=None
+            )
+        plan_status = PLAN_ACTIVE
+        if ends_at is not None and first_fire > ends_at:
+            plan_status = PLAN_COMPLETED
+            first_fire = None
+        return (
+            BenchmarkRunnerPlanRecord(
+                id=str(uuid4()),
+                campaign_id=campaign_id,
+                name=payload["name"],
+                status=plan_status,
+                timezone=payload["timezone"],
+                recurrence=recurrence,
+                overlap_policy=payload["overlap_policy"],
+                runner_template=json_safe(runner_template),
+                starts_at=starts_at,
+                ends_at=ends_at,
+                max_occurrences=payload.get("max_occurrences"),
+                next_fire_at=first_fire,
+                misfire_grace_seconds=payload.get("misfire_grace_seconds", 60),
+                created_by=created_by,
+            ),
+            adjustments,
         )
 
     async def create_runner(
@@ -387,15 +644,16 @@ class RunnerRepository:
             await session.flush()
         return self._campaign_dict(campaign)
 
-    async def create_campaign_with_runners(
+    async def create_campaign_workload(
         self,
         name: str,
         description: Optional[str],
         tags: Dict[str, Any],
         runners: Sequence[Dict[str, Any]],
+        runner_plans: Sequence[Dict[str, Any]],
         created_by: str,
     ) -> Dict[str, Any]:
-        """Create a Campaign and all initial Runners in one transaction."""
+        """Create a Campaign and its validated workload in one transaction."""
 
         campaign = BenchmarkCampaignRecord(
             id=str(uuid4()),
@@ -416,19 +674,357 @@ class RunnerRepository:
             )
             for runner in runners
         ]
+        plans_with_adjustments = []
+        plans = []
         async with self.database.sessions() as session, session.begin():
+            if runner_plans:
+                database_now = as_utc(
+                    (await session.execute(select(func.now()))).scalar_one()
+                )
+                plans_with_adjustments = [
+                    self._new_runner_plan(
+                        campaign.id,
+                        runner_plan["plan"],
+                        runner_plan["runner_template"],
+                        created_by,
+                        database_now,
+                    )
+                    for runner_plan in runner_plans
+                ]
+                plans = [item[0] for item in plans_with_adjustments]
             session.add(campaign)
+            await session.flush()
             session.add_all(records)
+            session.add_all(plans)
             await session.flush()
             session.add_all(
                 self._event(runner.id, QUEUED, "Runner accepted in Campaign")
                 for runner in records
             )
+            for plan, adjustments in plans_with_adjustments:
+                session.add(
+                    self._plan_event(
+                        plan.id,
+                        "created",
+                        scheduled_for=plan.next_fire_at,
+                        message="RunnerPlan accepted in Campaign",
+                    )
+                )
+                self._dst_events(session, plan.id, 0, adjustments)
             await session.flush()
         return {
             "campaign": self._campaign_dict(campaign),
             "items": [_runner_dict(runner) for runner in records],
+            "runner_plans": [_runner_plan_dict(plan) for plan in plans],
         }
+
+    async def create_runner_plan(
+        self,
+        campaign_id: str,
+        payload: Dict[str, Any],
+        runner_template: Dict[str, Any],
+        created_by: str,
+    ) -> Optional[Dict[str, Any]]:
+        async with self.database.sessions() as session, session.begin():
+            campaign = await session.get(BenchmarkCampaignRecord, campaign_id)
+            if campaign is None:
+                return None
+            database_now = as_utc(
+                (await session.execute(select(func.now()))).scalar_one()
+            )
+            plan, adjustments = self._new_runner_plan(
+                campaign_id,
+                payload,
+                runner_template,
+                created_by,
+                database_now,
+            )
+            session.add(plan)
+            await session.flush()
+            session.add(
+                self._plan_event(
+                    plan.id,
+                    "created",
+                    scheduled_for=plan.next_fire_at,
+                    message="RunnerPlan created",
+                )
+            )
+            self._dst_events(session, plan.id, 0, adjustments)
+        return _runner_plan_dict(plan)
+
+    async def list_runner_plans(
+        self,
+        status: Optional[str],
+        campaign_id: Optional[str],
+        limit: int,
+        offset: int,
+    ) -> List[Dict[str, Any]]:
+        statement = select(BenchmarkRunnerPlanRecord)
+        if status is not None:
+            statement = statement.where(BenchmarkRunnerPlanRecord.status == status)
+        if campaign_id is not None:
+            statement = statement.where(
+                BenchmarkRunnerPlanRecord.campaign_id == campaign_id
+            )
+        statement = (
+            statement.order_by(BenchmarkRunnerPlanRecord.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        async with self.database.sessions() as session:
+            plans = (await session.execute(statement)).scalars().all()
+            return [_runner_plan_dict(plan) for plan in plans]
+
+    async def get_runner_plan(self, runner_plan_id: str) -> Optional[Dict[str, Any]]:
+        async with self.database.sessions() as session:
+            plan = await session.get(BenchmarkRunnerPlanRecord, runner_plan_id)
+            return _runner_plan_dict(plan) if plan is not None else None
+
+    async def get_plan_events(
+        self, runner_plan_id: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        async with self.database.sessions() as session:
+            plan = await session.get(BenchmarkRunnerPlanRecord, runner_plan_id)
+            if plan is None:
+                return None
+            statement = (
+                select(BenchmarkRunnerPlanEventRecord)
+                .where(BenchmarkRunnerPlanEventRecord.runner_plan_id == runner_plan_id)
+                .order_by(BenchmarkRunnerPlanEventRecord.id.asc())
+            )
+            events = (await session.execute(statement)).scalars().all()
+            return [
+                {
+                    "event_type": event.event_type,
+                    "occurrence": event.occurrence,
+                    "scheduled_for": event.scheduled_for,
+                    "runner_id": event.runner_id,
+                    "message": event.message,
+                    "details": event.details,
+                    "created_at": event.created_at,
+                }
+                for event in events
+            ]
+
+    async def change_runner_plan(
+        self, runner_plan_id: str, action: str
+    ) -> Optional[Dict[str, Any]]:
+        transitions = {
+            "pause": ({PLAN_ACTIVE}, PLAN_PAUSED),
+            "resume": ({PLAN_PAUSED}, PLAN_ACTIVE),
+            "cancel": ({PLAN_ACTIVE, PLAN_PAUSED}, PLAN_CANCELLED),
+        }
+        allowed, target = transitions[action]
+        async with self.database.sessions() as session, session.begin():
+            statement = (
+                select(BenchmarkRunnerPlanRecord)
+                .where(BenchmarkRunnerPlanRecord.id == runner_plan_id)
+                .with_for_update()
+            )
+            plan = (await session.execute(statement)).scalar_one_or_none()
+            if plan is None:
+                return None
+            if plan.status not in allowed:
+                response = _runner_plan_dict(plan)
+                response["transition_error"] = (
+                    f"cannot {action} RunnerPlan in {plan.status} state"
+                )
+                return response
+            plan.status = target
+            plan.updated_at = utcnow()
+            session.add(
+                self._plan_event(
+                    plan.id,
+                    "cancelled" if action == "cancel" else f"{action}d",
+                    scheduled_for=plan.next_fire_at,
+                    message=f"RunnerPlan {action}d",
+                )
+            )
+            await session.flush()
+            return _runner_plan_dict(plan)
+
+    async def materialize_due_plans(
+        self, limit: int, planner_id: Optional[str] = None
+    ) -> int:
+        """Materialize due RunnerPlans in one transaction per bounded batch."""
+
+        emitted = 0
+        async with self.database.sessions() as session, session.begin():
+            database_now = as_utc(
+                (await session.execute(select(func.now()))).scalar_one()
+            )
+            statement = (
+                select(BenchmarkRunnerPlanRecord)
+                .where(
+                    BenchmarkRunnerPlanRecord.status == PLAN_ACTIVE,
+                    BenchmarkRunnerPlanRecord.next_fire_at <= func.now(),
+                )
+                .order_by(BenchmarkRunnerPlanRecord.next_fire_at.asc())
+                .with_for_update(skip_locked=True)
+                .limit(limit)
+            )
+            plans = list((await session.execute(statement)).scalars().all())
+            for plan in plans:
+                emitted += await self._materialize_plan(
+                    session, plan, database_now, planner_id
+                )
+        return emitted
+
+    async def _materialize_plan(
+        self,
+        session: AsyncSession,
+        plan: BenchmarkRunnerPlanRecord,
+        database_now: datetime,
+        planner_id: Optional[str],
+    ) -> int:
+        planned_for = as_utc(plan.next_fire_at)
+        grace_boundary = database_now - timedelta(seconds=plan.misfire_grace_seconds)
+        skipped_start = plan.occurrence_cursor
+        while planned_for < grace_boundary:
+            plan.skipped_count += 1
+            plan.occurrence_cursor += 1
+            if self._plan_exhausted(plan):
+                plan.status = PLAN_COMPLETED
+                plan.next_fire_at = None
+                break
+            planned_for, adjustments = next_fire_details(
+                plan.timezone, plan.recurrence, plan.starts_at, planned_for
+            )
+            self._dst_events(
+                session,
+                plan.id,
+                plan.occurrence_cursor,
+                adjustments,
+                planner_id,
+            )
+            if plan.ends_at is not None and planned_for > as_utc(plan.ends_at):
+                plan.status = PLAN_COMPLETED
+                plan.next_fire_at = None
+                break
+            plan.next_fire_at = planned_for
+        skipped = plan.occurrence_cursor - skipped_start
+        if skipped:
+            session.add(
+                self._plan_event(
+                    plan.id,
+                    "misfire_skipped",
+                    occurrence=skipped_start,
+                    message=f"Skipped {skipped} expired occurrence(s)",
+                    details={"count": skipped, "planner_id": planner_id},
+                )
+            )
+        if plan.status == PLAN_COMPLETED or planned_for > database_now:
+            plan.updated_at = database_now
+            if plan.status == PLAN_COMPLETED:
+                session.add(
+                    self._plan_event(
+                        plan.id,
+                        "completed",
+                        occurrence=plan.occurrence_cursor,
+                        scheduled_for=plan.last_fire_at,
+                        message="RunnerPlan reached its execution boundary",
+                        details={"planner_id": planner_id},
+                    )
+                )
+            return 0
+
+        occurrence = plan.occurrence_cursor
+        template = plan.runner_template
+        should_emit = True
+        if plan.overlap_policy == "skip":
+            active_count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(BenchmarkRunnerRecord)
+                    .where(
+                        BenchmarkRunnerRecord.runner_plan_id == plan.id,
+                        BenchmarkRunnerRecord.status.in_({QUEUED, RUNNING}),
+                    )
+                )
+            ).scalar_one()
+            should_emit = active_count == 0
+
+        runner = None
+        if should_emit:
+            runner = BenchmarkRunnerRecord(
+                id=str(uuid4()),
+                campaign_id=plan.campaign_id,
+                runner_plan_id=plan.id,
+                plan_occurrence=occurrence,
+                scheduled_for=planned_for,
+                plan_template_version=plan.template_version,
+                label=template.get("label"),
+                created_by=plan.created_by,
+                status=QUEUED,
+                benchmark_config=json_safe(template["benchmark"]),
+                user_metadata=json_safe(template.get("metadata", {})),
+            )
+            session.add(runner)
+            await session.flush()
+            session.add(self._event(runner.id, QUEUED, "Runner emitted by Planner"))
+            plan.emitted_count += 1
+        else:
+            plan.skipped_count += 1
+
+        plan.last_fire_at = planned_for
+        plan.occurrence_cursor += 1
+        if self._plan_exhausted(plan):
+            plan.status = PLAN_COMPLETED
+            plan.next_fire_at = None
+        else:
+            candidate, adjustments = next_fire_details(
+                plan.timezone, plan.recurrence, plan.starts_at, planned_for
+            )
+            self._dst_events(
+                session,
+                plan.id,
+                plan.occurrence_cursor,
+                adjustments,
+                planner_id,
+            )
+            if plan.ends_at is not None and candidate > as_utc(plan.ends_at):
+                plan.status = PLAN_COMPLETED
+                plan.next_fire_at = None
+            else:
+                plan.next_fire_at = candidate
+        plan.updated_at = database_now
+        session.add(
+            self._plan_event(
+                plan.id,
+                "emitted" if runner is not None else "overlap_skipped",
+                occurrence=occurrence,
+                scheduled_for=planned_for,
+                runner_id=runner.id if runner is not None else None,
+                message=(
+                    "Runner emitted to the shared queue"
+                    if runner is not None
+                    else "Occurrence skipped by overlap_policy=skip"
+                ),
+                details={
+                    "planner_id": planner_id,
+                    "overlap_policy": plan.overlap_policy,
+                },
+            )
+        )
+        if plan.status == PLAN_COMPLETED:
+            session.add(
+                self._plan_event(
+                    plan.id,
+                    "completed",
+                    occurrence=plan.occurrence_cursor,
+                    scheduled_for=plan.last_fire_at,
+                    message="RunnerPlan reached its execution boundary",
+                    details={"planner_id": planner_id},
+                )
+            )
+        return 1 if runner is not None else 0
+
+    @staticmethod
+    def _plan_exhausted(plan: BenchmarkRunnerPlanRecord) -> bool:
+        return (
+            plan.max_occurrences is not None
+            and plan.occurrence_cursor >= plan.max_occurrences
+        )
 
     @staticmethod
     def _campaign_dict(campaign: BenchmarkCampaignRecord) -> Dict[str, Any]:
@@ -455,19 +1051,21 @@ class RunnerRepository:
         )
         async with self.database.sessions() as session:
             campaigns = (await session.execute(statement)).scalars().all()
-            statuses: Dict[str, List[str]] = {campaign.id: [] for campaign in campaigns}
+            statuses: Dict[str, Dict[str, int]] = {
+                campaign.id: {} for campaign in campaigns
+            }
+            plan_statuses: Dict[str, Dict[str, int]] = {
+                campaign.id: {} for campaign in campaigns
+            }
             if campaigns:
+                campaign_ids = [campaign.id for campaign in campaigns]
                 status_statement = (
                     select(
                         BenchmarkRunnerRecord.campaign_id,
                         BenchmarkRunnerRecord.status,
                         func.count(),
                     )
-                    .where(
-                        BenchmarkRunnerRecord.campaign_id.in_(
-                            [campaign.id for campaign in campaigns]
-                        )
-                    )
+                    .where(BenchmarkRunnerRecord.campaign_id.in_(campaign_ids))
                     .group_by(
                         BenchmarkRunnerRecord.campaign_id,
                         BenchmarkRunnerRecord.status,
@@ -476,38 +1074,109 @@ class RunnerRepository:
                 for campaign_id, status, count in await session.execute(
                     status_statement
                 ):
-                    statuses[str(campaign_id)].extend([str(status)] * int(count))
+                    statuses[str(campaign_id)][str(status)] = int(count)
+                plan_statement = (
+                    select(
+                        BenchmarkRunnerPlanRecord.campaign_id,
+                        BenchmarkRunnerPlanRecord.status,
+                        func.count(),
+                    )
+                    .where(BenchmarkRunnerPlanRecord.campaign_id.in_(campaign_ids))
+                    .group_by(
+                        BenchmarkRunnerPlanRecord.campaign_id,
+                        BenchmarkRunnerPlanRecord.status,
+                    )
+                )
+                for campaign_id, plan_status, count in await session.execute(
+                    plan_statement
+                ):
+                    plan_statuses[str(campaign_id)][str(plan_status)] = int(count)
             responses = []
             for campaign in campaigns:
                 response = self._campaign_dict(campaign)
-                response.update(self._campaign_runtime(statuses[campaign.id]))
+                response.update(
+                    self._campaign_runtime(
+                        statuses[campaign.id], plan_statuses[campaign.id]
+                    )
+                )
                 responses.append(response)
             return responses
 
     @staticmethod
-    def _campaign_runtime(statuses: Sequence[str]) -> Dict[str, Any]:
-        counts = {
-            status: statuses.count(status)
-            for status in (QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED)
-        }
-        if not statuses:
-            campaign_status = "empty"
-        elif counts[RUNNING] or (counts[QUEUED] and len(statuses) != counts[QUEUED]):
+    def _campaign_runtime(
+        statuses: Union[Sequence[str], Mapping[str, int]],
+        plan_statuses: Union[Sequence[str], Mapping[str, int]] = (),
+    ) -> Dict[str, Any]:
+        runner_states = (QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED)
+        plan_states = (
+            PLAN_ACTIVE,
+            PLAN_PAUSED,
+            PLAN_COMPLETED,
+            PLAN_CANCELLED,
+        )
+        if isinstance(statuses, Mapping):
+            counts = {status: int(statuses.get(status, 0)) for status in runner_states}
+        else:
+            counts = {status: statuses.count(status) for status in runner_states}
+        if isinstance(plan_statuses, Mapping):
+            plan_counts = {
+                plan_status: int(plan_statuses.get(plan_status, 0))
+                for plan_status in plan_states
+            }
+        else:
+            plan_counts = {
+                plan_status: plan_statuses.count(plan_status)
+                for plan_status in plan_states
+            }
+        runner_count = sum(counts.values())
+        runner_plan_count = sum(plan_counts.values())
+        if counts[RUNNING]:
             campaign_status = RUNNING
         elif counts[QUEUED]:
             campaign_status = QUEUED
-        elif counts[FAILED]:
-            campaign_status = FAILED
-        elif counts[SUCCEEDED] == len(statuses):
-            campaign_status = SUCCEEDED
-        elif counts[CANCELLED] == len(statuses):
+        elif plan_counts[PLAN_ACTIVE]:
+            campaign_status = "planned"
+        elif plan_counts[PLAN_PAUSED]:
+            campaign_status = PLAN_PAUSED
+        elif not runner_count and not runner_plan_count:
+            campaign_status = "empty"
+        elif not runner_count:
+            campaign_status = (
+                CANCELLED
+                if plan_counts[PLAN_CANCELLED] == runner_plan_count
+                else "completed"
+            )
+        elif counts[CANCELLED] == runner_count and (
+            runner_count or plan_counts[PLAN_CANCELLED]
+        ):
             campaign_status = CANCELLED
         else:
             campaign_status = "completed"
+
+        if campaign_status in {RUNNING, QUEUED, "planned", PLAN_PAUSED}:
+            campaign_outcome = "pending"
+        elif not runner_count:
+            campaign_outcome = (
+                CANCELLED if campaign_status == CANCELLED else "no_runs"
+            )
+        elif counts[FAILED] == runner_count:
+            campaign_outcome = FAILED
+        elif counts[FAILED]:
+            campaign_outcome = "partial_failed"
+        elif counts[SUCCEEDED] == runner_count:
+            campaign_outcome = SUCCEEDED
+        elif counts[CANCELLED]:
+            campaign_outcome = CANCELLED
+        else:
+            campaign_outcome = "no_runs"
         return {
             "status": campaign_status,
-            "runner_count": len(statuses),
+            "outcome": campaign_outcome,
+            "has_failures": bool(counts[FAILED]),
+            "runner_count": runner_count,
             "status_counts": counts,
+            "runner_plan_count": runner_plan_count,
+            "runner_plan_status_counts": plan_counts,
         }
 
     async def get_campaign_status(self, campaign_id: str) -> Optional[Dict[str, Any]]:
@@ -515,12 +1184,26 @@ class RunnerRepository:
             campaign = await session.get(BenchmarkCampaignRecord, campaign_id)
             if campaign is None:
                 return None
-            statement = select(BenchmarkRunnerRecord.status).where(
-                BenchmarkRunnerRecord.campaign_id == campaign_id
+            statement = (
+                select(BenchmarkRunnerRecord.status, func.count())
+                .where(BenchmarkRunnerRecord.campaign_id == campaign_id)
+                .group_by(BenchmarkRunnerRecord.status)
             )
-            statuses = list((await session.execute(statement)).scalars().all())
+            statuses = {
+                str(runner_status): int(count)
+                for runner_status, count in await session.execute(statement)
+            }
+            plan_statement = (
+                select(BenchmarkRunnerPlanRecord.status, func.count())
+                .where(BenchmarkRunnerPlanRecord.campaign_id == campaign_id)
+                .group_by(BenchmarkRunnerPlanRecord.status)
+            )
+            plan_statuses = {
+                str(plan_status): int(count)
+                for plan_status, count in await session.execute(plan_statement)
+            }
             response = self._campaign_dict(campaign)
-            response.update(self._campaign_runtime(statuses))
+            response.update(self._campaign_runtime(statuses, plan_statuses))
             return response
 
     async def request_cancel_campaign(
@@ -537,6 +1220,25 @@ class RunnerRepository:
             )
             runners = list((await session.execute(statement)).scalars().all())
             now = utcnow()
+            plan_statement = (
+                select(BenchmarkRunnerPlanRecord)
+                .where(BenchmarkRunnerPlanRecord.campaign_id == campaign_id)
+                .with_for_update()
+            )
+            plans = list((await session.execute(plan_statement)).scalars().all())
+            for plan in plans:
+                if plan.status not in {PLAN_ACTIVE, PLAN_PAUSED}:
+                    continue
+                plan.status = PLAN_CANCELLED
+                plan.updated_at = now
+                session.add(
+                    self._plan_event(
+                        plan.id,
+                        "cancelled",
+                        scheduled_for=plan.next_fire_at,
+                        message="RunnerPlan cancelled with Campaign",
+                    )
+                )
             for runner in runners:
                 if runner.status in TERMINAL_STATUSES:
                     continue
@@ -553,7 +1255,10 @@ class RunnerRepository:
             await session.flush()
             response = self._campaign_dict(campaign)
             response.update(
-                self._campaign_runtime([runner.status for runner in runners])
+                self._campaign_runtime(
+                    [runner.status for runner in runners],
+                    [plan.status for plan in plans],
+                )
             )
             return response
 
@@ -563,11 +1268,20 @@ class RunnerRepository:
             return _runner_dict(runner) if runner is not None else None
 
     async def list_runners(
-        self, status: Optional[str], limit: int, offset: int, full: bool = False
+        self,
+        status: Optional[str],
+        limit: int,
+        offset: int,
+        full: bool = False,
+        campaign_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         statement = select(BenchmarkRunnerRecord)
         if status:
             statement = statement.where(BenchmarkRunnerRecord.status == status)
+        if campaign_id:
+            statement = statement.where(
+                BenchmarkRunnerRecord.campaign_id == campaign_id
+            )
         statement = statement.order_by(BenchmarkRunnerRecord.created_at.desc())
         statement = statement.limit(limit).offset(offset)
         async with self.database.sessions() as session:
@@ -852,6 +1566,12 @@ class RunnerRepository:
         )
         async with self.database.sessions() as session:
             runner_records = (await session.execute(statement)).scalars().all()
+            plan_statement = (
+                select(BenchmarkRunnerPlanRecord)
+                .where(BenchmarkRunnerPlanRecord.campaign_id == campaign_id)
+                .order_by(BenchmarkRunnerPlanRecord.created_at.asc())
+            )
+            plan_records = (await session.execute(plan_statement)).scalars().all()
             status_counts = {
                 status: 0 for status in (QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED)
             }
@@ -879,16 +1599,28 @@ class RunnerRepository:
                 if include_requests:
                     item["requests"] = request_map.get(runner.id, [])
                 runners.append(item)
+            plan_status_counts = {
+                plan_status: sum(
+                    plan.status == plan_status for plan in plan_records
+                )
+                for plan_status in (
+                    PLAN_ACTIVE,
+                    PLAN_PAUSED,
+                    PLAN_COMPLETED,
+                    PLAN_CANCELLED,
+                )
+            }
+            runtime = self._campaign_runtime(status_counts, plan_status_counts)
             return {
-                "version": 1,
+                "version": 3,
                 "campaign": campaign,
                 "aggregate": {
-                    "runner_count": len(runner_records),
-                    "status_counts": status_counts,
+                    **runtime,
                     "completed_request_count": sum(
                         runner.request_count for runner in runner_records
                     ),
                 },
+                "runner_plans": [_runner_plan_dict(plan) for plan in plan_records],
                 "runners": runners,
             }
 

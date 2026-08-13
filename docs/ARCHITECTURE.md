@@ -1,5 +1,10 @@
 # LLMPerf 异步任务与数据持久化架构
 
+KV Cache 外部观测的实验协议、P0 实施状态与数据字段演进方案见
+[《LLMPerf 外部 KV Cache 可观测性技术报告》](KVCACHE_OBSERVABILITY_TECHNICAL_REPORT.zh-CN.md)。
+地理时间周期派发的 RunnerPlan 领域模型、Planner 物化流程和 Scheduler 执行协议见
+[《LLMPerf Runner Planner 架构设计》](RUNNER_PLANNER_ARCHITECTURE.zh-CN.md)。
+
 ## 1. 目标
 
 本扩展将原始 LLMPerf 从“命令行运行后写出 JSON 文件”提升为可持久化、可恢复、可编排的实验系统，主要面向 GLM KVCache 命中率及性能指标调研。
@@ -89,7 +94,7 @@ API、Scheduler、Runner 和 Worker 是四个不同边界：
 
 任务创建时会复制完整 Benchmark 配置到 `benchmark_runners.benchmark_config`。之后即使默认 YAML 改变，历史运行仍能还原当时参数。
 
-`summary` 和 `metrics` 在 PostgreSQL 中使用 JSONB（测试数据库使用兼容 JSON 类型）保留上游及 GLM 扩展指标，但它们属于数据库记录，而不是磁盘 JSON 文件。非有限浮点数会在入库前转换为 `null`，避免 PostgreSQL 拒绝非法 JSON 数值。
+`summary` 和 `metrics` 在 PostgreSQL 中使用 JSONB 保留上游及 GLM 扩展指标，但它们属于数据库记录，而不是磁盘 JSON 文件。非有限浮点数会在入库前转换为 `null`，避免 PostgreSQL 拒绝非法 JSON 数值。
 
 ### 初始化数据库表
 
@@ -118,10 +123,13 @@ database:
 ```bash
 createdb llmperf_test
 export LLMPERF_TEST_DB='postgresql+asyncpg:///llmperf_test'
-pytest -q -m postgresql tests/test_postgresql_integration.py
+pytest -q -m postgresql tests/test_sql.py tests/test_backend_app.py
 ```
 
 测试会在该专用数据库内执行建表、Campaign/Runner 入库、任务领取、JSONB 指标提交、用户/公钥查询，最后删除测试创建的表。保护检查会拒绝重置名称不包含 `test` 的数据库。
+如果没有显式设置 `LLMPERF_TEST_DB`，所有 `postgresql` 测试自动跳过；配置了非 `postgresql+asyncpg` URL 或数据库名称不包含 `test` 时则直接失败。
+
+项目级 Pytest 配置要求测试函数名最多包含三个下划线分隔符。`tests/conftest.py` 在收集期强制执行此规则，并要求所有 `postgresql` 测试显式依赖统一的 `postgresql_url` fixture。
 
 ## 6. 状态机与并发控制
 
@@ -295,6 +303,13 @@ llmperfctl campaign start \
 ```
 
 CLI 创建 Campaign 后，通过一个批量接口在服务端事务中上传所有 Runners：全部入队成功或全部失败。随后 CLI 轮询最终状态，并请求数据库驱动的总结导出。CLI 进程退出不会造成任务丢失，因为任务已经持久化在 PostgreSQL 中。
+
+Campaign 聚合状态分为两个正交维度。`status` 只表达派发生命周期：
+`planned/queued/running/paused/completed/cancelled`；`outcome` 表达 Runner
+结果：`pending/succeeded/partial_failed/failed/cancelled/no_runs`。因此某一轮
+失败不会把已经完成派发的 Campaign 生命周期标成 `failed`。例如 8 轮中 7 轮成功、
+1 轮失败时返回 `status=completed, outcome=partial_failed`。这两个字段由 Runner 与
+RunnerPlan 的持久化状态实时聚合，无需在 Campaign 表中维护容易失真的重复状态。
 
 查询后端已配置的供应商及其模型目录：
 

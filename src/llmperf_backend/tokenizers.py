@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import threading
@@ -24,6 +25,7 @@ from llmperf_backend.huggingface import (
 # before Transformers initializes its private logger.
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
+from huggingface_hub import try_to_load_from_cache
 from huggingface_hub.utils import HFValidationError, validate_repo_id
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
@@ -38,6 +40,7 @@ LOGGER = logging.getLogger(__name__)
 TOKENIZERS_BACKEND_CLASS_ERROR = (
     "Tokenizer class TokenizersBackend does not exist or is not currently imported"
 )
+IMMUTABLE_HUGGINGFACE_REVISION = re.compile(r"[0-9a-f]{40,64}\Z")
 
 
 class TokenizerResolutionError(RuntimeError):
@@ -67,15 +70,30 @@ class TokenizerResolution:
     path: Path
     cached: bool
 
-    def benchmark_spec(self) -> Dict[str, Any]:
+    def benchmark_spec(
+        self,
+        selection: Optional[str] = None,
+        accuracy: Optional[str] = None,
+        requested_revision: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Return the immutable, non-local portion stored with a Runner."""
 
-        return {
+        result = {
             "source": self.source,
             "id": self.tokenizer_id,
             "revision": self.revision,
             "use_fast": self.use_fast,
+            "immutable_revision": bool(
+                IMMUTABLE_HUGGINGFACE_REVISION.fullmatch(self.revision)
+            ),
         }
+        if selection is not None:
+            result["selection"] = selection
+        if accuracy is not None:
+            result["accuracy"] = accuracy
+        if requested_revision is not None:
+            result["requested_revision"] = requested_revision
+        return result
 
 
 class TokenizerCache:
@@ -177,17 +195,28 @@ class TokenizerCache:
                         path=cached.path,
                         cached=True,
                     )
+            resolved_revision = self._resolved_revision(None, tokenizer_id, revision)
             existing_target = self.resolved_directory / self._artifact_key(
+                tokenizer_id, resolved_revision, use_fast
+            )
+            legacy_target = self.resolved_directory / self._artifact_key(
                 tokenizer_id, revision, use_fast
             )
+            if not existing_target.is_dir() and legacy_target.is_dir():
+                existing_target = legacy_target
             if existing_target.is_dir():
                 LOGGER.info(
-                    "Tokenizer artifact-cache hit: %s@%s", tokenizer_id, revision
+                    "Tokenizer artifact-cache hit: %s requested=%s resolved=%s "
+                    "immutable=%s",
+                    tokenizer_id,
+                    revision,
+                    resolved_revision,
+                    bool(IMMUTABLE_HUGGINGFACE_REVISION.fullmatch(resolved_revision)),
                 )
                 resolution = TokenizerResolution(
                     source="huggingface",
                     tokenizer_id=tokenizer_id,
-                    revision=revision,
+                    revision=resolved_revision,
                     use_fast=use_fast,
                     path=existing_target,
                     cached=True,
@@ -222,10 +251,7 @@ class TokenizerCache:
                         tokenizer_id, **load_options
                     )
                 except ValueError as exc:
-                    if (
-                        not use_fast
-                        or TOKENIZERS_BACKEND_CLASS_ERROR not in str(exc)
-                    ):
+                    if not use_fast or TOKENIZERS_BACKEND_CLASS_ERROR not in str(exc):
                         raise
                     # Transformers 5 renamed the generic tokenizer.json loader to
                     # TokenizersBackend. Older releases cannot resolve that class
@@ -249,7 +275,9 @@ class TokenizerCache:
                     tokenizer = PreTrainedTokenizerFast.from_pretrained(
                         tokenizer_id, **fallback_options
                     )
-                resolved_revision = self._resolved_revision(tokenizer, revision)
+                resolved_revision = self._resolved_revision(
+                    tokenizer, tokenizer_id, revision
+                )
                 target = self.resolved_directory / self._artifact_key(
                     tokenizer_id, resolved_revision, use_fast
                 )
@@ -265,9 +293,12 @@ class TokenizerCache:
                     cached=artifact_cached,
                 )
                 LOGGER.info(
-                    "Tokenizer resolved: %s@%s (cached=%s)",
+                    "Tokenizer resolved: %s requested=%s resolved=%s "
+                    "immutable=%s cached=%s",
                     tokenizer_id,
+                    revision,
                     resolved_revision,
+                    bool(IMMUTABLE_HUGGINGFACE_REVISION.fullmatch(resolved_revision)),
                     artifact_cached,
                 )
             except TokenizerResolutionError:
@@ -295,14 +326,58 @@ class TokenizerCache:
                 self._entries[resolved_key] = resolution
             return resolution
 
-    @staticmethod
-    def _resolved_revision(tokenizer: Any, requested_revision: str) -> str:
-        resolved = getattr(tokenizer, "_commit_hash", None)
-        if not resolved:
+    def _resolved_revision(
+        self,
+        tokenizer: Any,
+        tokenizer_id: str,
+        requested_revision: str,
+    ) -> str:
+        resolved = getattr(tokenizer, "_commit_hash", None) if tokenizer else None
+        if not resolved and tokenizer is not None:
             init_kwargs = getattr(tokenizer, "init_kwargs", {})
             if isinstance(init_kwargs, dict):
                 resolved = init_kwargs.get("_commit_hash")
-        return str(resolved or requested_revision)
+        if resolved and IMMUTABLE_HUGGINGFACE_REVISION.fullmatch(str(resolved)):
+            return str(resolved)
+        if IMMUTABLE_HUGGINGFACE_REVISION.fullmatch(requested_revision):
+            return requested_revision
+        cached_revision = self._cached_revision(tokenizer_id, requested_revision)
+        return cached_revision or str(resolved or requested_revision)
+
+    def _cached_revision(
+        self, tokenizer_id: str, requested_revision: str
+    ) -> Optional[str]:
+        for filename in (
+            "tokenizer_config.json",
+            "tokenizer.json",
+            "tokenizer.model",
+        ):
+            try:
+                cached_path = try_to_load_from_cache(
+                    tokenizer_id,
+                    filename,
+                    cache_dir=self.download_directory,
+                    revision=requested_revision,
+                )
+            except Exception:
+                LOGGER.debug(
+                    "Unable to inspect cached tokenizer revision for %s@%s",
+                    tokenizer_id,
+                    requested_revision,
+                    exc_info=True,
+                )
+                continue
+            if not isinstance(cached_path, str):
+                continue
+            parts = Path(cached_path).parts
+            try:
+                snapshot_index = parts.index("snapshots")
+                revision = parts[snapshot_index + 1]
+            except (ValueError, IndexError):
+                continue
+            if IMMUTABLE_HUGGINGFACE_REVISION.fullmatch(revision):
+                return revision
+        return None
 
     @staticmethod
     def _artifact_key(tokenizer_id: str, revision: str, use_fast: bool) -> str:

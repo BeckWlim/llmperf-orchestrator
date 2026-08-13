@@ -54,7 +54,7 @@ def test_worker_command(tmp_path: Path):
         SchedulerConfig(
             working_directory=str(tmp_path),
         ),
-        DatabaseConfig(url="sqlite+aiosqlite:///unused.db"),
+        DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
         ProviderRegistry.from_environment(
             {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
         ),
@@ -66,7 +66,8 @@ def test_worker_command(tmp_path: Path):
     assert command[1:3] == ["-m", "llmperf_backend.worker"]
     assert WORKER_DATABASE_URL not in " ".join(command)
     assert scheduler.status()["status"] == "stopped"
-    assert scheduler.status()["active_slots"] == 0
+    assert scheduler.status()["busy_slots"] == 0
+    assert scheduler.status()["live_slots"] == 0
 
 
 def test_tokenizer_injection(tmp_path: Path):
@@ -76,7 +77,7 @@ def test_tokenizer_injection(tmp_path: Path):
     scheduler = Scheduler(
         UnusedRepository(),
         SchedulerConfig(working_directory=str(tmp_path)),
-        DatabaseConfig(url="sqlite+aiosqlite:///unused.db"),
+        DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
         ProviderRegistry.from_environment(
             {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
         ),
@@ -109,7 +110,7 @@ def test_dataset_injection(tmp_path: Path):
     scheduler = Scheduler(
         UnusedRepository(),
         SchedulerConfig(working_directory=str(tmp_path)),
-        DatabaseConfig(url="sqlite+aiosqlite:///unused.db"),
+        DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
         ProviderRegistry.from_environment(
             {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
         ),

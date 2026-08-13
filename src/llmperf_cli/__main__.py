@@ -19,6 +19,8 @@ from llmperf_cli.client import ClientError, LLMPerfClient, write_json
 
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
+CAMPAIGN_TERMINAL_STATUSES = {"completed", "cancelled", "empty"}
+UNSUCCESSFUL_OUTCOMES = {"partial_failed", "failed", "cancelled"}
 LOGGER = logging.getLogger("llmperfctl")
 
 
@@ -31,7 +33,9 @@ Control LLMPerf benchmark Runners through the backend service.
 
 Concepts:
   Runner     One durable benchmark execution and its results.
-  Campaign   A named group of Runners for a benchmark study.
+  RunnerPlan A bounded geographic-time rule that produces Runners.
+  Planner    The backend component that materializes due RunnerPlans.
+  Campaign   A named workload containing Runners and/or RunnerPlans.
   Scheduler  The backend component that assigns queued Runners to Workers.
   Worker     A temporary backend-owned process; it is not started directly.
 
@@ -74,6 +78,22 @@ def load_yaml(path: Path) -> Dict[str, Any]:
     return document
 
 
+def load_runner_plan(path: Path) -> Dict[str, Any]:
+    """Load a bare RunnerPlan or extract one from Campaign YAML."""
+
+    document = load_yaml(path)
+    if "runner_plans" not in document:
+        return document
+    plans = document["runner_plans"]
+    if not isinstance(plans, list) or len(plans) != 1:
+        raise ClientError(
+            "planner commands require exactly one entry in campaign.runner_plans"
+        )
+    if not isinstance(plans[0], dict):
+        raise ClientError("campaign.runner_plans[0] must be a mapping")
+    return dict(plans[0])
+
+
 def print_json(document: Any) -> None:
     print(json.dumps(document, ensure_ascii=False, indent=2, default=str))
 
@@ -81,10 +101,16 @@ def print_json(document: Any) -> None:
 def submit_with_artifact_progress(action):
     """Render one indicator for backend tokenizer and dataset resolution."""
 
+    started = time.monotonic()
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(action)
         if future.done():
-            return future.result()
+            result = future.result()
+            LOGGER.info(
+                "Backend validation/submission completed in %.1fs",
+                time.monotonic() - started,
+            )
+            return result
         with tqdm(
             total=None,
             desc="Backend artifact download/cache lookup",
@@ -96,7 +122,12 @@ def submit_with_artifact_progress(action):
             while not future.done():
                 time.sleep(1)
                 progress.refresh()
-        return future.result()
+        result = future.result()
+        LOGGER.info(
+            "Backend validation/submission completed in %.1fs",
+            time.monotonic() - started,
+        )
+        return result
 
 
 def _table_value(value: Any, default: str = "-") -> str:
@@ -167,7 +198,9 @@ def _validate_campaign_list(document: Any) -> Dict[str, Any]:
         "campaign_id",
         "name",
         "status",
+        "outcome",
         "runner_count",
+        "runner_plan_count",
         "status_counts",
         "created_at",
     }
@@ -197,8 +230,9 @@ def print_campaign_table(document: Dict[str, Any]) -> None:
 
     columns = (
         ("STATUS", 9),
+        ("OUTCOME", 14),
         ("CAMPAIGN ID", 36),
-        ("RUNNERS", 7),
+        ("RUNNERS/PLANS", 13),
         ("Q/R/OK/F/C", 12),
         ("CREATED", 16),
         ("NAME", 24),
@@ -213,8 +247,9 @@ def print_campaign_table(document: Dict[str, Any]) -> None:
         )
         values = (
             item.get("status"),
+            item.get("outcome"),
             item.get("campaign_id"),
-            item.get("runner_count"),
+            f"{item.get('runner_count')}/{item.get('runner_plan_count')}",
             states,
             _compact_timestamp(item.get("created_at")),
             item.get("name"),
@@ -229,6 +264,94 @@ def print_campaign_table(document: Dict[str, Any]) -> None:
     offset = document.get("offset", 0)
     limit = document.get("limit", len(items))
     print(f"\nShowing {len(items)} Campaign(s) (offset={offset}, limit={limit}).")
+
+
+def _runner_request_summary(runner: Dict[str, Any]) -> str:
+    requests = runner.get("requests") or {}
+    started = requests.get("started")
+    completed = requests.get("completed")
+    failed = requests.get("failed")
+    if started is None and completed is None and failed is None:
+        return "-"
+    return (
+        f"{_table_value(started)} started; "
+        f"{_table_value(completed, '0')} ok; "
+        f"{_table_value(failed, '0')} err"
+    )
+
+
+def print_campaign_status(document: Dict[str, Any]) -> None:
+    """Render one Campaign and its lightweight Runner summaries."""
+
+    campaign = document.get("campaign") or {}
+    counts = campaign.get("status_counts") or {}
+    plan_counts = campaign.get("runner_plan_status_counts") or {}
+    print(
+        f"Campaign: {_table_value(campaign.get('name'))} "
+        f"({_table_value(campaign.get('campaign_id'))})"
+    )
+    print(
+        f"Status: {_table_value(campaign.get('status'))}  "
+        f"Outcome: {_table_value(campaign.get('outcome'))}  "
+        f"Runners: {_table_value(campaign.get('runner_count'), '0')}  "
+        f"RunnerPlans: {_table_value(campaign.get('runner_plan_count'), '0')}"
+    )
+    print(
+        "Runner states: "
+        + "  ".join(
+            f"{status}={_table_value(counts.get(status), '0')}"
+            for status in ("queued", "running", "succeeded", "failed", "cancelled")
+        )
+    )
+    if campaign.get("runner_plan_count"):
+        print(
+            "Plan states: "
+            + "  ".join(
+                f"{status}={_table_value(plan_counts.get(status), '0')}"
+                for status in ("active", "paused", "completed", "cancelled")
+            )
+        )
+
+    runners = document.get("runners") or []
+    if not runners:
+        print("\nNo Runners materialized for this Campaign.")
+        return
+
+    columns = (
+        ("ROUND", 5),
+        ("STATUS", 9),
+        ("RUNNER ID", 36),
+        ("PROVIDER/MODEL", 24),
+        ("SUMMARY", 28),
+    )
+    print("\n" + "  ".join(title.ljust(width) for title, width in columns).rstrip())
+    print("  ".join("-" * width for _, width in columns).rstrip())
+    for runner in runners:
+        target = (
+            "/".join(
+                part
+                for part in (
+                    _table_value(runner.get("provider"), ""),
+                    _table_value(runner.get("model"), ""),
+                )
+                if part
+            )
+            or "-"
+        )
+        occurrence = runner.get("plan_occurrence")
+        values = (
+            occurrence + 1 if isinstance(occurrence, int) else "-",
+            runner.get("status"),
+            runner.get("runner_id"),
+            target,
+            _runner_request_summary(runner),
+        )
+        print(
+            "  ".join(
+                _truncate(value, width).ljust(width)
+                for value, (_, width) in zip(values, columns)
+            ).rstrip()
+        )
 
 
 def print_runner_table(document: Dict[str, Any]) -> None:
@@ -317,18 +440,52 @@ def summarize_runner(runner: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def campaign_status_view(
+    client: LLMPerfClient, campaign_id: str
+) -> Dict[str, Any]:
+    """Load aggregate Campaign state and all lightweight Runner summaries."""
+
+    campaign = client.get_campaign(campaign_id)
+    runners: List[Dict[str, Any]] = []
+    limit = 200
+    offset = 0
+    while True:
+        page = _validate_runner_list(
+            client.list_runners(
+                status=None,
+                limit=limit,
+                offset=offset,
+                full=False,
+                campaign_id=campaign_id,
+            ),
+            full=False,
+        )
+        items = page["items"]
+        runners.extend(items)
+        if len(items) < limit:
+            break
+        offset += len(items)
+    runners.sort(
+        key=lambda runner: (
+            str(runner.get("scheduled_for") or runner.get("created_at") or ""),
+            str(runner.get("runner_id") or ""),
+        )
+    )
+    return {"campaign": campaign, "runners": runners}
+
+
 def _has_unsuccessful_runner(document: Any) -> bool:
     if isinstance(document, list):
-        return any(
-            isinstance(item, dict) and item.get("status") in {"failed", "cancelled"}
-            for item in document
-        )
+        return any(_has_unsuccessful_runner(item) for item in document)
     if isinstance(document, dict):
+        if document.get("outcome") in UNSUCCESSFUL_OUTCOMES:
+            return True
         if document.get("status") in {"failed", "cancelled"}:
             return True
-        completed = document.get("completed")
-        if isinstance(completed, list):
-            return _has_unsuccessful_runner(completed)
+        for key in ("campaign_status", "aggregate", "completed", "runners"):
+            nested = document.get(key)
+            if isinstance(nested, (dict, list)) and _has_unsuccessful_runner(nested):
+                return True
     return False
 
 
@@ -342,15 +499,15 @@ def wait_for_runners(
     started = time.monotonic()
     pending = set(runner_ids)
     results: Dict[str, Dict[str, Any]] = {}
-    last_status: Dict[str, str] = {}
+    last_state: Dict[str, Any] = {}
     while pending:
         for runner_id in list(pending):
             runner = client.get_runner(runner_id)
             results[runner_id] = runner
-            current_status = str(runner["status"])
-            if last_status.get(runner_id) != current_status:
-                LOGGER.info("Runner %s status: %s", runner_id, current_status)
-                last_status[runner_id] = current_status
+            current_state = _runner_signature(runner)
+            if last_state.get(runner_id) != current_state:
+                _log_runner_state(runner, time.monotonic() - started)
+                last_state[runner_id] = current_state
             if runner["status"] in TERMINAL_STATUSES:
                 pending.remove(runner_id)
                 report = summarize_runner(runner)
@@ -360,11 +517,208 @@ def wait_for_runners(
         if not pending:
             break
         if timeout is not None and time.monotonic() - started >= timeout:
-            raise ClientError(f"Timed out waiting for {len(pending)} Runner(s)")
+            observations = ", ".join(
+                _runner_observation(results[runner_id])
+                for runner_id in sorted(pending)
+                if runner_id in results
+            )
+            raise ClientError(
+                f"Timed out waiting for {len(pending)} Runner(s) after "
+                f"{time.monotonic() - started:.1f}s: {observations}"
+            )
         time.sleep(poll_interval)
     completed = [results[runner_id] for runner_id in runner_ids]
     return (
         completed if full_output else [summarize_runner(runner) for runner in completed]
+    )
+
+
+def _runner_signature(runner: Dict[str, Any]) -> Any:
+    report = summarize_runner(runner)
+    worker = report.get("worker") or {}
+    requests = runner.get("requests") or report.get("requests") or {}
+    return (
+        report.get("status"),
+        report.get("scheduler_id"),
+        worker.get("process_id"),
+        worker.get("exit_code"),
+        requests.get("started"),
+        requests.get("completed"),
+        requests.get("failed"),
+        runner.get("cancel_requested"),
+    )
+
+
+def _runner_observation(runner: Dict[str, Any]) -> str:
+    worker = runner.get("worker") or {}
+    return (
+        f"{runner.get('runner_id')} status={runner.get('status')} "
+        f"scheduler={runner.get('scheduler_id') or '-'} "
+        f"pid={worker.get('process_id') or '-'}"
+    )
+
+
+def _log_runner_state(runner: Dict[str, Any], elapsed: float) -> None:
+    report = summarize_runner(runner)
+    worker = report.get("worker") or {}
+    requests = runner.get("requests") or report.get("requests") or {}
+    LOGGER.info(
+        "Runner %s status: %s elapsed=%.1fs plan=%s occurrence=%s scheduler=%s "
+        "worker_pid=%s exit_code=%s requests[started=%s completed=%s failed=%s]",
+        report.get("runner_id"),
+        report.get("status"),
+        elapsed,
+        runner.get("runner_plan_id") or "-",
+        (
+            runner.get("plan_occurrence")
+            if runner.get("plan_occurrence") is not None
+            else "-"
+        ),
+        report.get("scheduler_id") or "-",
+        worker.get("process_id") or "-",
+        worker.get("exit_code") if worker.get("exit_code") is not None else "-",
+        requests.get("started") if requests.get("started") is not None else "-",
+        requests.get("completed") if requests.get("completed") is not None else "-",
+        requests.get("failed") if requests.get("failed") is not None else "-",
+    )
+
+
+def wait_for_campaign(
+    client: LLMPerfClient,
+    campaign_id: str,
+    poll_interval: float,
+    timeout: Optional[float],
+    initial_plans: Optional[List[Dict[str, Any]]] = None,
+    initial_runners: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    started = time.monotonic()
+    last_campaign = None
+    last_plans = {
+        str(plan["runner_plan_id"]): _plan_signature(plan)
+        for plan in initial_plans or []
+    }
+    last_runners = {
+        str(runner["runner_id"]): _runner_signature(runner)
+        for runner in initial_runners or []
+    }
+    while True:
+        campaign = client.get_campaign(campaign_id)
+        current_status = str(campaign["status"])
+        campaign_signature = _campaign_signature(campaign)
+        elapsed = time.monotonic() - started
+        if campaign_signature != last_campaign:
+            runner_counts = campaign.get("status_counts") or {}
+            plan_counts = campaign.get("runner_plan_status_counts") or {}
+            LOGGER.info(
+                "Campaign %s status=%s outcome=%s elapsed=%.1fs runners=%s "
+                "[queued=%s running=%s succeeded=%s failed=%s cancelled=%s] "
+                "plans=%s [active=%s paused=%s completed=%s cancelled=%s]",
+                campaign_id,
+                current_status,
+                campaign.get("outcome") or "-",
+                elapsed,
+                campaign.get("runner_count", 0),
+                runner_counts.get("queued", 0),
+                runner_counts.get("running", 0),
+                runner_counts.get("succeeded", 0),
+                runner_counts.get("failed", 0),
+                runner_counts.get("cancelled", 0),
+                campaign.get("runner_plan_count", 0),
+                plan_counts.get("active", 0),
+                plan_counts.get("paused", 0),
+                plan_counts.get("completed", 0),
+                plan_counts.get("cancelled", 0),
+            )
+            last_campaign = campaign_signature
+        plans = client.list_runner_plans(
+            campaign_id=campaign_id, limit=200, offset=0
+        ).get("items", [])
+        for runner_plan in plans:
+            runner_plan_id = str(runner_plan["runner_plan_id"])
+            plan_signature = _plan_signature(runner_plan)
+            if last_plans.get(runner_plan_id) == plan_signature:
+                continue
+            _log_plan_state(runner_plan, "updated")
+            last_plans[runner_plan_id] = plan_signature
+        runners = client.list_runners(
+            campaign_id=campaign_id,
+            limit=200,
+            offset=0,
+            full=False,
+        ).get("items", [])
+        for runner in runners:
+            runner_id = str(runner["runner_id"])
+            runner_signature = _runner_signature(runner)
+            if last_runners.get(runner_id) == runner_signature:
+                continue
+            _log_runner_state(runner, elapsed)
+            last_runners[runner_id] = runner_signature
+        if current_status in CAMPAIGN_TERMINAL_STATUSES:
+            LOGGER.info(
+                "Campaign %s finished: status=%s outcome=%s elapsed=%.1fs "
+                "runners=%s",
+                campaign_id,
+                current_status,
+                campaign.get("outcome") or "-",
+                elapsed,
+                campaign.get("runner_count", 0),
+            )
+            return campaign
+        if timeout is not None and time.monotonic() - started >= timeout:
+            raise ClientError(
+                f"Timed out waiting for Campaign {campaign_id} after "
+                f"{elapsed:.1f}s ({current_status}); runners="
+                f"{campaign.get('status_counts', {})}, plans="
+                f"{campaign.get('runner_plan_status_counts', {})}"
+            )
+        time.sleep(poll_interval)
+
+
+def _campaign_signature(campaign: Dict[str, Any]) -> Any:
+    runner_counts = campaign.get("status_counts") or {}
+    plan_counts = campaign.get("runner_plan_status_counts") or {}
+    return (
+        campaign.get("status"),
+        campaign.get("outcome"),
+        campaign.get("has_failures"),
+        campaign.get("runner_count"),
+        tuple(
+            runner_counts.get(status, 0)
+            for status in ("queued", "running", "succeeded", "failed", "cancelled")
+        ),
+        campaign.get("runner_plan_count"),
+        tuple(
+            plan_counts.get(status, 0)
+            for status in ("active", "paused", "completed", "cancelled")
+        ),
+    )
+
+
+def _plan_signature(runner_plan: Dict[str, Any]) -> Any:
+    return tuple(
+        runner_plan.get(field)
+        for field in (
+            "status",
+            "occurrence_cursor",
+            "emitted_count",
+            "skipped_count",
+            "next_fire_at",
+        )
+    )
+
+
+def _log_plan_state(runner_plan: Dict[str, Any], action: str) -> None:
+    LOGGER.info(
+        "RunnerPlan %s %s: status=%s occurrence=%s emitted=%s skipped=%s "
+        "next_fire=%s next_local=%s",
+        runner_plan.get("runner_plan_id"),
+        action,
+        runner_plan.get("status"),
+        runner_plan.get("occurrence_cursor", 0),
+        runner_plan.get("emitted_count", 0),
+        runner_plan.get("skipped_count", 0),
+        runner_plan.get("next_fire_at"),
+        runner_plan.get("next_fire_local"),
     )
 
 
@@ -375,37 +729,63 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
     campaign_spec = plan.get("campaign")
     if not isinstance(campaign_spec, dict) or not campaign_spec.get("name"):
         raise ClientError("campaign.start file must define campaign.name")
-    runners = plan.get("runners")
-    if not isinstance(runners, list) or not runners:
-        raise ClientError("campaign.start file must define a non-empty runners list")
+    runners = plan.get("runners", [])
+    runner_plans = plan.get("runner_plans", [])
+    if not isinstance(runners, list):
+        raise ClientError("campaign.start runners must be a list")
+    if not isinstance(runner_plans, list):
+        raise ClientError("campaign.start runner_plans must be a list")
+    if not runners and not runner_plans:
+        raise ClientError("campaign.start requires runners or runner_plans")
     prepared_runners = []
     for index, runner in enumerate(runners):
         if not isinstance(runner, dict):
             raise ClientError(f"plan.runners[{index}] must be a mapping")
         prepared_runners.append(dict(runner))
+    prepared_plans = []
+    for index, runner_plan in enumerate(runner_plans):
+        if not isinstance(runner_plan, dict):
+            raise ClientError(f"plan.runner_plans[{index}] must be a mapping")
+        prepared_plans.append(dict(runner_plan))
     batch = submit_with_artifact_progress(
-        lambda: client.create_campaign_with_runners(
-            campaign_spec, prepared_runners
-        )
+        lambda: client.start_campaign(campaign_spec, prepared_runners, prepared_plans)
     )
     campaign_id = batch["campaign"]["campaign_id"]
     LOGGER.info("Campaign created: %s", campaign_id)
     created = batch["items"]
-    runner_ids = [runner["runner_id"] for runner in created]
+    created_plans = batch["runner_plans"]
     LOGGER.info("Submitted %d Runner(s) to Campaign %s", len(created), campaign_id)
+    for runner in created:
+        _log_runner_state(runner, 0)
+    LOGGER.info(
+        "Registered %d RunnerPlan(s) in Campaign %s",
+        len(created_plans),
+        campaign_id,
+    )
+    for runner_plan in created_plans:
+        _log_plan_state(runner_plan, "registered")
     result: Dict[str, Any] = {
         "campaign_id": campaign_id,
         "runners": created,
+        "runner_plans": created_plans,
     }
     should_wait = arguments.wait or bool(plan.get("wait"))
     if should_wait:
-        LOGGER.info("Waiting for %d Campaign Runner(s)", len(runner_ids))
-        result["completed"] = wait_for_runners(
+        LOGGER.info("Waiting for the complete Campaign workload")
+        result["campaign_status"] = wait_for_campaign(
             client,
-            runner_ids,
+            campaign_id,
             arguments.poll_interval,
             arguments.timeout,
-            full_output=getattr(arguments, "full", False),
+            initial_plans=created_plans,
+            initial_runners=created,
+        )
+        completed_document = client.export_campaign(campaign_id)
+        completed_runners = completed_document["runners"]
+        result["completed"] = (
+            completed_runners
+            if getattr(arguments, "full", False)
+            else [summarize_runner(runner) for runner in completed_runners]
         )
     output = arguments.output or plan.get("export")
     if output:
@@ -526,6 +906,85 @@ def build_parser() -> argparse.ArgumentParser:
         description="Show Scheduler identity, state, capacity, and Worker module.",
         epilog="Example:\n  llmperfctl scheduler status",
     )
+
+    planner = _command_parser(
+        commands,
+        "planner",
+        help="Manage geographic-time Runner plans",
+        description=(
+            "A RunnerPlan is a bounded geographic-time rule that the Planner "
+            "materializes into ordinary queued Runners."
+        ),
+        epilog="Example:\n  llmperfctl planner list",
+    )
+    planner_commands = planner.add_subparsers(
+        dest="planner_command",
+        required=True,
+        title="planner commands",
+        metavar="COMMAND",
+    )
+    _command_parser(
+        planner_commands,
+        "runtime",
+        help="Show Planner runtime state",
+        description="Show the backend Planner state and polling configuration.",
+        epilog="Example:\n  llmperfctl planner runtime",
+    )
+    planner_preview = _command_parser(
+        planner_commands,
+        "preview",
+        help="Preview RunnerPlan occurrence times",
+        description="Validate a RunnerPlan YAML file and preview its occurrence times.",
+        epilog="Example:\n  llmperfctl planner preview -f runner-plan.yaml",
+    )
+    planner_preview.add_argument("-f", "--file", required=True, help="RunnerPlan YAML")
+    planner_create = _command_parser(
+        planner_commands,
+        "create",
+        help="Create a RunnerPlan",
+        description="Create a bounded RunnerPlan within an existing Campaign.",
+        epilog=(
+            "Example:\n  llmperfctl planner create <campaign-id> " "-f runner-plan.yaml"
+        ),
+    )
+    planner_create.add_argument("campaign_id", metavar="CAMPAIGN_ID")
+    planner_create.add_argument("-f", "--file", required=True, help="RunnerPlan YAML")
+    planner_list = _command_parser(
+        planner_commands,
+        "list",
+        help="List RunnerPlans",
+        description="List RunnerPlans with optional status and Campaign filters.",
+        epilog="Example:\n  llmperfctl planner list --status active",
+    )
+    planner_list.add_argument("--status")
+    planner_list.add_argument("--campaign-id")
+    planner_list.add_argument("--limit", type=int, default=50)
+    planner_list.add_argument("--offset", type=int, default=0)
+    planner_status = _command_parser(
+        planner_commands,
+        "status",
+        help="Show one RunnerPlan",
+        description="Show one persisted RunnerPlan and its current cursor.",
+        epilog="Example:\n  llmperfctl planner status <runner-plan-id>",
+    )
+    planner_status.add_argument("runner_plan_id", metavar="RUNNER_PLAN_ID")
+    planner_events = _command_parser(
+        planner_commands,
+        "events",
+        help="Show RunnerPlan audit events",
+        description="Show materialization and state-change events.",
+        epilog="Example:\n  llmperfctl planner events <runner-plan-id>",
+    )
+    planner_events.add_argument("runner_plan_id", metavar="RUNNER_PLAN_ID")
+    for action in ("pause", "resume", "cancel"):
+        action_parser = _command_parser(
+            planner_commands,
+            action,
+            help=f"{action.title()} one RunnerPlan",
+            description=f"{action.title()} one persisted RunnerPlan.",
+            epilog=f"Example:\n  llmperfctl planner {action} <runner-plan-id>",
+        )
+        action_parser.add_argument("runner_plan_id", metavar="RUNNER_PLAN_ID")
 
     provider = _command_parser(
         commands,
@@ -656,9 +1115,9 @@ Examples:
         "campaign",
         help="Start and inspect groups of benchmark Runners",
         description=(
-            "A Campaign is a durable, named collection of Runners. Use it to "
-            "submit a benchmark matrix, inspect aggregate status, cancel the "
-            "group, or export combined results."
+            "A Campaign is a durable workload containing immediate Runners, "
+            "bounded RunnerPlans, or both. Use it to submit, inspect, cancel, "
+            "or export one benchmark study."
         ),
         epilog="""\
 Examples:
@@ -679,10 +1138,10 @@ See examples/glm-campaign.yaml for the Campaign YAML shape.
     campaign_start = _command_parser(
         campaign_commands,
         "start",
-        help="Create a Campaign and submit its Runners",
+        help="Create and distribute a Campaign workload",
         description=(
-            "Read Campaign YAML, create the Campaign, and transactionally submit "
-            "its non-empty runners list."
+            "Validate Campaign YAML, then transactionally create the Campaign, "
+            "queue immediate Runners, and register bounded RunnerPlans."
         ),
         epilog="""\
 Examples:
@@ -694,7 +1153,10 @@ Examples:
         "-f", "--file", required=True, metavar="FILE", help="Campaign YAML file"
     )
     campaign_start.add_argument(
-        "-w", "--wait", action="store_true", help="Wait for all Runners to finish"
+        "-w",
+        "--wait",
+        action="store_true",
+        help="Wait for all bounded plans and their Runners to finish",
     )
     campaign_start.add_argument(
         "--poll-interval",
@@ -725,17 +1187,26 @@ Examples:
     campaign_status = _command_parser(
         campaign_commands,
         "status",
-        help="Show aggregate Campaign status",
-        description="Show Campaign metadata and aggregate Runner status counts.",
+        help="Show Campaign status and Runner summaries",
+        description=(
+            "Show Campaign lifecycle and execution outcome followed by every "
+            "materialized Runner ID, state, target, and request summary."
+        ),
         epilog=(
             "Examples:\n"
             "  llmperfctl campaign status <campaign-id>\n"
+            "  llmperfctl campaign status <campaign-id> --json\n"
             "  llmperfctl campaign status <campaign-id> --full\n"
             "  llmperfctl campaign status <campaign-id> --full --include-requests"
         ),
     )
     campaign_status.add_argument(
         "campaign_id", metavar="CAMPAIGN_ID", help="Campaign identifier"
+    )
+    campaign_status.add_argument(
+        "--json",
+        action="store_true",
+        help="Print lightweight Campaign and Runner status as JSON",
     )
     campaign_status.add_argument(
         "--full",
@@ -779,10 +1250,10 @@ Examples:
     campaign_cancel = _command_parser(
         campaign_commands,
         "cancel",
-        help="Cancel queued and running Campaign Runners",
+        help="Cancel Campaign plans and active Runners",
         description=(
-            "Cancel queued Runners immediately and request cancellation of running "
-            "Runners in the Campaign."
+            "Cancel active RunnerPlans, cancel queued Runners immediately, and "
+            "request cancellation of running Runners in the Campaign."
         ),
         epilog="Example:\n  llmperfctl campaign cancel <campaign-id>",
     )
@@ -1029,6 +1500,37 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
         return client.health()
     if arguments.command == "scheduler":
         return client.get_scheduler_status()
+    if arguments.command == "planner":
+        if arguments.planner_command == "runtime":
+            return client.get_planner_status()
+        if arguments.planner_command == "preview":
+            payload = load_runner_plan(Path(arguments.file).expanduser())
+            payload.pop("name", None)
+            payload.pop("runner", None)
+            return client.preview_runner_plan(payload)
+        if arguments.planner_command == "create":
+            runner_plan = client.create_runner_plan(
+                arguments.campaign_id,
+                load_runner_plan(Path(arguments.file).expanduser()),
+            )
+            _log_plan_state(runner_plan, "registered")
+            return runner_plan
+        if arguments.planner_command == "list":
+            return client.list_runner_plans(
+                arguments.status,
+                arguments.campaign_id,
+                arguments.limit,
+                arguments.offset,
+            )
+        if arguments.planner_command == "status":
+            return client.get_runner_plan(arguments.runner_plan_id)
+        if arguments.planner_command == "events":
+            return client.get_runner_plan_events(arguments.runner_plan_id)
+        runner_plan = client.change_runner_plan(
+            arguments.runner_plan_id, arguments.planner_command
+        )
+        _log_plan_state(runner_plan, arguments.planner_command)
+        return runner_plan
     if arguments.command == "provider":
         if arguments.provider_command == "list":
             return client.list_providers()
@@ -1065,17 +1567,32 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
                     arguments.campaign_id,
                     include_requests=arguments.include_requests,
                 )
-            return client.get_campaign(arguments.campaign_id)
+            return campaign_status_view(client, arguments.campaign_id)
         if arguments.campaign_command == "list":
             return _validate_campaign_list(
                 client.list_campaigns(arguments.limit, arguments.offset)
             )
         if arguments.campaign_command == "cancel":
-            return client.cancel_campaign(arguments.campaign_id)
+            campaign = client.cancel_campaign(arguments.campaign_id)
+            LOGGER.info(
+                "Campaign %s cancellation result: status=%s outcome=%s "
+                "runners=%s plans=%s",
+                arguments.campaign_id,
+                campaign.get("status"),
+                campaign.get("outcome"),
+                campaign.get("runner_count"),
+                campaign.get("runner_plan_count"),
+            )
+            return campaign
         document = client.export_campaign(
             arguments.campaign_id, arguments.include_requests
         )
         write_json(Path(arguments.output), document)
+        LOGGER.info(
+            "Exported Campaign %s to %s",
+            arguments.campaign_id,
+            arguments.output,
+        )
         return {"exported_to": arguments.output}
     if arguments.command == "runner":
         if arguments.runner_command == "start":
@@ -1095,7 +1612,15 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
             )
             runner_id = created["runner_id"]
             runner_status = created.get("status", "submitted")
-            LOGGER.info("Runner accepted: %s (%s)", runner_id, runner_status)
+            benchmark = created.get("benchmark") or payload.get("benchmark") or {}
+            LOGGER.info(
+                "Runner accepted: %s (%s) campaign=%s provider=%s model=%s",
+                runner_id,
+                runner_status,
+                created.get("campaign_id") or "-",
+                benchmark.get("provider") or "-",
+                benchmark.get("model") or "-",
+            )
             if not arguments.wait:
                 LOGGER.info(
                     "Runner start is non-blocking; track progress with: "
@@ -1131,7 +1656,9 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
             )
             return _validate_runner_list(document, full=arguments.full)
         if arguments.runner_command == "cancel":
-            return client.cancel_runner(arguments.runner_id)
+            runner = client.cancel_runner(arguments.runner_id)
+            _log_runner_state(runner, 0)
+            return runner
         if arguments.runner_command == "wait":
             return wait_for_runners(
                 client,
@@ -1152,6 +1679,7 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
             }
         document = client.export_runner(arguments.runner_id)
         write_json(Path(arguments.output), document)
+        LOGGER.info("Exported Runner %s to %s", arguments.runner_id, arguments.output)
         return {"exported_to": arguments.output}
     raise ClientError(f"Unsupported command: {arguments.command}")
 
@@ -1192,8 +1720,30 @@ def main() -> None:
             token_provider=token_provider,
             token_providers=token_providers,
         )
+        subcommand = getattr(
+            arguments,
+            f"{arguments.command}_command",
+            None,
+        )
+        command_label = (
+            f"{arguments.command} {subcommand}" if subcommand else arguments.command
+        )
+        LOGGER.info(
+            "llmperfctl process started: pid=%d backend=%s command=%s",
+            os.getpid(),
+            arguments.url,
+            command_label,
+        )
         result = execute(client, arguments)
         if (
+            arguments.command == "campaign"
+            and arguments.campaign_command == "status"
+            and not arguments.json
+            and not arguments.full
+            and not arguments.include_requests
+        ):
+            print_campaign_status(result)
+        elif (
             arguments.command == "campaign"
             and arguments.campaign_command == "list"
             and not arguments.json

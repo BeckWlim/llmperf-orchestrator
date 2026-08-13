@@ -9,6 +9,7 @@ import requests
 from llmperf.ray_llm_client import LLMClient
 from llmperf.models import RequestConfig
 from llmperf import common_metrics
+from llmperf.usage import normalize_usage
 
 
 class OpenAIStreamError(RuntimeError):
@@ -42,12 +43,13 @@ def decode_sse_line(chunk: bytes) -> Dict[str, Any]:
             code = -1
         raise OpenAIStreamError(message, code)
 
+    usage = document.get("usage")
+    event_usage = usage if isinstance(usage, dict) else None
     choices = document.get("choices") or []
     if not choices:
         event = {"kind": "metadata"}
-        usage = document.get("usage")
-        if isinstance(usage, dict):
-            event["usage"] = usage
+        if event_usage is not None:
+            event["usage"] = event_usage
         return event
     if not isinstance(choices, list) or not isinstance(choices[0], dict):
         raise ValueError("SSE choices must be a list of objects")
@@ -61,42 +63,42 @@ def decode_sse_line(chunk: bytes) -> Dict[str, Any]:
         if isinstance(value, str) and value:
             segments.append(value)
     if not segments:
-        return {"kind": "metadata"}
-    return {"kind": "text", "text": "".join(segments)}
+        event = {"kind": "metadata"}
+        if event_usage is not None:
+            event["usage"] = event_usage
+        return event
+    event = {"kind": "text", "text": "".join(segments)}
+    if event_usage is not None:
+        event["usage"] = event_usage
+    return event
 
 
 def cache_metrics_from_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize cache token counters from OpenAI-compatible providers."""
+    """Backward-compatible metric projection of typed usage normalization."""
 
-    hit_tokens = usage.get("prompt_cache_hit_tokens")
-    miss_tokens = usage.get("prompt_cache_miss_tokens")
+    normalized = normalize_usage(usage)
+    metrics = normalized.to_metrics()
+    metrics.pop(common_metrics.NORMALIZED_USAGE, None)
+    metrics.pop(common_metrics.RAW_USAGE, None)
+    metrics.pop(common_metrics.PROVIDER_INPUT_TOKENS, None)
+    metrics.pop(common_metrics.PROVIDER_OUTPUT_TOKENS, None)
+    return metrics
 
-    if hit_tokens is None:
-        details = usage.get("prompt_tokens_details")
-        total_tokens = usage.get("prompt_tokens")
-        if not isinstance(details, dict):
-            details = usage.get("input_tokens_details")
-            total_tokens = usage.get("input_tokens")
-        if isinstance(details, dict):
-            hit_tokens = details.get("cached_tokens")
-            if hit_tokens is not None and total_tokens is not None:
-                miss_tokens = max(0, total_tokens - hit_tokens)
 
-    if hit_tokens is None:
-        return {}
-    if miss_tokens is None:
-        total_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
-        if total_tokens is None:
-            return {common_metrics.KV_CACHE_HIT_TOKENS: hit_tokens}
-        miss_tokens = max(0, total_tokens - hit_tokens)
+SAFE_RESPONSE_HEADERS = {
+    "request-id",
+    "server-timing",
+    "trace-id",
+    "x-request-id",
+    "x-trace-id",
+}
 
-    cacheable_tokens = hit_tokens + miss_tokens
+
+def _safe_response_headers(headers: Any) -> Dict[str, str]:
     return {
-        common_metrics.KV_CACHE_HIT_TOKENS: hit_tokens,
-        common_metrics.KV_CACHE_MISS_TOKENS: miss_tokens,
-        common_metrics.KV_CACHE_HIT_RATE: (
-            hit_tokens / cacheable_tokens if cacheable_tokens else 0
-        ),
+        str(name).lower(): str(value)[:2048]
+        for name, value in headers.items()
+        if str(name).lower() in SAFE_RESPONSE_HEADERS
     }
 
 
@@ -120,7 +122,7 @@ class OpenAIChatCompletionsClient(LLMClient):
         }
         sampling_params = request_config.sampling_params
         body.update(sampling_params or {})
-        time_to_next_token = []
+        inter_chunk_latencies = []
         tokens_received = 0
         ttft = 0
         error_response_code = -1
@@ -129,6 +131,13 @@ class OpenAIChatCompletionsClient(LLMClient):
         output_throughput = 0
         total_request_time = 0
         usage = {}
+        request_metadata = dict(request_config.metadata or {})
+        response_headers = {}
+        response_headers_time = None
+        first_sse_time = None
+        first_text_time = None
+        last_text_time = None
+        completion_time = None
 
         metrics = {}
 
@@ -136,7 +145,6 @@ class OpenAIChatCompletionsClient(LLMClient):
         metrics[common_metrics.ERROR_MSG] = ""
 
         start_time = time.monotonic()
-        most_recent_received_token_time = time.monotonic()
         address = os.environ.get("OPENAI_API_BASE")
         if not address:
             raise ValueError("the environment variable OPENAI_API_BASE must be set.")
@@ -158,14 +166,19 @@ class OpenAIChatCompletionsClient(LLMClient):
                 timeout=request_timeout,
                 headers=headers,
             ) as response:
+                response_headers_time = time.monotonic()
+                response_headers = _safe_response_headers(response.headers)
                 if response.status_code != 200:
                     error_msg = response.text
                     error_response_code = response.status_code
                     response.raise_for_status()
                 for chunk in response.iter_lines(chunk_size=None):
+                    received_at = time.monotonic()
+                    if chunk and first_sse_time is None:
+                        first_sse_time = received_at
                     event = decode_sse_line(chunk)
+                    usage.update(event.get("usage") or {})
                     if event["kind"] == "metadata":
-                        usage.update(event.get("usage") or {})
                         continue
                     if event["kind"] == "ignore":
                         continue
@@ -173,14 +186,12 @@ class OpenAIChatCompletionsClient(LLMClient):
                         break
                     text = event["text"]
                     tokens_received += 1
-                    if not ttft:
-                        ttft = time.monotonic() - start_time
-                        time_to_next_token.append(ttft)
+                    if first_text_time is None:
+                        first_text_time = received_at
+                        ttft = first_text_time - start_time
                     else:
-                        time_to_next_token.append(
-                            time.monotonic() - most_recent_received_token_time
-                        )
-                    most_recent_received_token_time = time.monotonic()
+                        inter_chunk_latencies.append(received_at - last_text_time)
+                    last_text_time = received_at
                     generated_text += text
 
             if not generated_text:
@@ -202,18 +213,58 @@ class OpenAIChatCompletionsClient(LLMClient):
             print(f"Warning Or Error: {error_msg}")
             print(error_response_code)
         finally:
-            total_request_time = time.monotonic() - start_time
+            completion_time = time.monotonic()
+            total_request_time = completion_time - start_time
             output_throughput = (
                 tokens_received / total_request_time if total_request_time > 0 else 0
             )
 
-        metrics[common_metrics.INTER_TOKEN_LAT] = sum(time_to_next_token)
+        # Retained for result-schema compatibility. This is based on SSE chunks,
+        # not provider token boundaries; new consumers must use the explicitly
+        # named inter_sse_chunk_latency_s and TPOT fields below.
+        metrics[common_metrics.INTER_TOKEN_LAT] = sum(inter_chunk_latencies)
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
         metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = output_throughput
         metrics[common_metrics.NUM_TOTAL_TOKENS] = tokens_received + prompt_len
         metrics[common_metrics.NUM_OUTPUT_TOKENS] = tokens_received
         metrics[common_metrics.NUM_INPUT_TOKENS] = prompt_len
-        metrics.update(cache_metrics_from_usage(usage))
+        metrics[common_metrics.LOCAL_INPUT_TOKENS] = prompt_len
+        metrics[common_metrics.REQUEST_METADATA] = request_metadata
+        metrics[common_metrics.RESPONSE_HEADERS] = response_headers
+        metrics[common_metrics.RESPONSE_HEADER_LAT] = (
+            response_headers_time - start_time
+            if response_headers_time is not None
+            else None
+        )
+        metrics[common_metrics.FIRST_SSE_LAT] = (
+            first_sse_time - start_time if first_sse_time is not None else None
+        )
+        metrics[common_metrics.INTER_SSE_CHUNK_LAT] = inter_chunk_latencies
+        metrics[common_metrics.REQUEST_TIMING] = {
+            "client_start_monotonic": start_time,
+            "response_headers_monotonic": response_headers_time,
+            "first_sse_monotonic": first_sse_time,
+            "first_text_monotonic": first_text_time,
+            "completed_monotonic": completion_time,
+        }
+        metrics[common_metrics.STREAM_TIMING_SEMANTICS] = {
+            "legacy_inter_token_latency": "deprecated_inter_chunk_average",
+            "inter_sse_chunk_latency": "time_between_text-bearing_sse_events",
+            "ttft_in_decode_intervals": False,
+        }
+        if usage:
+            normalized_usage = normalize_usage(usage)
+            metrics.update(normalized_usage.to_metrics())
+            output_tokens = normalized_usage.provider_output_tokens
+            if (
+                output_tokens is not None
+                and output_tokens > 1
+                and first_text_time is not None
+                and completion_time is not None
+            ):
+                metrics[common_metrics.TPOT] = (completion_time - first_text_time) / (
+                    output_tokens - 1
+                )
 
         return metrics, generated_text, request_config
