@@ -66,7 +66,7 @@ and persisted before results are exported as JSON or professional HTML reports.
 
 ### 1. Install
 
-Requirements: Python 3.9 or 3.10 and PostgreSQL.
+Requirements: Python 3.9 or newer and PostgreSQL.
 
 ```bash
 git clone git@github.com:BeckWlim/llmperf-orchestrator.git
@@ -75,6 +75,20 @@ cd llmperf-orchestrator
 python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
+```
+
+The default installation includes the OpenAI-compatible and Vertex AI REST
+adapters. Install only the optional integrations you use:
+
+```bash
+# LiteLLM-backed providers, including Anthropic
+python -m pip install -e '.[litellm]'
+
+# Amazon SageMaker
+python -m pip install -e '.[sagemaker]'
+
+# Standalone llm_correctness.py benchmark
+python -m pip install -e '.[correctness]'
 ```
 
 Initialize a local database:
@@ -212,6 +226,7 @@ code `2`, while durable results remain available for diagnosis and export.
 ## Development
 
 ```bash
+python -m pip install -e '.[dev]'
 pytest -q
 ```
 
@@ -223,6 +238,12 @@ createdb llmperf_test
 export LLMPERF_TEST_DB=postgresql+asyncpg:///llmperf_test
 pytest -q -m postgresql
 ```
+
+## Acknowledgements
+
+This project builds on [ray-project/llmperf](https://github.com/ray-project/llmperf).
+We thank its original authors and contributors for creating and open-sourcing the
+LLM API benchmarking foundation used here.
 
 ## License
 
