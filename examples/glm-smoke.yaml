@@ -8,10 +8,10 @@ metadata:
 benchmark:
   # Must match a model ID returned by the configured /v1/models endpoint.
   provider: aliyun
-  model: glm-5.2
+  model: ZHIPU/GLM-5.2
   # The backend resolves this revision and caches local-only Worker artifacts.
   tokenizer:
-    id: THUDM/glm-4-9b-chat
+    id: zai-org/GLM-5.2
     revision: main
     use_fast: true
   timeout_seconds: 30

@@ -84,6 +84,7 @@ def test_default_dotenv(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.delenv("LLMPERF_ENV_FILE", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty-xdg"))
     monkeypatch.delenv("LLMPERF_DEFAULT_MODEL", raising=False)
     monkeypatch.delenv("LLMPERF_SERVER_PORT", raising=False)
     monkeypatch.chdir(tmp_path)

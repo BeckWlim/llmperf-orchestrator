@@ -21,24 +21,55 @@ LLMPerf includes an optional FastAPI backend for validating and reloading YAML
 runtime configuration. The default configuration is packaged at
 `src/llmperf_backend/configs/default.yaml`.
 
-Start the backend after installation:
+For a test server, persist backend settings in the user configuration directory
+instead of exporting them in every shell or keeping secrets in the repository:
 
 ```bash
-cp .env.template .env
-# Edit DATABASE_URL, the model endpoint, and credentials in .env.
+llmperf-backend config set LLMPERF_SERVER_HOST 0.0.0.0
+llmperf-backend config set DATABASE_URL postgresql+asyncpg:///llmperf
+llmperf-backend config set LLMPERF_PROVIDER_ALIYUN_URL https://dashscope.aliyuncs.com/compatible-mode/v1
+llmperf-backend config set LLMPERF_DEFAULT_PROVIDER aliyun
+llmperf-backend config set LLMPERF_TOKENIZER_CACHE /var/cache/llmperf/tokenizers
+llmperf-backend config set LLMPERF_DATASET_CACHE /var/cache/llmperf/datasets
+llmperf-backend config set LLMPERF_HUGGINGFACE_PROXY http://proxy.example.com:3128
+
+llmperf-backend config list
 llmperf-backend
 ```
 
-The backend automatically loads `.env` from its current working directory.
-Exported process variables take precedence. Set `LLMPERF_ENV_FILE` before
-startup to select another dotenv file; changing dotenv values requires a
-service restart. Workers and Ray actors inherit the resolved provider
-credentials, while task payloads and JSON exports never contain those secrets.
+For secrets, pipe the value through standard input so it is not included in the
+command arguments or shell history:
 
-`.env.template` intentionally contains only PostgreSQL, provider credentials,
-default provider/model, and a few optional service controls. Benchmark workload
-parameters belong in submitted YAML. The real `.env`, `.env.*`, and `.secrets/`
-are ignored by Git; `.env.template` is the only allowed dotenv template.
+```bash
+printf '%s' "$ALIYUN_API_KEY" | \
+  llmperf-backend config set LLMPERF_PROVIDER_ALIYUN_KEY --stdin
+```
+
+These commands write `~/.config/llmperf/backend.env`, alongside the recommended
+`~/.config/llmperf/keys/` location used for authentication keys.
+`XDG_CONFIG_HOME` is honored when set. The directory is owner-only (`0700`), the
+file is owner-only (`0600`), writes are atomic, and sensitive values are redacted
+by `config get/list`. Configuration changes require a backend restart.
+
+The backend automatically loads this user configuration. Exported process
+variables take precedence. Set `LLMPERF_ENV_FILE` before startup to select
+another dotenv file. If no user or explicit file exists, a working-directory
+`.env` is still loaded for backward compatibility. Workers and Ray actors inherit
+the resolved provider credentials, while task payloads and JSON exports never
+contain those secrets.
+
+Useful configuration commands are:
+
+```bash
+llmperf-backend config path
+llmperf-backend config get LLMPERF_SERVER_HOST
+llmperf-backend config list
+llmperf-backend config unset LLMPERF_SERVER_HOST
+```
+
+`.env.template` remains a reference and compatibility template. Benchmark
+workload parameters belong in submitted YAML, not the persistent backend file.
+The real `.env`, `.env.*`, and `.secrets/` are ignored by Git.
 
 Each submitted Runner can select its own tokenizer. The backend resolves and caches
 the tokenizer before accepting the Runner, records the resolved revision with the
@@ -58,12 +89,12 @@ benchmark:
 executed. Cache location and offline-only lookup are controlled by the backend:
 
 ```dotenv
-LLMPERF_TOKENIZER_CACHE_DIR=/var/cache/llmperf/tokenizers
-LLMPERF_TOKENIZER_PROXY=http://proxy.example.com:3128
-LLMPERF_TOKENIZER_LOCAL_FILES_ONLY=false
+LLMPERF_TOKENIZER_CACHE=/var/cache/llmperf/tokenizers
+LLMPERF_HUGGINGFACE_PROXY=http://proxy.example.com:3128
+LLMPERF_TOKENIZER_OFFLINE=false
 ```
 
-`LLMPERF_TOKENIZER_PROXY` is shared by tokenizer and dataset resolution and is
+`LLMPERF_HUGGINGFACE_PROXY` is shared by tokenizer and dataset resolution and is
 passed directly to their HTTP and HTTPS Hugging Face requests. It is useful when
 the backend service cannot see a desktop or system proxy. Standard `HTTP_PROXY`,
 `HTTPS_PROXY`, and `NO_PROXY` environment variables remain available for
@@ -74,10 +105,11 @@ directory is invalid, and cache one tokenizer instance per process. Runner YAML
 that omits `tokenizer` uses the backend default
 `hf-internal-testing/llama-tokenizer`, resolved through the same cache.
 
-To use another configuration file, set its path before starting the server:
+To use another YAML configuration file, persist its path before starting the
+server:
 
 ```bash
-export LLMPERF_BACKEND_CONFIG=/path/to/backend.yaml
+llmperf-backend config set LLMPERF_BACKEND_CONFIG /path/to/backend.yaml
 llmperf-backend
 ```
 
@@ -169,7 +201,7 @@ dataset, select a persistent backend cache and run the DeepSeek campaign:
 
 ```bash
 # Set this in the backend service environment (or its .env), then restart it:
-LLMPERF_DATASET_CACHE_DIR=/var/cache/llmperf/datasets
+LLMPERF_DATASET_CACHE=/var/cache/llmperf/datasets
 
 # Run the client after the backend is ready:
 llmperfctl campaign start \
@@ -178,7 +210,7 @@ llmperfctl campaign start \
 
 The CLI submits the Hugging Face dataset specification from the Campaign and
 receives queued Runners immediately. The Scheduler downloads the declared
-artifact once, stores it under `LLMPERF_DATASET_CACHE_DIR` (default
+artifact once, stores it under `LLMPERF_DATASET_CACHE` (default
 `~/.cache/llmperf/datasets`), and gives Workers only its resolved local path.
 Large downloads therefore cannot time out the Runner-submission HTTP request;
 download failures become durable failed Runner outcomes. Hugging Face's standard
@@ -235,6 +267,15 @@ summaries and captured logs are not transferred only to be hidden by the CLI.
 Use `full=true` (or CLI `--full`) only for diagnostics.
 The CLI and backend use one strict list-response contract.
 
+Campaign listings follow the same convention: compact table by default and
+lightweight JSON only when requested explicitly:
+
+```bash
+llmperfctl campaign list
+llmperfctl campaign list --limit 20
+llmperfctl campaign list --json
+```
+
 `runner wait` and `runner start --wait` print a compact outcome by default. Add
 `--full` only when the complete Runner document and captured stdout/stderr are
 needed. Status transitions (`queued`, `running`, terminal status) are printed as
@@ -289,7 +330,7 @@ psql -v ON_ERROR_STOP=1 -d llmperf -f sql/postgresql/init.sql
 The SQL creates task, metric, user, trusted-key, and audit tables but does not
 seed a database superuser. Bootstrap public-key authentication handles the
 first trusted CLI call. Real PostgreSQL repository tests are opt-in through
-`LLMPERF_TEST_DATABASE_URL`; details are in the architecture guide.
+`LLMPERF_TEST_DB`; details are in the architecture guide.
 
 # Basic Usage
 

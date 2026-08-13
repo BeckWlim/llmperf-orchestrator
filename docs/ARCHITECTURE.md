@@ -117,7 +117,7 @@ database:
 
 ```bash
 createdb llmperf_test
-export LLMPERF_TEST_DATABASE_URL='postgresql+asyncpg:///llmperf_test'
+export LLMPERF_TEST_DB='postgresql+asyncpg:///llmperf_test'
 pytest -q -m postgresql tests/test_postgresql_integration.py
 ```
 
@@ -265,16 +265,16 @@ API 在任务入队前通过 backend `TokenizerCache` 查找并下载 tokenizer�
 选择。Worker 始终使用 `local_files_only=True`，不会自行访问 Hugging Face。
 
 backend 缓存目录默认为 `~/.cache/llmperf/tokenizers`，可以通过
-`LLMPERF_TOKENIZER_CACHE_DIR` 修改；设置
-`LLMPERF_TOKENIZER_LOCAL_FILES_ONLY=true` 后，API 只接受已经存在于服务端下载缓存中的
+`LLMPERF_TOKENIZER_CACHE` 修改；设置
+`LLMPERF_TOKENIZER_OFFLINE=true` 后，API 只接受已经存在于服务端下载缓存中的
 tokenizer。远程 tokenizer code 固定为不信任，避免 operator 提交 YAML 后在控制面或
 Worker 中执行仓库代码。多个并发请求在进程内按 tokenizer key 合并查找，磁盘 artifact
 通过临时目录原子发布。
 
-受限网络环境可以设置 `LLMPERF_TOKENIZER_PROXY=http://proxy:port`。backend 将该代理
-显式传给 Transformers 的 HTTP 和 HTTPS tokenizer 请求，因此不依赖桌面或 systemd
-service 是否继承系统代理设置；进程级 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`
-仍然有效。
+受限网络环境可以设置 `LLMPERF_HUGGINGFACE_PROXY=http://proxy:port`。backend 将该共享
+代理显式传给 tokenizer 和 dataset 的 Hugging Face HTTP/HTTPS 请求，因此不依赖桌面或
+systemd service 是否继承系统代理设置；进程级 `HTTP_PROXY`、`HTTPS_PROXY` 和
+`NO_PROXY` 仍然有效。
 
 Runner 未声明 tokenizer 时使用 backend 默认的
 `hf-internal-testing/llama-tokenizer`，并经过同一解析与缓存流程。
@@ -309,7 +309,26 @@ llmperfctl provider models deepseek --refresh
 
 ## 10. YAML 与运行配置
 
-默认配置位于 `src/llmperf_backend/configs/default.yaml`，可通过环境变量覆盖：
+默认配置位于 `src/llmperf_backend/configs/default.yaml`，可通过环境变量覆盖。
+测试服务器及长期部署推荐使用持久化用户配置：
+
+```bash
+llmperf-backend config set LLMPERF_SERVER_HOST 0.0.0.0
+llmperf-backend config set DATABASE_URL postgresql+asyncpg:///llmperf
+llmperf-backend config set LLMPERF_DATASET_CACHE /var/cache/llmperf/datasets
+printf '%s' "$ALIYUN_API_KEY" | \
+  llmperf-backend config set LLMPERF_PROVIDER_ALIYUN_KEY --stdin
+llmperf-backend
+```
+
+默认写入 `~/.config/llmperf/backend.env`（设置了 `XDG_CONFIG_HOME` 时使用
+其下的 `llmperf/backend.env`），与 CLI 推荐的认证密钥目录共享
+`~/.config/llmperf` 根目录。目录权限为 `0700`，配置文件权限为 `0600`，
+写入使用原子替换；`config get/list` 会隐藏密钥、令牌和数据库 URL。
+配置修改后需要重启后端。
+
+加载优先级为：已经导出的进程环境变量 > `LLMPERF_ENV_FILE` 指定文件 >
+用户持久化配置 > 当前工作目录 `.env`。项目内 `.env` 仅作为兼容后备：
 
 ```bash
 cp .env.template .env
@@ -317,7 +336,7 @@ cp .env.template .env
 llmperf-backend
 ```
 
-后端从启动时的当前工作目录自动读取 `.env`。操作系统中已经导出的环境变量优先，不会被 `.env` 覆盖。需要使用其他文件时，在启动前设置：
+需要使用其他文件时，在启动前设置：
 
 ```bash
 export LLMPERF_ENV_FILE=/absolute/path/llmperf.env
@@ -372,7 +391,7 @@ OpenAI-compatible Profile 默认使用 `openai` Adapter、`/models` 发现路径
 300 秒缓存，因此常规供应商只需要 `URL` 与 `KEY`。任务负载参数保留在 Runner
 YAML 中，不再复制到 `.env`。如果供应商不是 OpenAI-compatible，可增加
 `ADAPTER`；存在 `MODELS` 时会自动使用静态目录。只有非标准服务才需要配置
-`DISCOVERY`、`MODELS_PATH`、`CACHE_TTL`、`URL_ENV` 或 `KEY_ENV`。
+`DISCOVERY`、`PATH`、`TTL`、`URLVAR` 或 `KEYVAR`。
 
 创建 Runner 时，服务端验证 `provider` 是否存在，并用 Profile 中的
 `llm_api` 覆盖客户端值。数据库仅保存 `provider`、`model` 和解析后的非敏感
@@ -404,7 +423,7 @@ sequenceDiagram
 ```
 
 - `DISCOVERY=openai`：请求 Profile 的
-  `<URL><MODELS_PATH>`，解析 OpenAI-compatible `data[].id`。
+  `<URL><PATH>`，解析 OpenAI-compatible `data[].id`。
 - `DISCOVERY=static`：对不提供兼容目录接口的供应商返回管理员配置的
   `MODELS` 白名单。
 - `DISCOVERY=disabled`：禁止该 Profile 的模型发现。

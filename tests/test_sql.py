@@ -14,13 +14,13 @@ from llmperf_backend.models import DatabaseConfig
 from llmperf_backend.persistence import Base, Database, RunnerRepository
 
 
-TEST_DATABASE_URL = os.environ.get("LLMPERF_TEST_DATABASE_URL")
+TEST_DATABASE_URL = os.environ.get("LLMPERF_TEST_DB")
 
 
 @pytest.mark.postgresql
 def test_lifecycle():
     if not TEST_DATABASE_URL:
-        pytest.skip("LLMPERF_TEST_DATABASE_URL is not configured")
+        pytest.skip("LLMPERF_TEST_DB is not configured")
     url = make_url(TEST_DATABASE_URL)
     database_name = url.database or ""
     assert url.drivername == "postgresql+asyncpg"

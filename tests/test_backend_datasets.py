@@ -68,7 +68,7 @@ def test_cache(tmp_path, monkeypatch):
 
 
 def test_environment_cache_directory(tmp_path, monkeypatch):
-    monkeypatch.setenv("LLMPERF_DATASET_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("LLMPERF_DATASET_CACHE", str(tmp_path))
 
     assert DatasetCache().cache_directory == tmp_path.resolve()
 
@@ -98,6 +98,14 @@ def test_shared_huggingface_proxy(tmp_path, monkeypatch):
         "http": "http://proxy.internal:3128",
         "https": "http://proxy.internal:3128",
     }
+
+
+def test_shared_huggingface_proxy_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLMPERF_HUGGINGFACE_PROXY", "http://proxy.environment:8080")
+
+    cache = DatasetCache(cache_directory=tmp_path)
+
+    assert cache.proxy_url == "http://proxy.environment:8080"
 
 
 @pytest.mark.parametrize("filename", ["/etc/passwd", "../outside.json", "a\\b"])

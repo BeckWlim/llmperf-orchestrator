@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from llmperf.utils import TOKENIZER_FAST, TOKENIZER_PATH
 from llmperf_backend.models import DatabaseConfig, SchedulerConfig
 from llmperf_backend.persistence import (
     CANCELLED,
@@ -18,18 +19,11 @@ from llmperf_backend.persistence import (
     RunnerRepository,
 )
 from llmperf_backend.providers import ProviderRegistry
-from llmperf_backend.tokenizers import (
-    TokenizerCache,
-    WORKER_TOKENIZER_PATH_ENV,
-    WORKER_TOKENIZER_USE_FAST_ENV,
-)
-from llmperf_backend.datasets import (
-    DatasetCache,
-    WORKER_DATASET_PATH_ENV,
-)
+from llmperf_backend.tokenizers import TokenizerCache
+from llmperf_backend.datasets import DatasetCache, WORKER_DATASET_PATH
 
 
-WORKER_DATABASE_URL_ENV = "LLMPERF_WORKER_DATABASE_URL"
+WORKER_DATABASE_URL = "LLMPERF_WORKER_DB"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -155,14 +149,12 @@ class Scheduler:
         tokenizer = runner["benchmark"].get("tokenizer")
         if tokenizer is not None:
             resolution = await self.tokenizer_cache.resolve(tokenizer)
-            environment[WORKER_TOKENIZER_PATH_ENV] = str(resolution.path)
-            environment[WORKER_TOKENIZER_USE_FAST_ENV] = (
-                "true" if resolution.use_fast else "false"
-            )
+            environment[TOKENIZER_PATH] = str(resolution.path)
+            environment[TOKENIZER_FAST] = "true" if resolution.use_fast else "false"
         dataset = runner["benchmark"].get("dataset")
         if dataset is not None:
             resolution = await self.dataset_cache.resolve(dataset)
-            environment[WORKER_DATASET_PATH_ENV] = str(resolution.path)
+            environment[WORKER_DATASET_PATH] = str(resolution.path)
         return environment
 
     async def _execute(self, runner: Dict[str, Any]) -> None:
@@ -171,7 +163,7 @@ class Scheduler:
         communicate_task: Optional[asyncio.Task] = None
         try:
             environment = await self.worker_environment(runner, dict(os.environ))
-            environment[WORKER_DATABASE_URL_ENV] = self.database_config.url
+            environment[WORKER_DATABASE_URL] = self.database_config.url
             process = await asyncio.create_subprocess_exec(
                 *self.build_command(runner_id),
                 cwd=str(self._working_directory()),

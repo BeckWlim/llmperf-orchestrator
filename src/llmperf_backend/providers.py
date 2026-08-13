@@ -18,21 +18,21 @@ SUPPORTED_ADAPTERS = {"openai", "anthropic", "litellm", "sagemaker", "vertexai"}
 PROVIDER_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 ENVIRONMENT_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 PROFILE_FIELDS = (
-    "MODELS_PATH",
-    "CACHE_TTL",
+    "PATH",
+    "TTL",
     "DISCOVERY",
-    "URL_ENV",
-    "KEY_ENV",
+    "URLVAR",
+    "KEYVAR",
     "ADAPTER",
     "MODELS",
     "URL",
     "KEY",
 )
-DEFAULT_BASE_ENV = {
+DEFAULT_BASE_VARIABLES = {
     "anthropic": "ANTHROPIC_API_BASE",
     "openai": "OPENAI_API_BASE",
 }
-DEFAULT_KEY_ENV = {
+DEFAULT_KEY_VARIABLES = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
 }
@@ -175,10 +175,10 @@ class ProviderRegistry:
                 "or disabled"
             )
         try:
-            cache_ttl = int(values.get("CACHE_TTL", "300"))
+            cache_ttl = int(values.get("TTL", "300"))
         except ValueError as exc:
             raise ProviderConfigError(
-                f"Provider {provider_id!r} CACHE_TTL must be an integer"
+                f"Provider {provider_id!r} TTL must be an integer"
             ) from exc
         if cache_ttl < 0 or cache_ttl > 86400:
             raise ProviderConfigError(
@@ -188,21 +188,21 @@ class ProviderRegistry:
             raise ProviderConfigError(
                 f"Provider {provider_id!r} static discovery requires MODELS"
             )
-        models_path = values.get("MODELS_PATH", "/models").strip() or "/models"
+        models_path = values.get("PATH", "/models").strip() or "/models"
         if not models_path.startswith("/"):
             models_path = f"/{models_path}"
         api_base_env = _validate_environment_name(
             provider_id,
-            "URL_ENV",
+            "URLVAR",
             values.get(
-                "URL_ENV", DEFAULT_BASE_ENV.get(llm_api, "OPENAI_API_BASE")
+                "URLVAR", DEFAULT_BASE_VARIABLES.get(llm_api, "OPENAI_API_BASE")
             ).strip(),
         )
         api_key_env = _validate_environment_name(
             provider_id,
-            "KEY_ENV",
+            "KEYVAR",
             values.get(
-                "KEY_ENV", DEFAULT_KEY_ENV.get(llm_api, "OPENAI_API_KEY")
+                "KEYVAR", DEFAULT_KEY_VARIABLES.get(llm_api, "OPENAI_API_KEY")
             ).strip(),
         )
         return ProviderProfile(

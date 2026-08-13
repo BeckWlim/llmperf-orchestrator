@@ -14,7 +14,7 @@ runners:
       provider: aliyun
       model: glm-5.2
       tokenizer:
-        id: THUDM/glm-4-9b-chat
+        id: zai-org/GLM-5.2  
         revision: main
         use_fast: true
       timeout_seconds: 60
@@ -34,7 +34,7 @@ runners:
       provider: aliyun
       model: glm-5.2
       tokenizer:
-        id: THUDM/glm-4-9b-chat
+        id: zai-org/GLM-5.2 
         revision: main
         use_fast: true
       timeout_seconds: 60

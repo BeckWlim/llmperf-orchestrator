@@ -11,9 +11,11 @@ from urllib.error import HTTPError
 
 from llmperf_cli.__main__ import (
     _has_unsuccessful_runner,
+    _validate_campaign_list,
     _validate_runner_list,
     build_parser,
     execute,
+    print_campaign_table,
     print_runner_table,
     start_campaign,
     summarize_runner,
@@ -297,6 +299,13 @@ ARG_CASES = [
     ),
     pytest.param(
         {
+            "argv": ["campaign", "list"],
+            "expected": {"limit": 50, "offset": 0, "json": False},
+        },
+        id="campaign-list-defaults",
+    ),
+    pytest.param(
+        {
             "argv": [
                 "runner",
                 "start",
@@ -408,7 +417,45 @@ def test_list_table(capsys):
     assert "b792140c-b58c-430f-9c01-2947f49305dc" in output
     assert "aliyun/glm-5.2" in output
     assert "0/1" in output
+
+
+def test_campaign_list_table(capsys):
+    document = {
+        "items": [
+            {
+                "campaign_id": "cc895606-89d4-4562-811d-2e12a1e1a7de",
+                "name": "deepseek-v4-pro-kvcache-reality",
+                "status": "succeeded",
+                "runner_count": 2,
+                "status_counts": {
+                    "queued": 0,
+                    "running": 0,
+                    "succeeded": 2,
+                    "failed": 0,
+                    "cancelled": 0,
+                },
+                "created_at": "2026-08-12T09:48:00.000000Z",
+                "description": "must not be rendered",
+                "tags": {"large": "must not be rendered"},
+            }
+        ],
+        "limit": 50,
+        "offset": 0,
+    }
+
+    print_campaign_table(_validate_campaign_list(document))
+
+    output = capsys.readouterr().out
+    assert "CAMPAIGN ID" in output
+    assert "cc895606-89d4-4562-811d-2e12a1e1a7de" in output
+    assert "0/0/2/0/0" in output
+    assert "deepseek-v4-pro-kvcac" in output
     assert "must not be rendered" not in output
+
+
+def test_bad_campaign_list_schema():
+    with pytest.raises(ClientError, match="missing required fields"):
+        _validate_campaign_list({"items": [{"campaign_id": "campaign-1"}]})
 
 
 def test_bad_list_schema():

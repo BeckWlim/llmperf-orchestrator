@@ -61,6 +61,37 @@ def test_offline(tmp_path, monkeypatch):
     assert loader.call_args.kwargs["use_fast"] is False
 
 
+def test_tokenizers_backend_compatibility(tmp_path, monkeypatch):
+    auto_loader = Mock(
+        side_effect=ValueError(
+            "Tokenizer class TokenizersBackend does not exist or is not currently "
+            "imported."
+        )
+    )
+    fast_loader = Mock(return_value=FakeTokenizer())
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", auto_loader
+    )
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.PreTrainedTokenizerFast.from_pretrained",
+        fast_loader,
+    )
+    cache = TokenizerCache(cache_directory=tmp_path, local_files_only=False)
+
+    result = cache._resolve_sync("zai-org/GLM-5.2", "main", True)
+
+    assert result.revision == "resolved-commit"
+    assert (result.path / "tokenizer.json").is_file()
+    fast_loader.assert_called_once_with(
+        "zai-org/GLM-5.2",
+        revision="main",
+        trust_remote_code=False,
+        cache_dir=str(tmp_path / "downloads"),
+        local_files_only=False,
+        extra_special_tokens={},
+    )
+
+
 def test_proxy(tmp_path, monkeypatch):
     loader = Mock(return_value=FakeTokenizer())
     monkeypatch.setattr(
@@ -78,6 +109,14 @@ def test_proxy(tmp_path, monkeypatch):
         "http": "http://proxy.internal:3128",
         "https": "http://proxy.internal:3128",
     }
+
+
+def test_shared_huggingface_proxy_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLMPERF_HUGGINGFACE_PROXY", "http://proxy.environment:8080")
+
+    cache = TokenizerCache(cache_directory=tmp_path, local_files_only=False)
+
+    assert cache.proxy_url == "http://proxy.environment:8080"
 
 
 def test_bad_proxy(tmp_path):

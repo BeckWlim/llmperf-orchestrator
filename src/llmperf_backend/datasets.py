@@ -11,15 +11,16 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from huggingface_hub import hf_hub_download, try_to_load_from_cache
 from huggingface_hub.utils import HFValidationError, validate_repo_id
 
-from llmperf_backend.tokenizers import (
-    TOKENIZER_PROXY_ENV,
-    _proxy_label,
-    _validate_proxy_url,
+from llmperf_backend.huggingface import (
+    HUGGINGFACE_PROXY,
+    HuggingFaceProxyError,
+    huggingface_proxy_label,
+    resolve_huggingface_proxy,
 )
 
 
-DATASET_CACHE_DIRECTORY_ENV = "LLMPERF_DATASET_CACHE_DIR"
-WORKER_DATASET_PATH_ENV = "LLMPERF_DATASET_PATH"
+DATASET_CACHE_DIRECTORY = "LLMPERF_DATASET_CACHE"
+WORKER_DATASET_PATH = "LLMPERF_DATASET_PATH"
 DEFAULT_DATASET_CACHE_DIRECTORY = Path("~/.cache/llmperf/datasets")
 LOGGER = logging.getLogger(__name__)
 
@@ -56,27 +57,23 @@ class DatasetCache:
         cache_directory: Optional[Path] = None,
         proxy_url: Optional[str] = None,
     ):
-        configured_directory = os.environ.get(DATASET_CACHE_DIRECTORY_ENV)
+        configured_directory = os.environ.get(DATASET_CACHE_DIRECTORY)
         selected_directory = (
             Path(configured_directory)
             if configured_directory
             else cache_directory or DEFAULT_DATASET_CACHE_DIRECTORY
         )
         self.cache_directory = selected_directory.expanduser().resolve()
-        configured_proxy = (
-            proxy_url
-            if proxy_url is not None
-            else os.environ.get(TOKENIZER_PROXY_ENV, "")
-        )
-        self.proxy_url = (
-            _validate_proxy_url(configured_proxy) if configured_proxy else None
-        )
+        try:
+            self.proxy_url = resolve_huggingface_proxy(proxy_url)
+        except HuggingFaceProxyError as exc:
+            raise DatasetResolutionError(str(exc)) from exc
         self._entries: Dict[Tuple[str, str, str, str], DatasetResolution] = {}
         self._lock = threading.RLock()
         LOGGER.info(
             "Dataset cache ready: directory=%s proxy=%s",
             self.cache_directory,
-            _proxy_label(self.proxy_url),
+            huggingface_proxy_label(self.proxy_url),
         )
 
     async def resolve(self, spec: Mapping[str, Any]) -> DatasetResolution:
@@ -148,7 +145,7 @@ class DatasetCache:
             raise DatasetResolutionError(
                 f"Unable to resolve dataset {dataset_id!r}, file {filename!r}, "
                 f"at revision {revision!r}: {exc}. Check Hugging Face network "
-                f"settings, {TOKENIZER_PROXY_ENV}, or preload "
+                f"settings, {HUGGINGFACE_PROXY}, or preload "
                 f"{self.cache_directory}."
             ) from exc
 

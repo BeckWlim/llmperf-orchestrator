@@ -6,19 +6,24 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+from llmperf.user_config import backend_environment_path
 
-ENV_FILE_ENV = "LLMPERF_ENV_FILE"
+
+ENV_FILE = "LLMPERF_ENV_FILE"
 DEFAULT_ENV_FILE = ".env"
 
 
 def resolve_environment_path(path: Optional[Path] = None) -> Path:
-    """Resolve an explicit path, LLMPERF_ENV_FILE, or the working-directory .env."""
+    """Resolve an explicit path, override, user config, or legacy local .env."""
 
     if path is not None:
         return Path(path).expanduser().resolve()
-    configured_path = os.environ.get(ENV_FILE_ENV)
+    configured_path = os.environ.get(ENV_FILE)
     if configured_path:
         return Path(configured_path).expanduser().resolve()
+    user_path = backend_environment_path()
+    if user_path.is_file():
+        return user_path
     return (Path.cwd() / DEFAULT_ENV_FILE).resolve()
 
 
@@ -34,7 +39,7 @@ def load_environment(
     """
 
     environment_path = resolve_environment_path(path)
-    explicitly_selected = path is not None or bool(os.environ.get(ENV_FILE_ENV))
+    explicitly_selected = path is not None or bool(os.environ.get(ENV_FILE))
     if not environment_path.is_file():
         if explicitly_selected:
             raise RuntimeError(f"Environment file does not exist: {environment_path}")

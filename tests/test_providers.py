@@ -64,7 +64,7 @@ def test_worker_credentials():
     "environment",
     [
         {"LLMPERF_PROVIDER_BAD_URL": "https://models.example/v1?key=x"},
-        {"LLMPERF_PROVIDER_BAD_KEY_ENV": "INVALID-NAME"},
+        {"LLMPERF_PROVIDER_BAD_KEYVAR": "INVALID-NAME"},
     ],
 )
 def test_unsafe_routing(environment):
@@ -72,12 +72,12 @@ def test_unsafe_routing(environment):
         ProviderRegistry.from_environment(environment)
 
 
-def test_legacy_variables():
-    with pytest.raises(ProviderConfigError, match="requires URL or MODELS"):
+def test_unknown_provider_fields():
+    with pytest.raises(ProviderConfigError, match="At least one provider"):
         ProviderRegistry.from_environment(
             {
-                "LLMPERF_PROVIDER_DEEPSEEK_API_BASE": "https://models.example/v1",
-                "LLMPERF_PROVIDER_DEEPSEEK_API_KEY": "old-secret",
+                "LLMPERF_PROVIDER_DEEPSEEK_APIBASE": "https://models.example/v1",
+                "LLMPERF_PROVIDER_DEEPSEEK_APIKEY": "old-secret",
             }
         )
 

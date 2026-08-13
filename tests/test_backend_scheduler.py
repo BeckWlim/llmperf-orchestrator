@@ -1,15 +1,12 @@
 import asyncio
 from pathlib import Path
 
+from llmperf.utils import TOKENIZER_FAST, TOKENIZER_PATH
 from llmperf_backend.models import DatabaseConfig, SchedulerConfig
 from llmperf_backend.providers import ProviderRegistry
-from llmperf_backend.scheduler import Scheduler, WORKER_DATABASE_URL_ENV
-from llmperf_backend.tokenizers import (
-    TokenizerResolution,
-    WORKER_TOKENIZER_PATH_ENV,
-    WORKER_TOKENIZER_USE_FAST_ENV,
-)
-from llmperf_backend.datasets import DatasetResolution, WORKER_DATASET_PATH_ENV
+from llmperf_backend.scheduler import Scheduler, WORKER_DATABASE_URL
+from llmperf_backend.tokenizers import TokenizerResolution
+from llmperf_backend.datasets import DatasetResolution, WORKER_DATASET_PATH
 
 
 class UnusedRepository:
@@ -67,7 +64,7 @@ def test_worker_command(tmp_path: Path):
 
     assert command[-2:] == ["--runner-id", "runner-1; touch unsafe"]
     assert command[1:3] == ["-m", "llmperf_backend.worker"]
-    assert WORKER_DATABASE_URL_ENV not in " ".join(command)
+    assert WORKER_DATABASE_URL not in " ".join(command)
     assert scheduler.status()["status"] == "stopped"
     assert scheduler.status()["active_slots"] == 0
 
@@ -100,8 +97,8 @@ def test_tokenizer_injection(tmp_path: Path):
     environment = asyncio.run(scheduler.worker_environment(runner, {"KEEP": "yes"}))
 
     assert environment["KEEP"] == "yes"
-    assert environment[WORKER_TOKENIZER_PATH_ENV] == str(tokenizer_directory)
-    assert environment[WORKER_TOKENIZER_USE_FAST_ENV] == "false"
+    assert environment[TOKENIZER_PATH] == str(tokenizer_directory)
+    assert environment[TOKENIZER_FAST] == "false"
     assert cache.spec == runner["benchmark"]["tokenizer"]
 
 
@@ -134,5 +131,5 @@ def test_dataset_injection(tmp_path: Path):
     environment = asyncio.run(scheduler.worker_environment(runner, {"KEEP": "yes"}))
 
     assert environment["KEEP"] == "yes"
-    assert environment[WORKER_DATASET_PATH_ENV] == str(dataset_path)
+    assert environment[WORKER_DATASET_PATH] == str(dataset_path)
     assert cache.spec == runner["benchmark"]["dataset"]

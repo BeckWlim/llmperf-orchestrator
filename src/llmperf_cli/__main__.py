@@ -152,6 +152,85 @@ def _validate_runner_list(document: Any, full: bool) -> Dict[str, Any]:
     return document
 
 
+def _validate_campaign_list(document: Any) -> Dict[str, Any]:
+    """Validate the lightweight Campaign collection returned by the backend."""
+
+    if not isinstance(document, dict):
+        raise ClientError(
+            "Campaign list response does not match this CLI version; restart or "
+            "update the backend service"
+        )
+    items = document.get("items")
+    if not isinstance(items, list):
+        raise ClientError("Campaign list response must contain an items array")
+    required = {
+        "campaign_id",
+        "name",
+        "status",
+        "runner_count",
+        "status_counts",
+        "created_at",
+    }
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ClientError(f"Campaign list item {index} must be an object")
+        missing = sorted(required.difference(item))
+        if missing:
+            raise ClientError(
+                f"Campaign list item {index} is missing required fields: "
+                f"{', '.join(missing)}"
+            )
+        if not isinstance(item["status_counts"], dict):
+            raise ClientError(
+                f"Campaign list item {index}.status_counts must be an object"
+            )
+    return document
+
+
+def print_campaign_table(document: Dict[str, Any]) -> None:
+    """Render aggregate Campaign state without nested metadata or tags."""
+
+    items = document.get("items") or []
+    if not items:
+        print("No Campaigns found.")
+        return
+
+    columns = (
+        ("STATUS", 9),
+        ("CAMPAIGN ID", 36),
+        ("RUNNERS", 7),
+        ("Q/R/OK/F/C", 12),
+        ("CREATED", 16),
+        ("NAME", 24),
+    )
+    print("  ".join(title.ljust(width) for title, width in columns).rstrip())
+    print("  ".join("-" * width for _, width in columns).rstrip())
+    for item in items:
+        counts = item.get("status_counts") or {}
+        states = "/".join(
+            _table_value(counts.get(status), "0")
+            for status in ("queued", "running", "succeeded", "failed", "cancelled")
+        )
+        values = (
+            item.get("status"),
+            item.get("campaign_id"),
+            item.get("runner_count"),
+            states,
+            _compact_timestamp(item.get("created_at")),
+            item.get("name"),
+        )
+        print(
+            "  ".join(
+                _truncate(value, width).ljust(width)
+                for value, (_, width) in zip(values, columns)
+            ).rstrip()
+        )
+
+    offset = document.get("offset", 0)
+    limit = document.get("limit", len(items))
+    print(f"\nShowing {len(items)} Campaign(s) (offset={offset}, limit={limit}).")
+
+
 def print_runner_table(document: Dict[str, Any]) -> None:
     """Render the lightweight Runner collection without logs or nested JSON."""
 
@@ -672,8 +751,16 @@ Examples:
         campaign_commands,
         "list",
         help="List Campaigns",
-        description="List Campaigns with aggregate Runner status.",
-        epilog="Example:\n  llmperfctl campaign list --limit 20",
+        description=(
+            "List Campaigns as a compact table by default. Use --json for the "
+            "same lightweight aggregate records."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  llmperfctl campaign list\n"
+            "  llmperfctl campaign list --limit 20\n"
+            "  llmperfctl campaign list --json"
+        ),
     )
     campaign_list.add_argument(
         "--limit",
@@ -683,6 +770,11 @@ Examples:
     )
     campaign_list.add_argument(
         "--offset", type=int, default=0, help="Pagination offset (default: 0)"
+    )
+    campaign_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the lightweight Campaign list as JSON",
     )
     campaign_cancel = _command_parser(
         campaign_commands,
@@ -975,7 +1067,9 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
                 )
             return client.get_campaign(arguments.campaign_id)
         if arguments.campaign_command == "list":
-            return client.list_campaigns(arguments.limit, arguments.offset)
+            return _validate_campaign_list(
+                client.list_campaigns(arguments.limit, arguments.offset)
+            )
         if arguments.campaign_command == "cancel":
             return client.cancel_campaign(arguments.campaign_id)
         document = client.export_campaign(
@@ -1100,6 +1194,12 @@ def main() -> None:
         )
         result = execute(client, arguments)
         if (
+            arguments.command == "campaign"
+            and arguments.campaign_command == "list"
+            and not arguments.json
+        ):
+            print_campaign_table(result)
+        elif (
             arguments.command == "runner"
             and arguments.runner_command == "list"
             and not arguments.json

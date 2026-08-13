@@ -42,7 +42,7 @@ database models.
 8. Do not run Ray or benchmark calculation on the FastAPI event loop. Keep it in
    the supervised worker subprocess.
 9. Do not send the database URL into Ray actors. The Worker removes
-   `LLMPERF_WORKER_DATABASE_URL` before creating Ray's runtime environment.
+   `LLMPERF_WORKER_DB` before creating Ray's runtime environment.
 10. Do not return database passwords from configuration APIs. Preserve URL
    redaction when changing config responses.
 11. Do not grant application roles PostgreSQL superuser privileges.
@@ -117,7 +117,7 @@ Real PostgreSQL tests are opt-in and destructive only to a dedicated database
 whose name contains `test`:
 
 ```bash
-LLMPERF_TEST_DATABASE_URL='postgresql+asyncpg:///llmperf_test' \
+LLMPERF_TEST_DB='postgresql+asyncpg:///llmperf_test' \
   python -m pytest -q -m postgresql tests/test_postgresql_integration.py
 ```
 

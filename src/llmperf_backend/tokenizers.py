@@ -10,9 +10,14 @@ import shutil
 import tempfile
 import threading
 from typing import Any, Dict, Mapping, Optional, Tuple
-from urllib.parse import urlsplit
 
 from llmperf.logging import route_library_logs
+from llmperf_backend.huggingface import (
+    HUGGINGFACE_PROXY,
+    HuggingFaceProxyError,
+    huggingface_proxy_label,
+    resolve_huggingface_proxy,
+)
 
 # This backend intentionally uses Transformers without a model framework: only
 # tokenizer configuration and artifacts are needed. Suppress that import advisory
@@ -20,19 +25,19 @@ from llmperf.logging import route_library_logs
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 from huggingface_hub.utils import HFValidationError, validate_repo_id
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 
 route_library_logs("huggingface_hub", "transformers")
 
 
-TOKENIZER_CACHE_DIRECTORY_ENV = "LLMPERF_TOKENIZER_CACHE_DIR"
-TOKENIZER_LOCAL_FILES_ONLY_ENV = "LLMPERF_TOKENIZER_LOCAL_FILES_ONLY"
-TOKENIZER_PROXY_ENV = "LLMPERF_TOKENIZER_PROXY"
-WORKER_TOKENIZER_PATH_ENV = "LLMPERF_TOKENIZER_PATH"
-WORKER_TOKENIZER_USE_FAST_ENV = "LLMPERF_TOKENIZER_USE_FAST"
+TOKENIZER_CACHE_DIRECTORY = "LLMPERF_TOKENIZER_CACHE"
+TOKENIZER_OFFLINE = "LLMPERF_TOKENIZER_OFFLINE"
 DEFAULT_TOKENIZER_CACHE_DIRECTORY = Path("~/.cache/llmperf/tokenizers")
 LOGGER = logging.getLogger(__name__)
+TOKENIZERS_BACKEND_CLASS_ERROR = (
+    "Tokenizer class TokenizersBackend does not exist or is not currently imported"
+)
 
 
 class TokenizerResolutionError(RuntimeError):
@@ -51,30 +56,6 @@ def _environment_flag(name: str, default: bool = False) -> bool:
     raise TokenizerResolutionError(
         f"{name} must be one of true/false, yes/no, on/off, or 1/0"
     )
-
-
-def _validate_proxy_url(proxy_url: str) -> str:
-    normalized = proxy_url.strip()
-    parsed = urlsplit(normalized)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise TokenizerResolutionError(
-            f"{TOKENIZER_PROXY_ENV} must be an HTTP(S) proxy URL"
-        )
-    if parsed.query or parsed.fragment:
-        raise TokenizerResolutionError(
-            f"{TOKENIZER_PROXY_ENV} must not contain query or fragment components"
-        )
-    return normalized
-
-
-def _proxy_label(proxy_url: Optional[str]) -> str:
-    """Describe a proxy for logs without exposing credentials."""
-
-    if not proxy_url:
-        return "environment/default"
-    parsed = urlsplit(proxy_url)
-    port = f":{parsed.port}" if parsed.port else ""
-    return f"{parsed.scheme}://{parsed.hostname}{port}"
 
 
 @dataclass(frozen=True)
@@ -111,7 +92,7 @@ class TokenizerCache:
         local_files_only: Optional[bool] = None,
         proxy_url: Optional[str] = None,
     ):
-        configured_directory = os.environ.get(TOKENIZER_CACHE_DIRECTORY_ENV)
+        configured_directory = os.environ.get(TOKENIZER_CACHE_DIRECTORY)
         selected_directory = (
             Path(configured_directory)
             if configured_directory
@@ -121,18 +102,14 @@ class TokenizerCache:
         self.download_directory = self.cache_directory / "downloads"
         self.resolved_directory = self.cache_directory / "resolved"
         self.local_files_only = (
-            _environment_flag(TOKENIZER_LOCAL_FILES_ONLY_ENV)
+            _environment_flag(TOKENIZER_OFFLINE)
             if local_files_only is None
             else local_files_only
         )
-        configured_proxy = (
-            proxy_url
-            if proxy_url is not None
-            else os.environ.get(TOKENIZER_PROXY_ENV, "")
-        )
-        self.proxy_url = (
-            _validate_proxy_url(configured_proxy) if configured_proxy else None
-        )
+        try:
+            self.proxy_url = resolve_huggingface_proxy(proxy_url)
+        except HuggingFaceProxyError as exc:
+            raise TokenizerResolutionError(str(exc)) from exc
         self._entries: Dict[Tuple[str, str, bool], TokenizerResolution] = {}
         self._key_locks: Dict[Tuple[str, str, bool], threading.Lock] = {}
         self._lock = threading.RLock()
@@ -140,7 +117,7 @@ class TokenizerCache:
             "Tokenizer cache ready: directory=%s offline=%s proxy=%s",
             self.cache_directory,
             self.local_files_only,
-            _proxy_label(self.proxy_url),
+            huggingface_proxy_label(self.proxy_url),
         )
 
     async def resolve(self, spec: Mapping[str, Any]) -> TokenizerResolution:
@@ -226,7 +203,7 @@ class TokenizerCache:
                     tokenizer_id,
                     revision,
                     self.local_files_only,
-                    _proxy_label(self.proxy_url),
+                    huggingface_proxy_label(self.proxy_url),
                 )
                 load_options: Dict[str, Any] = {
                     "revision": revision,
@@ -240,7 +217,38 @@ class TokenizerCache:
                         "http": self.proxy_url,
                         "https": self.proxy_url,
                     }
-                tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, **load_options)
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        tokenizer_id, **load_options
+                    )
+                except ValueError as exc:
+                    if (
+                        not use_fast
+                        or TOKENIZERS_BACKEND_CLASS_ERROR not in str(exc)
+                    ):
+                        raise
+                    # Transformers 5 renamed the generic tokenizer.json loader to
+                    # TokenizersBackend. Older releases cannot resolve that class
+                    # name from newer Hub metadata, although they can load the same
+                    # tokenizer.json through PreTrainedTokenizerFast.
+                    LOGGER.warning(
+                        "Tokenizer %s@%s requires the Transformers 5 "
+                        "TokenizersBackend class; using the compatible fast "
+                        "tokenizer loader",
+                        tokenizer_id,
+                        revision,
+                    )
+                    fallback_options = dict(load_options)
+                    fallback_options.pop("use_fast", None)
+                    # Transformers 5 accepts a list here. Transformers 4 treats
+                    # this field as a mapping of named token attributes and calls
+                    # .keys(), so override only that incompatible metadata field.
+                    # The actual special-token IDs remain embedded in the official
+                    # tokenizer.json artifact.
+                    fallback_options["extra_special_tokens"] = {}
+                    tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                        tokenizer_id, **fallback_options
+                    )
                 resolved_revision = self._resolved_revision(tokenizer, revision)
                 target = self.resolved_directory / self._artifact_key(
                     tokenizer_id, resolved_revision, use_fast
@@ -276,9 +284,9 @@ class TokenizerCache:
                 raise TokenizerResolutionError(
                     f"Unable to resolve tokenizer {tokenizer_id!r} at revision "
                     f"{revision!r} from {mode}: {exc}. Check "
-                    f"{TOKENIZER_PROXY_ENV}, proxy HTTPS CONNECT/TLS support, or "
+                    f"{HUGGINGFACE_PROXY}, proxy HTTPS CONNECT/TLS support, or "
                     f"preload {self.cache_directory} and enable "
-                    f"{TOKENIZER_LOCAL_FILES_ONLY_ENV}."
+                    f"{TOKENIZER_OFFLINE}."
                 ) from exc
 
             resolved_key = (tokenizer_id, resolution.revision, use_fast)

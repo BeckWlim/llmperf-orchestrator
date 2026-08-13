@@ -10,7 +10,7 @@ from typing import Any, Dict, Sequence, Tuple
 from llmperf import common_metrics
 from llmperf.logging import configure_logging
 from llmperf_backend.models import DatabaseConfig
-from llmperf_backend.datasets import WORKER_DATASET_PATH_ENV
+from llmperf_backend.datasets import WORKER_DATASET_PATH
 from llmperf_backend.persistence import (
     Database,
     FAILED,
@@ -18,7 +18,7 @@ from llmperf_backend.persistence import (
     RUNNING,
     SUCCEEDED,
 )
-from llmperf_backend.scheduler import WORKER_DATABASE_URL_ENV
+from llmperf_backend.scheduler import WORKER_DATABASE_URL
 
 
 LOGGER = logging.getLogger(__name__)
@@ -32,17 +32,17 @@ def _calculate(
     from token_benchmark_ray import get_token_throughput_latencies
 
     runtime_environment = dict(os.environ)
-    runtime_environment.pop(WORKER_DATABASE_URL_ENV, None)
+    runtime_environment.pop(WORKER_DATABASE_URL, None)
     ray.init(runtime_env={"env_vars": runtime_environment})
     try:
         dataset = benchmark.get("dataset")
         dataset_path = None
         dataset_format = "sharegpt"
         if dataset is not None:
-            dataset_path = os.environ.get(WORKER_DATASET_PATH_ENV)
+            dataset_path = os.environ.get(WORKER_DATASET_PATH)
             if not dataset_path:
                 raise RuntimeError(
-                    f"{WORKER_DATASET_PATH_ENV} is required for dataset workloads"
+                    f"{WORKER_DATASET_PATH} is required for dataset workloads"
                 )
             dataset_format = dataset["format"]
         return get_token_throughput_latencies(
@@ -166,9 +166,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Execute one persisted LLMPerf Runner")
     parser.add_argument("--runner-id", required=True)
     arguments = parser.parse_args()
-    database_url = os.environ.get(WORKER_DATABASE_URL_ENV)
+    database_url = os.environ.get(WORKER_DATABASE_URL)
     if not database_url:
-        raise RuntimeError(f"{WORKER_DATABASE_URL_ENV} is not configured")
+        raise RuntimeError(f"{WORKER_DATABASE_URL} is not configured")
     try:
         asyncio.run(execute_runner(arguments.runner_id, database_url))
     except Exception:

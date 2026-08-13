@@ -16,7 +16,7 @@ from llmperf_backend.environment import load_environment
 from llmperf_backend.models import AppConfig, dump_model, validate_app_config
 
 
-CONFIG_PATH_ENV = "LLMPERF_BACKEND_CONFIG"
+CONFIG_PATH = "LLMPERF_BACKEND_CONFIG"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "default.yaml"
 _ENV_PATTERN = re.compile(
     r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::-(?P<default>[^}]*))?\}"
@@ -78,7 +78,7 @@ def resolve_config_path(path: Optional[Path] = None) -> Path:
     load_environment()
     if path is not None:
         return Path(path).expanduser().resolve()
-    configured_path = os.environ.get(CONFIG_PATH_ENV)
+    configured_path = os.environ.get(CONFIG_PATH)
     if configured_path:
         return Path(configured_path).expanduser().resolve()
     return DEFAULT_CONFIG_PATH
