@@ -11,6 +11,7 @@ from dotenv import dotenv_values
 
 CONFIG_DIRECTORY_NAME = "llmperf"
 BACKEND_ENV_FILENAME = "backend.env"
+CLI_ENV_FILENAME = "cli.env"
 _NAME_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _SENSITIVE_FRAGMENTS = ("KEY", "PASSWORD", "SECRET", "TOKEN")
 
@@ -29,6 +30,10 @@ def user_config_directory() -> Path:
 
 def backend_environment_path() -> Path:
     return user_config_directory() / BACKEND_ENV_FILENAME
+
+
+def cli_environment_path() -> Path:
+    return user_config_directory() / CLI_ENV_FILENAME
 
 
 def read_environment_file(path: Path) -> Dict[str, str]:

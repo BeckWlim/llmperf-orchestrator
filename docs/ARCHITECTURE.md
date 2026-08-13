@@ -223,11 +223,26 @@ GET /api/v1/campaigns/{campaign_id}/export?include_requests=true
 
 ## 9. CLI 架构与使用
 
-`llmperfctl` 不导入后端包。它通过 `urllib` 调用 REST API，并使用 PyYAML 解析本地编排文件。服务地址默认为 `http://127.0.0.1:8000`，可以设置：
+`llmperfctl` 不导入后端包。它通过 `urllib` 调用 REST API，并使用 PyYAML 解析本地编排文件。CLI 默认读取 `~/.config/llmperf/cli.env`（设置 `XDG_CONFIG_HOME` 时使用其下的 `llmperf/cli.env`）；已经导出的进程环境变量优先于文件值。默认文件不存在是正常状态，也可以用 `LLMPERF_CLI_ENV_FILE` 显式选择其他文件。Backend 请求命令遇到显式文件不存在时立即报错，本地 `config` 命令仍可用于检查或创建该文件。服务地址默认为 `http://127.0.0.1:8000`，可以在 `cli.env` 中设置：
 
 ```bash
-export LLMPERF_URL=http://127.0.0.1:8000
+LLMPERF_URL=http://127.0.0.1:8000
+LLMPERF_PRIVATE_KEY=/home/user/.ssh/id_rsa
 ```
+
+推荐通过本地配置命令原子写入该文件；这些命令不连接 Backend：
+
+```bash
+llmperfctl config set LLMPERF_URL http://127.0.0.1:12666
+llmperfctl config set LLMPERF_PRIVATE_KEY /home/user/.ssh/id_rsa
+printf '%s' "$LLMPERF_TOKEN" | llmperfctl config set LLMPERF_TOKEN --stdin
+llmperfctl config get LLMPERF_URL
+llmperfctl config list
+llmperfctl config path
+llmperfctl config unset LLMPERF_TOKEN
+```
+
+配置目录和文件会分别使用 `0700`、`0600` 权限。命令行参数优先级最高，因此 `--url`、`--private-key` 等显式参数会覆盖进程环境和 `cli.env`；进程环境又优先于文件值。
 
 未显式提供 `--token` 或 `--private-key` 时，CLI 默认扫描 `~/.ssh` 中权限安全、未加密且可解析的 RSA 私钥。候选顺序优先 `llmperfctl`、`id_rsa`，之后按文件名排列；只有服务返回 `401` 才尝试下一把，`403` 表示已认证但权限不足，不会继续尝试。可以通过 `--ssh-dir` 或 `LLMPERF_SSH_DIR` 改变目录，通过 `--no-key-discovery` 完全关闭发现。CLI 跳过公钥、known_hosts、SSH 配置、符号链接、权限对组/其他用户开放的文件以及非 RSA/加密私钥。
 

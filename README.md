@@ -120,6 +120,22 @@ Start the service:
 llmperf-backend
 ```
 
+`llmperfctl` loads its own optional user environment from
+`~/.config/llmperf/cli.env` (or `$XDG_CONFIG_HOME/llmperf/cli.env`). Configure a
+remote Backend without exporting values in every shell:
+
+```bash
+llmperfctl config set LLMPERF_URL http://127.0.0.1:12666
+llmperfctl config set LLMPERF_PRIVATE_KEY /home/user/.ssh/id_rsa
+llmperfctl config path
+llmperfctl config list
+```
+
+Exported process variables take precedence. Set `LLMPERF_CLI_ENV_FILE` to use a
+different file. `config set` creates the selected file with mode `0600`;
+Backend-facing commands reject an explicitly selected missing file, while the
+local `config` commands remain available to inspect or repair it.
+
 In another terminal, verify the control plane and Provider catalog:
 
 ```bash

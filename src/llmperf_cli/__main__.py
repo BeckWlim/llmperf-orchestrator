@@ -15,7 +15,15 @@ import yaml
 from tqdm import tqdm
 
 from llmperf.logging import LOG_COLOR_MODES, LOG_LEVELS, configure_logging
+from llmperf.user_config import (
+    UserConfigError,
+    display_environment_value,
+    read_environment_file,
+    set_environment_value,
+    unset_environment_value,
+)
 from llmperf_cli.client import ClientError, LLMPerfClient, write_json
+from llmperf_cli.environment import load_cli_environment, resolve_cli_environment_path
 
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
@@ -440,9 +448,7 @@ def summarize_runner(runner: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def campaign_status_view(
-    client: LLMPerfClient, campaign_id: str
-) -> Dict[str, Any]:
+def campaign_status_view(client: LLMPerfClient, campaign_id: str) -> Dict[str, Any]:
     """Load aggregate Campaign state and all lightweight Runner summaries."""
 
     campaign = client.get_campaign(campaign_id)
@@ -872,6 +878,67 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(
         dest="command", required=True, title="commands", metavar="COMMAND"
+    )
+
+    config = _command_parser(
+        commands,
+        "config",
+        help="Manage persistent llmperfctl environment settings",
+        description=(
+            "Manage the local CLI environment file without contacting the Backend."
+        ),
+        epilog="""\
+Examples:
+  llmperfctl config set LLMPERF_URL http://127.0.0.1:8000
+  llmperfctl config set LLMPERF_TOKEN --stdin
+  llmperfctl config list
+  llmperfctl config path
+""",
+    )
+    config_commands = config.add_subparsers(
+        dest="config_command",
+        required=True,
+        title="config commands",
+        metavar="COMMAND",
+    )
+    config_set = _command_parser(
+        config_commands,
+        "set",
+        help="Persist one CLI environment setting",
+        description="Write one setting to the selected CLI environment file.",
+    )
+    config_set.add_argument("name", metavar="NAME")
+    config_set.add_argument("value", metavar="VALUE", nargs="?")
+    config_set.add_argument(
+        "--stdin",
+        action="store_true",
+        help="read VALUE from standard input (recommended for tokens)",
+    )
+    config_get = _command_parser(
+        config_commands,
+        "get",
+        help="Show one persisted CLI setting",
+        description="Read one setting, redacting sensitive values.",
+    )
+    config_get.add_argument("name", metavar="NAME")
+    config_unset = _command_parser(
+        config_commands,
+        "unset",
+        help="Remove one persisted CLI setting",
+        description="Remove one setting from the selected CLI environment file.",
+    )
+    config_unset.add_argument("name", metavar="NAME")
+    _command_parser(
+        config_commands,
+        "list",
+        help="List persisted CLI settings",
+        description="List persisted settings with sensitive values redacted.",
+    )
+    _command_parser(
+        config_commands,
+        "path",
+        help="Show the CLI environment file path",
+        description="Print the selected CLI environment file and whether it exists.",
     )
 
     _command_parser(
@@ -1495,6 +1562,53 @@ Examples:
     return parser
 
 
+def execute_cli_config(arguments: argparse.Namespace) -> Dict[str, Any]:
+    """Manage the local CLI dotenv without constructing an HTTP client."""
+
+    path = resolve_cli_environment_path()
+    if arguments.config_command == "path":
+        return {"path": str(path), "exists": path.is_file()}
+    if arguments.config_command == "set":
+        use_stdin = bool(getattr(arguments, "stdin", False))
+        if use_stdin == (arguments.value is not None):
+            raise UserConfigError("Provide exactly one of VALUE or --stdin")
+        value = sys.stdin.read().rstrip("\r\n") if use_stdin else arguments.value
+        set_environment_value(path, arguments.name, value)
+        return {
+            "name": arguments.name,
+            "value": display_environment_value(arguments.name, value),
+            "path": str(path),
+            "effective_next_run": True,
+        }
+    if arguments.config_command == "unset":
+        removed = unset_environment_value(path, arguments.name)
+        return {
+            "name": arguments.name,
+            "removed": removed,
+            "path": str(path),
+            "effective_next_run": removed,
+        }
+    values = read_environment_file(path)
+    if arguments.config_command == "get":
+        value = values.get(arguments.name)
+        if value is None:
+            raise UserConfigError(
+                f"CLI configuration setting is not defined: {arguments.name}"
+            )
+        return {
+            "name": arguments.name,
+            "value": display_environment_value(arguments.name, value),
+            "path": str(path),
+        }
+    return {
+        "path": str(path),
+        "items": {
+            name: display_environment_value(name, value)
+            for name, value in sorted(values.items())
+        },
+    }
+
+
 def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
     if arguments.command == "health":
         return client.health()
@@ -1685,9 +1799,23 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
 
 
 def main() -> None:
+    environment_error = None
+    try:
+        environment_path = load_cli_environment()
+    except RuntimeError as exc:
+        environment_path = None
+        environment_error = exc
     parser = build_parser()
     arguments = parser.parse_args()
     configure_logging(arguments.log_level, color=arguments.color)
+    if environment_error is not None and arguments.command != "config":
+        parser.exit(1, f"error: {environment_error}\n")
+    if arguments.command == "config":
+        try:
+            print_json(execute_cli_config(arguments))
+        except UserConfigError as exc:
+            parser.exit(1, f"error: {exc}\n")
+        return
     try:
         if arguments.token and arguments.private_key:
             raise ClientError("Use either --token or --private-key, not both")
@@ -1729,10 +1857,11 @@ def main() -> None:
             f"{arguments.command} {subcommand}" if subcommand else arguments.command
         )
         LOGGER.info(
-            "llmperfctl process started: pid=%d backend=%s command=%s",
+            "llmperfctl process started: pid=%d backend=%s command=%s cli_env=%s",
             os.getpid(),
             arguments.url,
             command_label,
+            str(environment_path) if environment_path is not None else "none",
         )
         result = execute(client, arguments)
         if (

@@ -17,7 +17,9 @@ llmperf-backend
 
 配置加载优先级：进程环境变量、`LLMPERF_ENV_FILE`、用户持久化配置、当前目录
 `.env`。Provider Profile、密钥或数据库配置改变后重启 Backend。CLI 默认连接
-`http://127.0.0.1:8000`，可设置 `LLMPERF_URL` 或传 `--url`。
+`http://127.0.0.1:8000`，并独立读取 `~/.config/llmperf/cli.env`。使用
+`llmperfctl config set/get/unset/list/path` 管理该文件；`LLMPERF_CLI_ENV_FILE` 可指定
+其他路径。CLI 显式参数优先于进程环境，进程环境优先于 `cli.env`。
 
 先检查控制面：
 

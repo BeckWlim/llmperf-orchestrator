@@ -268,7 +268,8 @@ def test_forbidden_key(monkeypatch):
     assert len(attempts) == 1
 
 
-def test_auth_defaults():
+def test_auth_defaults(monkeypatch):
+    monkeypatch.delenv("LLMPERF_SSH_DIR", raising=False)
     arguments = build_parser().parse_args(["auth", "list"])
 
     assert arguments.ssh_dir == "~/.ssh"
@@ -549,9 +550,7 @@ def test_campaign_status_view(capsys):
                 },
             }
 
-        def list_runners(
-            self, status, limit, offset, full=False, campaign_id=None
-        ):
+        def list_runners(self, status, limit, offset, full=False, campaign_id=None):
             assert status is None
             assert limit == 200
             assert offset == 0
@@ -594,9 +593,7 @@ def test_campaign_status_view(capsys):
                 "campaign_id": campaign_id,
             }
 
-    arguments = build_parser().parse_args(
-        ["campaign", "status", "campaign-1"]
-    )
+    arguments = build_parser().parse_args(["campaign", "status", "campaign-1"])
     document = execute(CampaignClient(), arguments)
     print_campaign_status(document)
 
@@ -771,12 +768,14 @@ def test_wait_summary(caplog):
     assert "requests[started=1 completed=0 failed=1]" in caplog.text
     assert "Runner runner-1: No benchmark requests completed" in caplog.text
     assert _has_unsuccessful_runner(reports) is True
-    assert _has_unsuccessful_runner(
-        {"status": "completed", "outcome": "partial_failed"}
-    ) is True
-    assert _has_unsuccessful_runner(
-        {"status": "completed", "outcome": "succeeded"}
-    ) is False
+    assert (
+        _has_unsuccessful_runner({"status": "completed", "outcome": "partial_failed"})
+        is True
+    )
+    assert (
+        _has_unsuccessful_runner({"status": "completed", "outcome": "succeeded"})
+        is False
+    )
 
 
 def test_campaign_wait_logs(caplog):
