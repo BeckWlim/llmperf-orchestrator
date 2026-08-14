@@ -1,3 +1,5 @@
+"""Standalone model correctness benchmark packaged with LLMPerf."""
+
 import argparse
 import json
 import os

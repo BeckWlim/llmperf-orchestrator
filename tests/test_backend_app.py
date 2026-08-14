@@ -226,6 +226,17 @@ def test_runner_lifecycle(client_factory):
         assert full_list.json()["items"][0]["benchmark"]["model"] == "test-model"
         assert "stdout" in full_list.json()["items"][0]
 
+        logs = client.get(f"/api/v1/runners/{runner_id}/logs")
+        assert logs.status_code == 200
+        assert logs.json() == {
+            "runner_id": runner_id,
+            "status": "queued",
+            "scheduler_id": None,
+            "worker": None,
+            "stdout": None,
+            "stderr": None,
+        }
+
         cancelled = client.post(f"/api/v1/runners/{runner_id}/cancel")
         assert cancelled.status_code == 200
         assert cancelled.json()["status"] == "cancelled"
@@ -247,7 +258,7 @@ def test_runner_lifecycle(client_factory):
 
         exported = client.get(f"/api/v1/campaigns/{campaign_id}/export")
         assert exported.status_code == 200
-        assert exported.json()["version"] == 3
+        assert exported.json()["version"] == 5
         assert exported.json()["aggregate"]["status"] == "cancelled"
         assert exported.json()["aggregate"]["outcome"] == "cancelled"
         assert exported.json()["aggregate"]["runner_count"] == 1

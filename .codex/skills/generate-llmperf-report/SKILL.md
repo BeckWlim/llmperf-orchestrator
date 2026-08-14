@@ -1,6 +1,6 @@
 ---
 name: generate-llmperf-report
-description: "Generate professional, self-contained HTML analysis reports with charts from LLMPerf experiment records. Use when Codex needs to export a Campaign or Runner with llmperfctl, turn Campaign export v3 or Runner export v1 JSON into an offline HTML report, compare multi-round latency/throughput/KV-cache behavior, summarize request reliability and failures, or prepare an auditable benchmark report for review or sharing."
+description: "Generate professional, self-contained HTML analysis reports with charts from LLMPerf experiment records. Use when Codex needs to export a Campaign or Runner with llmperfctl, turn Campaign export v5 or Runner export v1 JSON into an offline HTML report, compare multi-round latency/throughput/KV-cache behavior, summarize request reliability and failures, or prepare an auditable benchmark report for review or sharing."
 ---
 
 # Generate LLMPerf Report

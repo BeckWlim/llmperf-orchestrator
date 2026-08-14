@@ -10,7 +10,7 @@
 
 ## 1. Supported exports
 
-### Campaign export version 3
+### Campaign export version 5
 
 Create with:
 
@@ -18,7 +18,12 @@ Create with:
 llmperfctl campaign export CAMPAIGN_ID -o campaign.json
 ```
 
-The root contains `campaign`, `aggregate`, `runner_plans`, and `runners`.
+The root contains `campaign`, `aggregate`, `runner_plans`, `runners`,
+`protocol_definitions`, `protocol_instances`, `dispatches`, and
+`protocol_analyses`. Cache-retention curves are protocol analyses rather than
+specialized Campaign fields. `cache-residency/v1` curves are access-conditioned;
+render their geographic scheduled time, planned offset, and actual Prime-to-Warm
+delay separately, and never label them as passive TTL.
 `aggregate.status` is lifecycle state; `aggregate.outcome` is aggregate execution
 result. Each Runner stores benchmark configuration under `benchmark`, aggregate
 benchmark output under `summary`, and optional request records under `requests`.

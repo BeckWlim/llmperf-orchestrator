@@ -65,6 +65,96 @@ CREATE INDEX IF NOT EXISTS ix_runner_plan_due
 CREATE INDEX IF NOT EXISTS ix_runner_plan_campaign
     ON benchmark_runner_plans (campaign_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS benchmark_protocol_definitions (
+    id                  VARCHAR(36) PRIMARY KEY,
+    campaign_id         VARCHAR(36) NOT NULL
+                        REFERENCES benchmark_campaigns(id) ON DELETE CASCADE,
+    name                VARCHAR(200) NOT NULL,
+    protocol            VARCHAR(40) NOT NULL,
+    config              JSONB NOT NULL,
+    runner_template     JSONB NOT NULL,
+    created_by          VARCHAR(64) NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS ix_protocol_definition_campaign
+    ON benchmark_protocol_definitions (campaign_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS benchmark_protocol_instances (
+    id                      VARCHAR(36) PRIMARY KEY,
+    definition_id           VARCHAR(36) NOT NULL
+                            REFERENCES benchmark_protocol_definitions(id)
+                            ON DELETE CASCADE,
+    campaign_id             VARCHAR(36) NOT NULL
+                            REFERENCES benchmark_campaigns(id) ON DELETE CASCADE,
+    protocol                VARCHAR(40) NOT NULL,
+    instance_key            VARCHAR(120) NOT NULL,
+    state                   VARCHAR(20) NOT NULL DEFAULT 'planned',
+    spec                    JSONB NOT NULL,
+    checkpoint              JSONB NOT NULL DEFAULT '{}'::jsonb,
+    outcome                 JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error                   TEXT,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_protocol_instance_key UNIQUE (definition_id, instance_key),
+    CONSTRAINT ck_protocol_instance_state CHECK (
+        state IN ('planned', 'active', 'completed', 'failed', 'cancelled')
+    )
+);
+
+CREATE INDEX IF NOT EXISTS ix_protocol_instance_campaign
+    ON benchmark_protocol_instances (campaign_id, protocol, state);
+
+CREATE TABLE IF NOT EXISTS benchmark_runner_dispatches (
+    id                      VARCHAR(36) PRIMARY KEY,
+    campaign_id             VARCHAR(36) NOT NULL
+                            REFERENCES benchmark_campaigns(id) ON DELETE CASCADE,
+    runner_plan_id          VARCHAR(36)
+                            REFERENCES benchmark_runner_plans(id)
+                            ON DELETE CASCADE,
+    dispatch_key            VARCHAR(80),
+    protocol_instance_id    VARCHAR(36)
+                            REFERENCES benchmark_protocol_instances(id)
+                            ON DELETE CASCADE,
+    role                    VARCHAR(40),
+    due_at                  TIMESTAMPTZ,
+    state                   VARCHAR(20) NOT NULL DEFAULT 'pending',
+    parent_dispatch_id      VARCHAR(36),
+    runner_template         JSONB NOT NULL,
+    lineage                 JSONB NOT NULL DEFAULT '{}'::jsonb,
+    runner_id               VARCHAR(36),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    emitted_at              TIMESTAMPTZ,
+    CONSTRAINT uq_runner_dispatch_plan_key UNIQUE (runner_plan_id, dispatch_key),
+    CONSTRAINT uq_runner_dispatch_protocol_role
+        UNIQUE (protocol_instance_id, role),
+    CONSTRAINT uq_runner_dispatch_runner UNIQUE (runner_id),
+    CONSTRAINT fk_runner_dispatch_parent FOREIGN KEY (parent_dispatch_id)
+        REFERENCES benchmark_runner_dispatches(id) ON DELETE SET NULL,
+    CONSTRAINT ck_runner_dispatch_state CHECK (
+        state IN ('blocked', 'pending', 'emitted', 'cancelled')
+    ),
+    CONSTRAINT ck_runner_dispatch_not_self_parent CHECK (
+        parent_dispatch_id IS NULL OR parent_dispatch_id <> id
+    ),
+    CONSTRAINT ck_runner_dispatch_owner CHECK (
+        (runner_plan_id IS NOT NULL AND protocol_instance_id IS NULL AND
+         dispatch_key IS NOT NULL AND role IS NULL) OR
+        (runner_plan_id IS NULL AND protocol_instance_id IS NOT NULL AND
+         dispatch_key IS NULL AND role IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS ix_runner_dispatch_due
+    ON benchmark_runner_dispatches (due_at)
+    WHERE state = 'pending';
+CREATE INDEX IF NOT EXISTS ix_runner_dispatch_campaign
+    ON benchmark_runner_dispatches (campaign_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_runner_dispatch_parent
+    ON benchmark_runner_dispatches (parent_dispatch_id);
+CREATE INDEX IF NOT EXISTS ix_runner_dispatch_protocol
+    ON benchmark_runner_dispatches (protocol_instance_id, role);
+
 CREATE TABLE IF NOT EXISTS benchmark_runners (
     id                  VARCHAR(36) PRIMARY KEY,
     campaign_id         VARCHAR(36)

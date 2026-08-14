@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy LLMPerf"
+  short_description: "Guide safe LLMPerf installation and deployment"
+  default_prompt: "Use $deploy-llmperf to inspect this host and guide a verified LLMPerf deployment."

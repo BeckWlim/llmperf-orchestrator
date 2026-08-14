@@ -18,7 +18,10 @@ from llmperf_cli.__main__ import (
     execute,
     print_campaign_status,
     print_campaign_table,
+    print_runner_logs,
+    print_runner_summary,
     print_runner_table,
+    render_result,
     start_campaign,
     summarize_runner,
     wait_for_campaign,
@@ -49,7 +52,9 @@ class FakeClient:
             payloads.append(self.start_runner(payload))
         return {"items": payloads}
 
-    def start_campaign(self, campaign, runners, runner_plans):
+    def start_campaign(
+        self, campaign, runners, runner_plans, protocol_definitions=None
+    ):
         assert campaign["name"] == "glm-study"
         payloads = []
         for runner in runners:
@@ -70,6 +75,7 @@ class FakeClient:
             "campaign": {"campaign_id": "campaign-1"},
             "items": payloads,
             "runner_plans": plans,
+            "protocol_definitions": protocol_definitions or [],
         }
 
 
@@ -138,6 +144,77 @@ runner_plans:
     assert result["runners"] == []
     assert result["runner_plans"][0]["runner_plan_id"] == "plan-1"
     assert client.plan_payloads[0]["recurrence"]["every_seconds"] == 30
+
+
+def test_sweep_campaign(tmp_path):
+    plan = tmp_path / "sweep.yaml"
+    plan.write_text(
+        """
+campaign:
+  name: glm-study
+protocol_definitions:
+  - name: retention
+    protocol: cache-retention/v1
+    delay_seconds: [0, 60, 300]
+    trials_per_delay: 2
+    runner:
+      benchmark:
+        model: glm-test
+""",
+        encoding="utf-8",
+    )
+    arguments = Namespace(
+        file=str(plan),
+        wait=False,
+        poll_interval=0.01,
+        timeout=None,
+        output=None,
+        include_requests=False,
+    )
+    client = FakeClient()
+
+    result = start_campaign(client, arguments)
+
+    assert result["protocol_definitions"][0]["delay_seconds"] == [0, 60, 300]
+
+
+def test_residency_campaign(tmp_path):
+    plan = tmp_path / "residency.yaml"
+    plan.write_text(
+        """
+campaign:
+  name: glm-study
+protocol_definitions:
+  - name: daily-residency
+    protocol: cache-residency/v1
+    schedule:
+      kind: geographic
+      timezone: Asia/Shanghai
+      starts_at: 2026-08-15T00:00:00+08:00
+      every_seconds: 3600
+      duration_days: 1
+    mapping: one_to_one
+    runner:
+      benchmark:
+        model: glm-test
+""",
+        encoding="utf-8",
+    )
+    arguments = Namespace(
+        file=str(plan),
+        wait=False,
+        poll_interval=0.01,
+        timeout=None,
+        output=None,
+        include_requests=False,
+    )
+    client = FakeClient()
+
+    result = start_campaign(client, arguments)
+
+    definition = result["protocol_definitions"][0]
+    assert definition["protocol"] == "cache-residency/v1"
+    assert definition["schedule"]["timezone"] == "Asia/Shanghai"
 
 
 def test_campaign_export_status():
@@ -291,7 +368,7 @@ def test_main_help():
     [
         (["provider", "--help"], "LLMPERF_DEFAULT_PROVIDER"),
         (["runner", "--help"], "A Runner is one durable benchmark execution"),
-        (["campaign", "--help"], "See examples/glm-campaign.yaml"),
+        (["campaign", "--help"], "See examples/example-campaign.yaml"),
         (["runner", "start", "--help"], "Validate Runner YAML"),
     ],
 )
@@ -649,6 +726,59 @@ def test_full_list_request(monkeypatch):
     assert requested_urls == [
         "http://127.0.0.1:8000/api/v1/runners?status=failed&limit=5&offset=10&full=true"
     ]
+
+
+def test_log_request(monkeypatch):
+    requested_urls = []
+
+    def fake_urlopen(request, timeout):
+        requested_urls.append(request.full_url)
+        return _FakeResponse(
+            {
+                "runner_id": "runner-1",
+                "status": "failed",
+                "scheduler_id": "scheduler-1",
+                "worker": {"process_id": 42, "exit_code": 1},
+                "stdout": "progress\n",
+                "stderr": "failure\n",
+            }
+        )
+
+    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    document = LLMPerfClient("http://127.0.0.1:8000").get_runner_logs("runner-1")
+
+    assert requested_urls == [
+        "http://127.0.0.1:8000/api/v1/runners/runner-1/logs"
+    ]
+    assert document["stderr"] == "failure\n"
+
+
+def test_action_output(capsys):
+    arguments = build_parser().parse_args(
+        ["campaign", "start", "-f", "examples/example-campaign.yaml", "--wait"]
+    )
+
+    render_result(arguments, {"campaign_id": "campaign-1", "large": [1, 2, 3]})
+
+    assert capsys.readouterr().out == ""
+
+
+def test_log_output(capsys):
+    document = {
+        "runner_id": "runner-1",
+        "status": "failed",
+        "scheduler_id": "scheduler-1",
+        "worker": {"process_id": 42, "exit_code": 1},
+        "stdout": "progress",
+        "stderr": "failure\n",
+    }
+
+    print_runner_logs(document)
+
+    output = capsys.readouterr().out
+    assert "Runner: runner-1  Status: failed" in output
+    assert "[stdout]\nprogress\n" in output
+    assert "[stderr]\nfailure\n" in output
 
 
 def test_datetime_payload(monkeypatch):

@@ -34,11 +34,19 @@ llmperfctl provider models aliyun
 `provider models ... --refresh` 会主动访问供应商目录，需要 operator 权限。目录可见
 不保证推理调用成功；401 通常表示供应商 token 失效或不正确。
 
+Ubuntu 部署模板和指引统一放在仓库 `deploy/systemd/`，该目录不是 systemd 的运行加载
+目录。准备好 `.venv`、PostgreSQL schema 和运行用户的 Backend 配置后，把
+`llmperf-backend.service.template` 中的项目路径、用户和组占位符渲染到
+`/etc/systemd/system/llmperf-backend.service`，再由系统级 `sudo systemctl` 启动。
+unit 属于系统级服务，但 Backend 进程必须以模板指定的普通用户运行。服务直接执行
+现有 `.venv/bin/llmperf-backend`，不重复声明 Backend 已能自行解析的环境变量，并通过
+systemd cgroup 管理 Worker。Provider 密钥仍只保存在该用户自有的 `0600` 配置中。
+
 ## 2. Runner 操作
 
 ```bash
-llmperfctl runner start -f examples/test-smoke.yaml
-llmperfctl runner start -f examples/test-smoke.yaml -w
+llmperfctl runner start -f examples/example-smoke.yaml
+llmperfctl runner start -f examples/example-smoke.yaml -w
 llmperfctl runner status RUNNER_ID --summary
 llmperfctl runner status RUNNER_ID --wait --summary
 llmperfctl runner list --status failed --limit 10
@@ -48,13 +56,15 @@ llmperfctl runner cancel RUNNER_ID
 ```
 
 `runner start` 默认只入队并立即返回。`-w`/`--wait` 仅让 CLI 等待，不改变 Runner
-持久化生命周期。CLI 中断后 Runner 继续执行，可用 ID 重连。Worker 退出码 0 不代表
-基准成功；零完成请求、请求异常和首个 provider error 必须以 Runner 结果为准。
+持久化生命周期。启动、等待、取消和导出命令默认不向 stdout 输出响应 JSON，只把状态
+变化写入 stderr；需要结果时使用 `status/list/logs` 或显式导出。CLI 中断后 Runner
+继续执行，可用 ID 重连。Worker 退出码 0 不代表基准成功；零完成请求、请求异常和首个
+provider error 必须以 Runner 结果为准。
 
 排障顺序：
 
 1. `runner status ... --summary` 查看请求 started/completed/failed 和首错。
-2. `runner logs` 查看完整 stdout/stderr、Ray Actor 异常和缺失环境变量。
+2. `runner logs` 通过专用日志接口查看完整 stdout/stderr、Ray Actor 异常和缺失环境变量。
 3. 验证 Provider Profile 是否把 endpoint/key 注入所选 Worker。
 4. 对 401 检查供应商凭据；对 404/模型错误检查精确模型 ID；对 tokenizer 错误检查
    immutable revision 解析。
@@ -62,9 +72,9 @@ llmperfctl runner cancel RUNNER_ID
 ## 3. Campaign 与 RunnerPlan 操作
 
 ```bash
-llmperfctl campaign start -f examples/runner-plan.yaml
-llmperfctl campaign start -f examples/runner-plan.yaml -w
-llmperfctl campaign start -f examples/runner-plan.yaml -w \
+llmperfctl campaign start -f examples/example-runner-plan.yaml
+llmperfctl campaign start -f examples/example-runner-plan.yaml -w
+llmperfctl campaign start -f examples/example-runner-plan.yaml -w \
   -o campaign-report.json
 llmperfctl campaign status CAMPAIGN_ID
 llmperfctl campaign status CAMPAIGN_ID --json
@@ -77,8 +87,8 @@ llmperfctl campaign cancel CAMPAIGN_ID
 Planner 控制命令：
 
 ```bash
-llmperfctl planner preview -f examples/runner-plan.yaml
-llmperfctl planner create CAMPAIGN_ID -f examples/runner-plan.yaml
+llmperfctl planner preview -f examples/example-runner-plan.yaml
+llmperfctl planner create CAMPAIGN_ID -f examples/example-runner-plan.yaml
 llmperfctl planner list --status active
 llmperfctl planner status RUNNER_PLAN_ID
 llmperfctl planner events RUNNER_PLAN_ID
@@ -114,7 +124,11 @@ Campaign 有两个正交聚合维度：
 
 不要把它标成生命周期 `failed`。`-w` 在 Campaign 生命周期终态结束；
 `partial_failed`、`failed` 或 `cancelled` 仍令 CLI 返回退出码 2。Campaign export
-version 3 在 `aggregate` 中使用同一口径。
+version 5 在 `aggregate` 中使用同一口径，并附带 `protocol_definitions`、
+`protocol_instances`、`dispatches` 与 `protocol_analyses`。协议实例处于父调用完成、
+子调用尚未到期的等待期时，Campaign 状态保持 `planned`。
+`cache-residency/v1` 的分析会同时保留地理时间表、计划 offset、实际 Prime-to-Warm
+delay，并标记为 `access_conditioned_residency`；不要把它解释为被动 TTL。
 
 ## 5. 等待与日志
 
@@ -139,5 +153,6 @@ Backend 内 Planner 和 Scheduler 默认各自每 1 秒轮询 PostgreSQL，与 C
 ## 6. 导出与结果定位
 
 核心结果首先写入 PostgreSQL；JSON 是导出视图，不是唯一存储。Runner 导出包含
-summary、Worker 信息和捕获日志；Campaign 导出包含 aggregate、RunnerPlans 和
-Runners。需要请求级记录时显式使用 `--include-requests`，避免默认传输大对象。
+summary、Worker 信息和捕获日志；Campaign 导出包含 aggregate、RunnerPlans、
+Protocol Definitions、Protocol Instances、Dispatches、Protocol Analyses 和 Runners。需要请求级记录时显式使用
+`--include-requests`，避免默认传输大对象。

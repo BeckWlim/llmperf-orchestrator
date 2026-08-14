@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict
 
 import ray
@@ -145,6 +146,8 @@ class OpenAIChatCompletionsClient(LLMClient):
         metrics[common_metrics.ERROR_MSG] = ""
 
         start_time = time.monotonic()
+        start_utc = datetime.now(timezone.utc).isoformat()
+        completed_utc = None
         address = os.environ.get("OPENAI_API_BASE")
         if not address:
             raise ValueError("the environment variable OPENAI_API_BASE must be set.")
@@ -214,6 +217,7 @@ class OpenAIChatCompletionsClient(LLMClient):
             print(error_response_code)
         finally:
             completion_time = time.monotonic()
+            completed_utc = datetime.now(timezone.utc).isoformat()
             total_request_time = completion_time - start_time
             output_throughput = (
                 tokens_received / total_request_time if total_request_time > 0 else 0
@@ -247,6 +251,8 @@ class OpenAIChatCompletionsClient(LLMClient):
             "first_sse_monotonic": first_sse_time,
             "first_text_monotonic": first_text_time,
             "completed_monotonic": completion_time,
+            "client_start_utc": start_utc,
+            "completed_utc": completed_utc,
         }
         metrics[common_metrics.STREAM_TIMING_SEMANTICS] = {
             "legacy_inter_token_latency": "deprecated_inter_chunk_average",

@@ -34,6 +34,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from llmperf_backend.models import DatabaseConfig
 from llmperf_backend.planner import as_utc, next_fire_details
+from llmperf_backend.protocols import get_protocol_plugin
+from llmperf_backend.protocols.base import ProtocolCompileContext
 
 
 QUEUED = "queued"
@@ -47,6 +49,7 @@ PLAN_PAUSED = "paused"
 PLAN_COMPLETED = "completed"
 PLAN_CANCELLED = "cancelled"
 PLAN_STATUSES = {PLAN_ACTIVE, PLAN_PAUSED, PLAN_COMPLETED, PLAN_CANCELLED}
+PROTOCOL_INSTANCE_PENDING_STATES = {"planned", "active"}
 JSON_DOCUMENT = JSONB
 
 
@@ -150,6 +153,142 @@ class BenchmarkRunnerPlanRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
+
+
+class BenchmarkProtocolDefinitionRecord(Base):
+    __tablename__ = "benchmark_protocol_definitions"
+    __table_args__ = (
+        Index("ix_protocol_definition_campaign", "campaign_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("benchmark_campaigns.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    protocol: Mapped[str] = mapped_column(String(40), nullable=False)
+    config: Mapped[Dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
+    runner_template: Mapped[Dict[str, Any]] = mapped_column(
+        JSON_DOCUMENT, nullable=False
+    )
+    created_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class BenchmarkProtocolInstanceRecord(Base):
+    __tablename__ = "benchmark_protocol_instances"
+    __table_args__ = (
+        UniqueConstraint(
+            "definition_id", "instance_key", name="uq_protocol_instance_key"
+        ),
+        CheckConstraint(
+            "state IN ('planned', 'active', 'completed', 'failed', 'cancelled')",
+            name="ck_protocol_instance_state",
+        ),
+        Index("ix_protocol_instance_campaign", "campaign_id", "protocol", "state"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    definition_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("benchmark_protocol_definitions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    campaign_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("benchmark_campaigns.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    protocol: Mapped[str] = mapped_column(String(40), nullable=False)
+    instance_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    state: Mapped[str] = mapped_column(String(20), default="planned", nullable=False)
+    spec: Mapped[Dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
+    checkpoint: Mapped[Dict[str, Any]] = mapped_column(
+        JSON_DOCUMENT, default=dict, nullable=False
+    )
+    outcome: Mapped[Dict[str, Any]] = mapped_column(
+        JSON_DOCUMENT, default=dict, nullable=False
+    )
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class BenchmarkRunnerDispatchRecord(Base):
+    __tablename__ = "benchmark_runner_dispatches"
+    __table_args__ = (
+        UniqueConstraint(
+            "runner_plan_id", "dispatch_key", name="uq_runner_dispatch_plan_key"
+        ),
+        UniqueConstraint(
+            "protocol_instance_id", "role", name="uq_runner_dispatch_protocol_role"
+        ),
+        UniqueConstraint("runner_id", name="uq_runner_dispatch_runner"),
+        CheckConstraint(
+            "state IN ('blocked', 'pending', 'emitted', 'cancelled')",
+            name="ck_runner_dispatch_state",
+        ),
+        CheckConstraint(
+            "parent_dispatch_id IS NULL OR parent_dispatch_id <> id",
+            name="ck_runner_dispatch_not_self_parent",
+        ),
+        CheckConstraint(
+            "(runner_plan_id IS NOT NULL AND protocol_instance_id IS NULL AND "
+            "dispatch_key IS NOT NULL AND role IS NULL) OR "
+            "(runner_plan_id IS NULL AND protocol_instance_id IS NOT NULL AND "
+            "dispatch_key IS NULL AND role IS NOT NULL)",
+            name="ck_runner_dispatch_owner",
+        ),
+        Index(
+            "ix_runner_dispatch_due",
+            "due_at",
+            postgresql_where=text("state = 'pending'"),
+        ),
+        Index("ix_runner_dispatch_campaign", "campaign_id", "created_at"),
+        Index("ix_runner_dispatch_parent", "parent_dispatch_id"),
+        Index("ix_runner_dispatch_protocol", "protocol_instance_id", "role"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("benchmark_campaigns.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    runner_plan_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("benchmark_runner_plans.id", ondelete="CASCADE")
+    )
+    dispatch_key: Mapped[Optional[str]] = mapped_column(String(80))
+    protocol_instance_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("benchmark_protocol_instances.id", ondelete="CASCADE"),
+    )
+    role: Mapped[Optional[str]] = mapped_column(String(40))
+    due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    state: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    parent_dispatch_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("benchmark_runner_dispatches.id", ondelete="SET NULL"),
+    )
+    runner_template: Mapped[Dict[str, Any]] = mapped_column(
+        JSON_DOCUMENT, nullable=False
+    )
+    lineage: Mapped[Dict[str, Any]] = mapped_column(
+        JSON_DOCUMENT, default=dict, nullable=False
+    )
+    runner_id: Mapped[Optional[str]] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    emitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
 
 class BenchmarkRunnerRecord(Base):
@@ -468,6 +607,58 @@ def _runner_plan_dict(plan: BenchmarkRunnerPlanRecord) -> Dict[str, Any]:
     }
 
 
+def _protocol_definition_dict(
+    definition: BenchmarkProtocolDefinitionRecord,
+) -> Dict[str, Any]:
+    return {
+        "protocol_definition_id": definition.id,
+        "campaign_id": definition.campaign_id,
+        "name": definition.name,
+        "protocol": definition.protocol,
+        "config": definition.config,
+        "runner": definition.runner_template,
+        "created_by": definition.created_by,
+        "created_at": definition.created_at,
+    }
+
+
+def _protocol_instance_dict(
+    instance: BenchmarkProtocolInstanceRecord,
+) -> Dict[str, Any]:
+    return {
+        "protocol_instance_id": instance.id,
+        "protocol_definition_id": instance.definition_id,
+        "campaign_id": instance.campaign_id,
+        "protocol": instance.protocol,
+        "instance_key": instance.instance_key,
+        "state": instance.state,
+        "spec": instance.spec,
+        "checkpoint": instance.checkpoint,
+        "outcome": instance.outcome,
+        "error": instance.error,
+        "created_at": instance.created_at,
+        "updated_at": instance.updated_at,
+    }
+
+
+def _dispatch_dict(dispatch: BenchmarkRunnerDispatchRecord) -> Dict[str, Any]:
+    return {
+        "dispatch_id": dispatch.id,
+        "campaign_id": dispatch.campaign_id,
+        "runner_plan_id": dispatch.runner_plan_id,
+        "dispatch_key": dispatch.dispatch_key,
+        "protocol_instance_id": dispatch.protocol_instance_id,
+        "role": dispatch.role,
+        "due_at": dispatch.due_at,
+        "state": dispatch.state,
+        "parent_dispatch_id": dispatch.parent_dispatch_id,
+        "lineage": dispatch.lineage,
+        "runner_id": dispatch.runner_id,
+        "created_at": dispatch.created_at,
+        "emitted_at": dispatch.emitted_at,
+    }
+
+
 class RunnerRepository:
     """Transactional Runner state and result operations."""
 
@@ -566,6 +757,33 @@ class RunnerRepository:
             adjustments,
         )
 
+    @staticmethod
+    def _new_dispatch(
+        campaign_id: str,
+        due_at: Optional[datetime],
+        runner_template: Dict[str, Any],
+        lineage: Optional[Dict[str, Any]] = None,
+        state: str = "pending",
+        parent_dispatch_id: Optional[str] = None,
+        runner_plan_id: Optional[str] = None,
+        dispatch_key: Optional[str] = None,
+        protocol_instance_id: Optional[str] = None,
+        role: Optional[str] = None,
+    ) -> BenchmarkRunnerDispatchRecord:
+        return BenchmarkRunnerDispatchRecord(
+            id=str(uuid4()),
+            campaign_id=campaign_id,
+            runner_plan_id=runner_plan_id,
+            dispatch_key=dispatch_key,
+            due_at=as_utc(due_at) if due_at is not None else None,
+            state=state,
+            parent_dispatch_id=parent_dispatch_id,
+            protocol_instance_id=protocol_instance_id,
+            role=role,
+            runner_template=json_safe(runner_template),
+            lineage=json_safe(lineage or {}),
+        )
+
     async def create_runner(
         self,
         benchmark: Dict[str, Any],
@@ -651,6 +869,7 @@ class RunnerRepository:
         tags: Dict[str, Any],
         runners: Sequence[Dict[str, Any]],
         runner_plans: Sequence[Dict[str, Any]],
+        protocol_definitions: Sequence[Dict[str, Any]],
         created_by: str,
     ) -> Dict[str, Any]:
         """Create a Campaign and its validated workload in one transaction."""
@@ -676,11 +895,16 @@ class RunnerRepository:
         ]
         plans_with_adjustments = []
         plans = []
+        definition_records: List[BenchmarkProtocolDefinitionRecord] = []
+        instance_records: List[BenchmarkProtocolInstanceRecord] = []
+        dispatch_records: List[BenchmarkRunnerDispatchRecord] = []
         async with self.database.sessions() as session, session.begin():
-            if runner_plans:
+            database_now = utcnow()
+            if runner_plans or protocol_definitions:
                 database_now = as_utc(
                     (await session.execute(select(func.now()))).scalar_one()
                 )
+            if runner_plans:
                 plans_with_adjustments = [
                     self._new_runner_plan(
                         campaign.id,
@@ -694,8 +918,70 @@ class RunnerRepository:
                 plans = [item[0] for item in plans_with_adjustments]
             session.add(campaign)
             await session.flush()
+            for submitted in protocol_definitions:
+                definition_payload = dict(submitted["definition"])
+                definition_payload.pop("runner", None)
+                definition = BenchmarkProtocolDefinitionRecord(
+                    id=str(uuid4()),
+                    campaign_id=campaign.id,
+                    name=definition_payload["name"],
+                    protocol=definition_payload["protocol"],
+                    config=json_safe(definition_payload),
+                    runner_template=json_safe(submitted["runner_template"]),
+                    created_by=created_by,
+                )
+                session.add(definition)
+                await session.flush()
+                plugin = get_protocol_plugin(definition.protocol)
+                blueprints = plugin.compile(
+                    ProtocolCompileContext(
+                        campaign_id=campaign.id,
+                        definition_id=definition.id,
+                        definition_name=definition.name,
+                        protocol=definition.protocol,
+                        config=definition_payload,
+                        runner_template=submitted["runner_template"],
+                        database_now=database_now,
+                        created_by=created_by,
+                    )
+                )
+                for blueprint in blueprints:
+                    instance_records.append(
+                        BenchmarkProtocolInstanceRecord(
+                            id=blueprint.instance_id,
+                            definition_id=definition.id,
+                            campaign_id=campaign.id,
+                            protocol=definition.protocol,
+                            instance_key=blueprint.instance_key,
+                            state="planned",
+                            spec=json_safe(blueprint.spec),
+                            checkpoint=json_safe(blueprint.checkpoint),
+                            outcome=json_safe(blueprint.outcome),
+                        )
+                    )
+                    dispatch_records.extend(
+                        BenchmarkRunnerDispatchRecord(
+                            id=dispatch.dispatch_id,
+                            campaign_id=campaign.id,
+                            due_at=(
+                                as_utc(dispatch.due_at)
+                                if dispatch.due_at is not None
+                                else None
+                            ),
+                            state=dispatch.state,
+                            parent_dispatch_id=dispatch.parent_dispatch_id,
+                            protocol_instance_id=blueprint.instance_id,
+                            role=dispatch.role,
+                            runner_template=json_safe(dispatch.runner_template),
+                            lineage=json_safe(dispatch.lineage),
+                        )
+                        for dispatch in blueprint.dispatches
+                    )
+                definition_records.append(definition)
             session.add_all(records)
             session.add_all(plans)
+            session.add_all(instance_records)
+            session.add_all(dispatch_records)
             await session.flush()
             session.add_all(
                 self._event(runner.id, QUEUED, "Runner accepted in Campaign")
@@ -716,6 +1002,10 @@ class RunnerRepository:
             "campaign": self._campaign_dict(campaign),
             "items": [_runner_dict(runner) for runner in records],
             "runner_plans": [_runner_plan_dict(plan) for plan in plans],
+            "protocol_definitions": [
+                _protocol_definition_dict(definition)
+                for definition in definition_records
+            ],
         }
 
     async def create_runner_plan(
@@ -832,6 +1122,15 @@ class RunnerRepository:
                 return response
             plan.status = target
             plan.updated_at = utcnow()
+            if action == "cancel":
+                await session.execute(
+                    update(BenchmarkRunnerDispatchRecord)
+                    .where(
+                        BenchmarkRunnerDispatchRecord.runner_plan_id == plan.id,
+                        BenchmarkRunnerDispatchRecord.state == "pending",
+                    )
+                    .values(state="cancelled")
+                )
             session.add(
                 self._plan_event(
                     plan.id,
@@ -843,12 +1142,11 @@ class RunnerRepository:
             await session.flush()
             return _runner_plan_dict(plan)
 
-    async def materialize_due_plans(
+    async def materialize_due_work(
         self, limit: int, planner_id: Optional[str] = None
     ) -> int:
-        """Materialize due RunnerPlans in one transaction per bounded batch."""
+        """Compile triggers and emit every due Runner through one dispatch protocol."""
 
-        emitted = 0
         async with self.database.sessions() as session, session.begin():
             database_now = as_utc(
                 (await session.execute(select(func.now()))).scalar_one()
@@ -865,10 +1163,81 @@ class RunnerRepository:
             )
             plans = list((await session.execute(statement)).scalars().all())
             for plan in plans:
-                emitted += await self._materialize_plan(
-                    session, plan, database_now, planner_id
+                await self._materialize_plan(session, plan, database_now, planner_id)
+            await session.flush()
+            dispatch_statement = (
+                select(BenchmarkRunnerDispatchRecord)
+                .where(
+                    BenchmarkRunnerDispatchRecord.state == "pending",
+                    BenchmarkRunnerDispatchRecord.due_at <= func.now(),
                 )
-        return emitted
+                .order_by(
+                    BenchmarkRunnerDispatchRecord.due_at.asc(),
+                    BenchmarkRunnerDispatchRecord.created_at.asc(),
+                )
+                .with_for_update(skip_locked=True)
+                .limit(limit)
+            )
+            dispatches = list(
+                (await session.execute(dispatch_statement)).scalars().all()
+            )
+            for dispatch in dispatches:
+                await self._emit_dispatch(session, dispatch, database_now, planner_id)
+            return len(dispatches)
+
+    async def materialize_due_plans(
+        self, limit: int, planner_id: Optional[str] = None
+    ) -> int:
+        """Compatibility alias for callers predating generic dispatches."""
+
+        return await self.materialize_due_work(limit, planner_id)
+
+    async def _emit_dispatch(
+        self,
+        session: AsyncSession,
+        dispatch: BenchmarkRunnerDispatchRecord,
+        database_now: datetime,
+        planner_id: Optional[str],
+    ) -> None:
+        template = dispatch.runner_template
+        lineage = dispatch.lineage or {}
+        runner = BenchmarkRunnerRecord(
+            id=str(uuid4()),
+            campaign_id=dispatch.campaign_id,
+            runner_plan_id=dispatch.runner_plan_id,
+            plan_occurrence=lineage.get("plan_occurrence"),
+            scheduled_for=dispatch.due_at,
+            plan_template_version=lineage.get("plan_template_version"),
+            label=template.get("label"),
+            created_by=str(lineage.get("created_by") or "planner"),
+            status=QUEUED,
+            benchmark_config=json_safe(template["benchmark"]),
+            user_metadata=json_safe(template.get("metadata", {})),
+        )
+        session.add(runner)
+        await session.flush()
+        dispatch.state = "emitted"
+        dispatch.runner_id = runner.id
+        dispatch.emitted_at = database_now
+        session.add(
+            self._event(runner.id, QUEUED, f"Emitted by Planner {planner_id or '-'}")
+        )
+        if dispatch.runner_plan_id is not None:
+            plan = await session.get(BenchmarkRunnerPlanRecord, dispatch.runner_plan_id)
+            if plan is not None:
+                plan.emitted_count += 1
+                plan.updated_at = database_now
+                session.add(
+                    self._plan_event(
+                        plan.id,
+                        "emitted",
+                        occurrence=lineage.get("plan_occurrence"),
+                        scheduled_for=dispatch.due_at,
+                        runner_id=runner.id,
+                        message="Runner emitted through durable dispatch",
+                        details={"planner_id": planner_id},
+                    )
+                )
 
     async def _materialize_plan(
         self,
@@ -932,7 +1301,7 @@ class RunnerRepository:
         template = plan.runner_template
         should_emit = True
         if plan.overlap_policy == "skip":
-            active_count = (
+            active_runners = (
                 await session.execute(
                     select(func.count())
                     .select_from(BenchmarkRunnerRecord)
@@ -942,27 +1311,33 @@ class RunnerRepository:
                     )
                 )
             ).scalar_one()
-            should_emit = active_count == 0
+            pending_dispatches = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(BenchmarkRunnerDispatchRecord)
+                    .where(
+                        BenchmarkRunnerDispatchRecord.runner_plan_id == plan.id,
+                        BenchmarkRunnerDispatchRecord.state == "pending",
+                    )
+                )
+            ).scalar_one()
+            should_emit = active_runners == 0 and pending_dispatches == 0
 
-        runner = None
+        dispatch = None
         if should_emit:
-            runner = BenchmarkRunnerRecord(
-                id=str(uuid4()),
-                campaign_id=plan.campaign_id,
+            dispatch = self._new_dispatch(
+                plan.campaign_id,
+                planned_for,
+                template,
+                {
+                    "plan_occurrence": occurrence,
+                    "plan_template_version": plan.template_version,
+                    "created_by": plan.created_by,
+                },
                 runner_plan_id=plan.id,
-                plan_occurrence=occurrence,
-                scheduled_for=planned_for,
-                plan_template_version=plan.template_version,
-                label=template.get("label"),
-                created_by=plan.created_by,
-                status=QUEUED,
-                benchmark_config=json_safe(template["benchmark"]),
-                user_metadata=json_safe(template.get("metadata", {})),
+                dispatch_key=str(occurrence),
             )
-            session.add(runner)
-            await session.flush()
-            session.add(self._event(runner.id, QUEUED, "Runner emitted by Planner"))
-            plan.emitted_count += 1
+            session.add(dispatch)
         else:
             plan.skipped_count += 1
 
@@ -991,13 +1366,12 @@ class RunnerRepository:
         session.add(
             self._plan_event(
                 plan.id,
-                "emitted" if runner is not None else "overlap_skipped",
+                "dispatch_scheduled" if dispatch is not None else "overlap_skipped",
                 occurrence=occurrence,
                 scheduled_for=planned_for,
-                runner_id=runner.id if runner is not None else None,
                 message=(
-                    "Runner emitted to the shared queue"
-                    if runner is not None
+                    "Occurrence compiled into durable dispatch"
+                    if dispatch is not None
                     else "Occurrence skipped by overlap_policy=skip"
                 ),
                 details={
@@ -1017,7 +1391,7 @@ class RunnerRepository:
                     details={"planner_id": planner_id},
                 )
             )
-        return 1 if runner is not None else 0
+        return 0
 
     @staticmethod
     def _plan_exhausted(plan: BenchmarkRunnerPlanRecord) -> bool:
@@ -1057,6 +1431,12 @@ class RunnerRepository:
             plan_statuses: Dict[str, Dict[str, int]] = {
                 campaign.id: {} for campaign in campaigns
             }
+            protocol_statuses: Dict[str, Dict[str, int]] = {
+                campaign.id: {} for campaign in campaigns
+            }
+            dispatch_statuses: Dict[str, Dict[str, int]] = {
+                campaign.id: {} for campaign in campaigns
+            }
             if campaigns:
                 campaign_ids = [campaign.id for campaign in campaigns]
                 status_statement = (
@@ -1091,12 +1471,53 @@ class RunnerRepository:
                     plan_statement
                 ):
                     plan_statuses[str(campaign_id)][str(plan_status)] = int(count)
+                protocol_statement = (
+                    select(
+                        BenchmarkProtocolInstanceRecord.campaign_id,
+                        BenchmarkProtocolInstanceRecord.state,
+                        func.count(),
+                    )
+                    .where(
+                        BenchmarkProtocolInstanceRecord.campaign_id.in_(campaign_ids)
+                    )
+                    .group_by(
+                        BenchmarkProtocolInstanceRecord.campaign_id,
+                        BenchmarkProtocolInstanceRecord.state,
+                    )
+                )
+                for campaign_id, protocol_state, count in await session.execute(
+                    protocol_statement
+                ):
+                    protocol_statuses[str(campaign_id)][str(protocol_state)] = int(
+                        count
+                    )
+                dispatch_statement = (
+                    select(
+                        BenchmarkRunnerDispatchRecord.campaign_id,
+                        BenchmarkRunnerDispatchRecord.state,
+                        func.count(),
+                    )
+                    .where(BenchmarkRunnerDispatchRecord.campaign_id.in_(campaign_ids))
+                    .group_by(
+                        BenchmarkRunnerDispatchRecord.campaign_id,
+                        BenchmarkRunnerDispatchRecord.state,
+                    )
+                )
+                for campaign_id, dispatch_state, count in await session.execute(
+                    dispatch_statement
+                ):
+                    dispatch_statuses[str(campaign_id)][str(dispatch_state)] = int(
+                        count
+                    )
             responses = []
             for campaign in campaigns:
                 response = self._campaign_dict(campaign)
                 response.update(
                     self._campaign_runtime(
-                        statuses[campaign.id], plan_statuses[campaign.id]
+                        statuses[campaign.id],
+                        plan_statuses[campaign.id],
+                        protocol_statuses[campaign.id],
+                        dispatch_statuses[campaign.id],
                     )
                 )
                 responses.append(response)
@@ -1106,6 +1527,8 @@ class RunnerRepository:
     def _campaign_runtime(
         statuses: Union[Sequence[str], Mapping[str, int]],
         plan_statuses: Union[Sequence[str], Mapping[str, int]] = (),
+        protocol_statuses: Union[Sequence[str], Mapping[str, int]] = (),
+        dispatch_statuses: Union[Sequence[str], Mapping[str, int]] = (),
     ) -> Dict[str, Any]:
         runner_states = (QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED)
         plan_states = (
@@ -1128,18 +1551,59 @@ class RunnerRepository:
                 plan_status: plan_statuses.count(plan_status)
                 for plan_status in plan_states
             }
+        protocol_states = ("planned", "active", "completed", "failed", "cancelled")
+        if isinstance(protocol_statuses, Mapping):
+            protocol_counts = {
+                protocol_state: int(protocol_statuses.get(protocol_state, 0))
+                for protocol_state in protocol_states
+            }
+        else:
+            protocol_counts = {
+                protocol_state: protocol_statuses.count(protocol_state)
+                for protocol_state in protocol_states
+            }
         runner_count = sum(counts.values())
         runner_plan_count = sum(plan_counts.values())
+        protocol_instance_count = sum(protocol_counts.values())
+        pending_protocol_instances = sum(
+            protocol_counts[state] for state in PROTOCOL_INSTANCE_PENDING_STATES
+        )
+        dispatch_states = ("blocked", "pending", "emitted", "cancelled")
+        if isinstance(dispatch_statuses, Mapping):
+            dispatch_counts = {
+                state: int(dispatch_statuses.get(state, 0)) for state in dispatch_states
+            }
+        else:
+            dispatch_counts = {
+                state: dispatch_statuses.count(state) for state in dispatch_states
+            }
+        dispatch_count = sum(dispatch_counts.values())
+        pending_dispatches = dispatch_counts["blocked"] + dispatch_counts["pending"]
         if counts[RUNNING]:
             campaign_status = RUNNING
         elif counts[QUEUED]:
             campaign_status = QUEUED
+        elif pending_protocol_instances or pending_dispatches:
+            campaign_status = "planned"
         elif plan_counts[PLAN_ACTIVE]:
             campaign_status = "planned"
         elif plan_counts[PLAN_PAUSED]:
             campaign_status = PLAN_PAUSED
         elif not runner_count and not runner_plan_count:
-            campaign_status = "empty"
+            if protocol_instance_count:
+                campaign_status = (
+                    CANCELLED
+                    if protocol_counts["cancelled"] == protocol_instance_count
+                    else "completed"
+                )
+            elif dispatch_count:
+                campaign_status = (
+                    CANCELLED
+                    if dispatch_counts["cancelled"] == dispatch_count
+                    else "completed"
+                )
+            else:
+                campaign_status = "empty"
         elif not runner_count:
             campaign_status = (
                 CANCELLED
@@ -1155,10 +1619,14 @@ class RunnerRepository:
 
         if campaign_status in {RUNNING, QUEUED, "planned", PLAN_PAUSED}:
             campaign_outcome = "pending"
-        elif not runner_count:
+        elif protocol_counts["failed"]:
             campaign_outcome = (
-                CANCELLED if campaign_status == CANCELLED else "no_runs"
+                FAILED
+                if protocol_counts["failed"] == protocol_instance_count
+                else "partial_failed"
             )
+        elif not runner_count:
+            campaign_outcome = CANCELLED if campaign_status == CANCELLED else "no_runs"
         elif counts[FAILED] == runner_count:
             campaign_outcome = FAILED
         elif counts[FAILED]:
@@ -1172,11 +1640,15 @@ class RunnerRepository:
         return {
             "status": campaign_status,
             "outcome": campaign_outcome,
-            "has_failures": bool(counts[FAILED]),
+            "has_failures": bool(counts[FAILED] or protocol_counts["failed"]),
             "runner_count": runner_count,
             "status_counts": counts,
             "runner_plan_count": runner_plan_count,
             "runner_plan_status_counts": plan_counts,
+            "protocol_instance_count": protocol_instance_count,
+            "protocol_instance_status_counts": protocol_counts,
+            "dispatch_count": dispatch_count,
+            "dispatch_status_counts": dispatch_counts,
         }
 
     async def get_campaign_status(self, campaign_id: str) -> Optional[Dict[str, Any]]:
@@ -1202,8 +1674,30 @@ class RunnerRepository:
                 str(plan_status): int(count)
                 for plan_status, count in await session.execute(plan_statement)
             }
+            protocol_statement = (
+                select(BenchmarkProtocolInstanceRecord.state, func.count())
+                .where(BenchmarkProtocolInstanceRecord.campaign_id == campaign_id)
+                .group_by(BenchmarkProtocolInstanceRecord.state)
+            )
+            protocol_statuses = {
+                str(protocol_state): int(count)
+                for protocol_state, count in await session.execute(protocol_statement)
+            }
+            dispatch_statement = (
+                select(BenchmarkRunnerDispatchRecord.state, func.count())
+                .where(BenchmarkRunnerDispatchRecord.campaign_id == campaign_id)
+                .group_by(BenchmarkRunnerDispatchRecord.state)
+            )
+            dispatch_statuses = {
+                str(dispatch_state): int(count)
+                for dispatch_state, count in await session.execute(dispatch_statement)
+            }
             response = self._campaign_dict(campaign)
-            response.update(self._campaign_runtime(statuses, plan_statuses))
+            response.update(
+                self._campaign_runtime(
+                    statuses, plan_statuses, protocol_statuses, dispatch_statuses
+                )
+            )
             return response
 
     async def request_cancel_campaign(
@@ -1226,6 +1720,22 @@ class RunnerRepository:
                 .with_for_update()
             )
             plans = list((await session.execute(plan_statement)).scalars().all())
+            protocol_statement = (
+                select(BenchmarkProtocolInstanceRecord)
+                .where(BenchmarkProtocolInstanceRecord.campaign_id == campaign_id)
+                .with_for_update()
+            )
+            instances = list(
+                (await session.execute(protocol_statement)).scalars().all()
+            )
+            dispatch_statement = (
+                select(BenchmarkRunnerDispatchRecord)
+                .where(BenchmarkRunnerDispatchRecord.campaign_id == campaign_id)
+                .with_for_update()
+            )
+            dispatches = list(
+                (await session.execute(dispatch_statement)).scalars().all()
+            )
             for plan in plans:
                 if plan.status not in {PLAN_ACTIVE, PLAN_PAUSED}:
                     continue
@@ -1252,12 +1762,23 @@ class RunnerRepository:
                     message = "Cancellation requested with Campaign"
                     event_status = RUNNING
                 session.add(self._event(runner.id, event_status, message))
+            for instance in instances:
+                if instance.state in {"completed", "failed", "cancelled"}:
+                    continue
+                instance.state = "cancelled"
+                instance.error = "Campaign cancelled"
+                instance.updated_at = now
+            for dispatch in dispatches:
+                if dispatch.state in {"blocked", "pending"}:
+                    dispatch.state = "cancelled"
             await session.flush()
             response = self._campaign_dict(campaign)
             response.update(
                 self._campaign_runtime(
                     [runner.status for runner in runners],
                     [plan.status for plan in plans],
+                    [instance.state for instance in instances],
+                    [dispatch.state for dispatch in dispatches],
                 )
             )
             return response
@@ -1359,6 +1880,9 @@ class RunnerRepository:
             if runner.status == QUEUED:
                 runner.status = CANCELLED
                 runner.finished_at = utcnow()
+                await self._update_protocol_instance(
+                    session, runner, CANCELLED, runner.finished_at
+                )
                 session.add(
                     self._event(runner.id, CANCELLED, "Cancelled before execution")
                 )
@@ -1366,6 +1890,343 @@ class RunnerRepository:
                 session.add(self._event(runner.id, RUNNING, "Cancellation requested"))
             await session.flush()
             return _runner_dict(runner)
+
+    async def _update_protocol_instance(
+        self,
+        session: AsyncSession,
+        runner: BenchmarkRunnerRecord,
+        terminal_status: str,
+        occurred_at: datetime,
+        request_timestamp: Optional[datetime] = None,
+        request_prompt_hash: Optional[str] = None,
+        request_prompt_hashes: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        context = (runner.user_metadata or {}).get("protocol")
+        if not isinstance(context, Mapping):
+            return
+        instance_id = context.get("instance_id")
+        role = context.get("role")
+        if not instance_id or role not in {"prime", "warm", "cold_control"}:
+            return
+        statement = (
+            select(BenchmarkProtocolInstanceRecord)
+            .where(BenchmarkProtocolInstanceRecord.id == str(instance_id))
+            .with_for_update()
+        )
+        instance = (await session.execute(statement)).scalar_one_or_none()
+        if instance is None:
+            return
+        if instance.protocol == "cache-residency/v1":
+            await self._update_cache_residency_instance(
+                session,
+                instance,
+                runner,
+                str(role),
+                terminal_status,
+                occurred_at,
+                request_timestamp,
+                request_prompt_hash,
+                request_prompt_hashes,
+            )
+            return
+        if instance.protocol != "cache-retention/v1":
+            return
+        instance.updated_at = occurred_at
+        spec = instance.spec or {}
+        checkpoint = dict(instance.checkpoint or {})
+        outcome = dict(instance.outcome or {})
+        if role == "prime":
+            prime_dispatch = (
+                await session.execute(
+                    select(BenchmarkRunnerDispatchRecord)
+                    .where(BenchmarkRunnerDispatchRecord.runner_id == runner.id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if prime_dispatch is None:
+                instance.state = "failed"
+                instance.error = "prime Runner has no originating Dispatch"
+                await session.execute(
+                    update(BenchmarkRunnerDispatchRecord)
+                    .where(
+                        BenchmarkRunnerDispatchRecord.protocol_instance_id
+                        == instance.id,
+                        BenchmarkRunnerDispatchRecord.state == "blocked",
+                    )
+                    .values(state="cancelled")
+                )
+                return
+            if terminal_status == SUCCEEDED:
+                if not request_prompt_hash:
+                    instance.state = "failed"
+                    instance.error = "prime result omitted prompt_hash"
+                    await session.execute(
+                        update(BenchmarkRunnerDispatchRecord)
+                        .where(
+                            BenchmarkRunnerDispatchRecord.parent_dispatch_id
+                            == prime_dispatch.id,
+                            BenchmarkRunnerDispatchRecord.state == "blocked",
+                        )
+                        .values(state="cancelled")
+                    )
+                    return
+                prime_anchor = request_timestamp or occurred_at
+                warm_due_at = prime_anchor + timedelta(
+                    seconds=int(spec["delay_seconds"])
+                )
+                checkpoint.update(
+                    {
+                        "prompt_hash": request_prompt_hash,
+                        "prime_anchor_at": prime_anchor.isoformat(),
+                    }
+                )
+                instance.checkpoint = json_safe(checkpoint)
+                instance.state = "active"
+                instance.error = None
+                await session.execute(
+                    update(BenchmarkRunnerDispatchRecord)
+                    .where(
+                        BenchmarkRunnerDispatchRecord.parent_dispatch_id
+                        == prime_dispatch.id,
+                        BenchmarkRunnerDispatchRecord.state == "blocked",
+                    )
+                    .values(state="pending", due_at=warm_due_at)
+                )
+            else:
+                instance.state = (
+                    "cancelled" if terminal_status == CANCELLED else "failed"
+                )
+                instance.error = f"prime Runner ended as {terminal_status}"
+                await session.execute(
+                    update(BenchmarkRunnerDispatchRecord)
+                    .where(
+                        BenchmarkRunnerDispatchRecord.parent_dispatch_id
+                        == prime_dispatch.id,
+                        BenchmarkRunnerDispatchRecord.state == "blocked",
+                    )
+                    .values(state="cancelled")
+                )
+            return
+        if role == "warm":
+            warm_started_at = request_timestamp or runner.started_at or occurred_at
+            prime_anchor_value = checkpoint.get("prime_anchor_at")
+            actual_delay_seconds = None
+            if isinstance(prime_anchor_value, str):
+                try:
+                    prime_anchor = as_utc(datetime.fromisoformat(prime_anchor_value))
+                    actual_delay_seconds = max(
+                        0.0, (warm_started_at - prime_anchor).total_seconds()
+                    )
+                except ValueError:
+                    pass
+            outcome.update(
+                {
+                    "warm_started_at": warm_started_at.isoformat(),
+                    "actual_delay_seconds": actual_delay_seconds,
+                }
+            )
+            instance.outcome = json_safe(outcome)
+            if terminal_status == SUCCEEDED and request_prompt_hash != checkpoint.get(
+                "prompt_hash"
+            ):
+                instance.state = "failed"
+                instance.error = "warm prompt_hash does not match prime"
+                return
+        if terminal_status != SUCCEEDED:
+            instance.state = "cancelled" if terminal_status == CANCELLED else "failed"
+            instance.error = f"{role} Runner ended as {terminal_status}"
+            return
+        required_roles = ["warm"]
+        if spec.get("control_prompt_seed") is not None:
+            required_roles.append("cold_control")
+        phase_rows = await session.execute(
+            select(
+                BenchmarkRunnerDispatchRecord.role,
+                BenchmarkRunnerRecord.status,
+            )
+            .outerjoin(
+                BenchmarkRunnerRecord,
+                BenchmarkRunnerRecord.id == BenchmarkRunnerDispatchRecord.runner_id,
+            )
+            .where(
+                BenchmarkRunnerDispatchRecord.protocol_instance_id == instance.id,
+                BenchmarkRunnerDispatchRecord.role.in_(required_roles),
+            )
+        )
+        phase_statuses = {
+            str(phase_role): phase_status for phase_role, phase_status in phase_rows
+        }
+        instance.state = (
+            "completed"
+            if all(phase_statuses.get(item) == SUCCEEDED for item in required_roles)
+            else "active"
+        )
+
+    async def _update_cache_residency_instance(
+        self,
+        session: AsyncSession,
+        instance: BenchmarkProtocolInstanceRecord,
+        runner: BenchmarkRunnerRecord,
+        role: str,
+        terminal_status: str,
+        occurred_at: datetime,
+        request_timestamp: Optional[datetime],
+        request_prompt_hash: Optional[str],
+        request_prompt_hashes: Optional[Mapping[str, str]],
+    ) -> None:
+        """Advance one strict bundled-Prime observation chain transactionally."""
+
+        instance.updated_at = occurred_at
+        checkpoint = dict(instance.checkpoint or {})
+        outcome = dict(instance.outcome or {})
+        source_dispatch = (
+            await session.execute(
+                select(BenchmarkRunnerDispatchRecord)
+                .where(BenchmarkRunnerDispatchRecord.runner_id == runner.id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if source_dispatch is None:
+            instance.state = "failed"
+            instance.error = f"{role} Runner has no originating Dispatch"
+            await self._cancel_protocol_dispatches(session, instance.id)
+            return
+
+        if role == "prime":
+            if terminal_status != SUCCEEDED:
+                instance.state = (
+                    "cancelled" if terminal_status == CANCELLED else "failed"
+                )
+                instance.error = f"prime Runner ended as {terminal_status}"
+                await self._cancel_protocol_dispatches(session, instance.id)
+                return
+            expected_mapping_keys = list(
+                ((runner.user_metadata or {}).get("protocol") or {}).get("mapping_keys")
+                or []
+            )
+            observed_hashes = dict(request_prompt_hashes or {})
+            if not expected_mapping_keys or any(
+                mapping_key not in observed_hashes
+                for mapping_key in expected_mapping_keys
+            ):
+                instance.state = "failed"
+                instance.error = "Prime bundle omitted one or more prompt hashes"
+                await self._cancel_protocol_dispatches(session, instance.id)
+                return
+            prime_anchor = request_timestamp or occurred_at
+            checkpoint.update(
+                {
+                    "prompt_hashes": observed_hashes,
+                    "prime_anchor_at": prime_anchor.isoformat(),
+                }
+            )
+            instance.checkpoint = json_safe(checkpoint)
+            instance.state = "active"
+            instance.error = None
+            descendants = list(
+                (
+                    await session.execute(
+                        select(BenchmarkRunnerDispatchRecord)
+                        .where(
+                            BenchmarkRunnerDispatchRecord.protocol_instance_id
+                            == instance.id,
+                            BenchmarkRunnerDispatchRecord.state == "blocked",
+                        )
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for dispatch in descendants:
+                lineage = dispatch.lineage or {}
+                scheduled_at = lineage.get("scheduled_at")
+                if isinstance(scheduled_at, str):
+                    dispatch.due_at = as_utc(datetime.fromisoformat(scheduled_at))
+                else:
+                    offset_seconds = int(lineage["offset_seconds"])
+                    dispatch.due_at = prime_anchor + timedelta(seconds=offset_seconds)
+                if dispatch.parent_dispatch_id == source_dispatch.id:
+                    dispatch.state = "pending"
+            return
+
+        observation_index = ((runner.user_metadata or {}).get("protocol") or {}).get(
+            "observation_index"
+        )
+        if not isinstance(observation_index, int):
+            instance.state = "failed"
+            instance.error = f"{role} Runner omitted observation_index"
+            await self._cancel_protocol_dispatches(session, instance.id)
+            return
+        observations = dict(outcome.get("observations") or {})
+        observation = dict(observations.get(str(observation_index)) or {})
+        observation[f"{role}_mapping_key"] = (
+            (runner.user_metadata or {}).get("protocol") or {}
+        ).get("mapping_key")
+        started_at = request_timestamp or runner.started_at or occurred_at
+        observation[f"{role}_started_at"] = started_at.isoformat()
+        prime_anchor_value = checkpoint.get("prime_anchor_at")
+        if isinstance(prime_anchor_value, str):
+            try:
+                prime_anchor = as_utc(datetime.fromisoformat(prime_anchor_value))
+                observation[f"{role}_actual_delay_seconds"] = max(
+                    0.0, (started_at - prime_anchor).total_seconds()
+                )
+            except ValueError:
+                pass
+        observations[str(observation_index)] = observation
+        outcome["observations"] = observations
+        instance.outcome = json_safe(outcome)
+
+        if terminal_status != SUCCEEDED:
+            instance.state = "cancelled" if terminal_status == CANCELLED else "failed"
+            instance.error = f"{role} Runner ended as {terminal_status}"
+            await self._cancel_protocol_dispatches(session, instance.id)
+            return
+        if role == "warm":
+            expected_mapping_key = (
+                (runner.user_metadata or {}).get("protocol") or {}
+            ).get("mapping_key")
+            prime_hashes = checkpoint.get("prompt_hashes") or {}
+            observed_hashes = dict(request_prompt_hashes or {})
+            if not isinstance(expected_mapping_key, str) or observed_hashes.get(
+                expected_mapping_key
+            ) != prime_hashes.get(expected_mapping_key):
+                instance.state = "failed"
+                instance.error = "Warm prompt hash does not match mapped Prime"
+                await self._cancel_protocol_dispatches(session, instance.id)
+                return
+
+        child = (
+            await session.execute(
+                select(BenchmarkRunnerDispatchRecord)
+                .where(
+                    BenchmarkRunnerDispatchRecord.parent_dispatch_id
+                    == source_dispatch.id,
+                    BenchmarkRunnerDispatchRecord.state == "blocked",
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if child is None:
+            instance.state = "completed"
+            instance.error = None
+        else:
+            child.state = "pending"
+            instance.state = "active"
+
+    @staticmethod
+    async def _cancel_protocol_dispatches(
+        session: AsyncSession, instance_id: str
+    ) -> None:
+        await session.execute(
+            update(BenchmarkRunnerDispatchRecord)
+            .where(
+                BenchmarkRunnerDispatchRecord.protocol_instance_id == instance_id,
+                BenchmarkRunnerDispatchRecord.state.in_(["blocked", "pending"]),
+            )
+            .values(state="cancelled")
+        )
 
     async def complete_runner(
         self,
@@ -1391,6 +2252,41 @@ class RunnerRepository:
             runner = (await session.execute(statement)).scalar_one_or_none()
             if runner is None or runner.status != RUNNING or runner.cancel_requested:
                 return False
+            completed_at = utcnow()
+            request_timestamp = None
+            request_prompt_hash = None
+            request_prompt_hashes: Dict[str, str] = {}
+            context = (runner.user_metadata or {}).get("protocol")
+            if isinstance(context, Mapping) and safe_requests:
+                timestamp_name = (
+                    "completed_utc"
+                    if context.get("role") == "prime"
+                    else "client_start_utc"
+                )
+                request_timestamps = []
+                for request in safe_requests:
+                    timing = request.get("request_timing") or {}
+                    request_metadata = request.get("request_metadata") or {}
+                    prompt_hash = request_metadata.get("prompt_hash")
+                    if request_prompt_hash is None and isinstance(prompt_hash, str):
+                        request_prompt_hash = prompt_hash
+                    mapping_key = request_metadata.get("mapping_key")
+                    if isinstance(mapping_key, str) and isinstance(prompt_hash, str):
+                        request_prompt_hashes[mapping_key] = prompt_hash
+                    timestamp_value = timing.get(timestamp_name)
+                    if isinstance(timestamp_value, str):
+                        try:
+                            request_timestamps.append(
+                                as_utc(datetime.fromisoformat(timestamp_value))
+                            )
+                        except ValueError:
+                            pass
+                if request_timestamps:
+                    request_timestamp = (
+                        max(request_timestamps)
+                        if context.get("role") == "prime"
+                        else min(request_timestamps)
+                    )
             await session.execute(
                 delete(BenchmarkRequestRecord).where(
                     BenchmarkRequestRecord.runner_id == runner_id
@@ -1408,8 +2304,8 @@ class RunnerRepository:
                 .where(BenchmarkRunnerRecord.id == runner_id)
                 .values(
                     status=terminal_status,
-                    finished_at=utcnow(),
-                    heartbeat_at=utcnow(),
+                    finished_at=completed_at,
+                    heartbeat_at=completed_at,
                     exit_code=exit_code,
                     summary=safe_summary,
                     request_count=len(safe_requests),
@@ -1417,6 +2313,15 @@ class RunnerRepository:
                     stderr=stderr,
                     error_message=error_message,
                 )
+            )
+            await self._update_protocol_instance(
+                session,
+                runner,
+                terminal_status,
+                completed_at,
+                request_timestamp=request_timestamp,
+                request_prompt_hash=request_prompt_hash,
+                request_prompt_hashes=request_prompt_hashes,
             )
             event_message = (
                 "Results persisted"
@@ -1438,24 +2343,26 @@ class RunnerRepository:
         if status not in {FAILED, CANCELLED}:
             raise ValueError(f"Unsupported terminal status: {status}")
         async with self.database.sessions() as session, session.begin():
-            result = await session.execute(
-                update(BenchmarkRunnerRecord)
+            statement = (
+                select(BenchmarkRunnerRecord)
                 .where(
                     BenchmarkRunnerRecord.id == runner_id,
                     BenchmarkRunnerRecord.status == RUNNING,
                 )
-                .values(
-                    status=status,
-                    finished_at=utcnow(),
-                    heartbeat_at=utcnow(),
-                    exit_code=exit_code,
-                    error_message=message,
-                    stdout=stdout,
-                    stderr=stderr,
-                )
+                .with_for_update()
             )
-            if not result.rowcount:
+            runner = (await session.execute(statement)).scalar_one_or_none()
+            if runner is None:
                 return False
+            finished_at = utcnow()
+            runner.status = status
+            runner.finished_at = finished_at
+            runner.heartbeat_at = finished_at
+            runner.exit_code = exit_code
+            runner.error_message = message
+            runner.stdout = stdout
+            runner.stderr = stderr
+            await self._update_protocol_instance(session, runner, status, finished_at)
             session.add(self._event(runner_id, status, message))
         return True
 
@@ -1572,6 +2479,33 @@ class RunnerRepository:
                 .order_by(BenchmarkRunnerPlanRecord.created_at.asc())
             )
             plan_records = (await session.execute(plan_statement)).scalars().all()
+            definition_statement = (
+                select(BenchmarkProtocolDefinitionRecord)
+                .where(BenchmarkProtocolDefinitionRecord.campaign_id == campaign_id)
+                .order_by(BenchmarkProtocolDefinitionRecord.created_at.asc())
+            )
+            definition_records = (
+                (await session.execute(definition_statement)).scalars().all()
+            )
+            instance_statement = (
+                select(BenchmarkProtocolInstanceRecord)
+                .where(BenchmarkProtocolInstanceRecord.campaign_id == campaign_id)
+                .order_by(
+                    BenchmarkProtocolInstanceRecord.definition_id.asc(),
+                    BenchmarkProtocolInstanceRecord.instance_key.asc(),
+                )
+            )
+            instance_records = (
+                (await session.execute(instance_statement)).scalars().all()
+            )
+            dispatch_statement = (
+                select(BenchmarkRunnerDispatchRecord)
+                .where(BenchmarkRunnerDispatchRecord.campaign_id == campaign_id)
+                .order_by(BenchmarkRunnerDispatchRecord.created_at.asc())
+            )
+            dispatch_records = (
+                (await session.execute(dispatch_statement)).scalars().all()
+            )
             status_counts = {
                 status: 0 for status in (QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED)
             }
@@ -1600,9 +2534,7 @@ class RunnerRepository:
                     item["requests"] = request_map.get(runner.id, [])
                 runners.append(item)
             plan_status_counts = {
-                plan_status: sum(
-                    plan.status == plan_status for plan in plan_records
-                )
+                plan_status: sum(plan.status == plan_status for plan in plan_records)
                 for plan_status in (
                     PLAN_ACTIVE,
                     PLAN_PAUSED,
@@ -1610,9 +2542,43 @@ class RunnerRepository:
                     PLAN_CANCELLED,
                 )
             }
-            runtime = self._campaign_runtime(status_counts, plan_status_counts)
+            protocol_status_counts = {
+                protocol_state: sum(
+                    instance.state == protocol_state for instance in instance_records
+                )
+                for protocol_state in (
+                    "planned",
+                    "active",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                )
+            }
+            dispatch_status_counts = {
+                dispatch_state: sum(
+                    dispatch.state == dispatch_state for dispatch in dispatch_records
+                )
+                for dispatch_state in ("blocked", "pending", "emitted", "cancelled")
+            }
+            runtime = self._campaign_runtime(
+                status_counts,
+                plan_status_counts,
+                protocol_status_counts,
+                dispatch_status_counts,
+            )
+            instances = [
+                _protocol_instance_dict(instance) for instance in instance_records
+            ]
+            dispatches = [_dispatch_dict(dispatch) for dispatch in dispatch_records]
+            from llmperf.cache_sweep import analyze_cache_protocols
+
+            protocol_analyses = analyze_cache_protocols(
+                instances,
+                dispatches,
+                {runner.id: _runner_dict(runner) for runner in runner_records},
+            )
             return {
-                "version": 3,
+                "version": 5,
                 "campaign": campaign,
                 "aggregate": {
                     **runtime,
@@ -1621,6 +2587,13 @@ class RunnerRepository:
                     ),
                 },
                 "runner_plans": [_runner_plan_dict(plan) for plan in plan_records],
+                "protocol_definitions": [
+                    _protocol_definition_dict(definition)
+                    for definition in definition_records
+                ],
+                "protocol_instances": instances,
+                "dispatches": dispatches,
+                "protocol_analyses": protocol_analyses,
                 "runners": runners,
             }
 

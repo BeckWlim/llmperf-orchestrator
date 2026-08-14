@@ -550,9 +550,9 @@ RunnerPlan Detail 包含当地规则、`next_fire_at`、`next_fire_local`、计�
 ## 11. CLI 设计
 
 ```bash
-llmperfctl campaign start -f runner-plan.yaml
-llmperfctl planner preview -f runner-plan.yaml
-llmperfctl planner create CAMPAIGN_ID -f runner-plan.yaml
+llmperfctl campaign start -f examples/example-runner-plan.yaml
+llmperfctl planner preview -f examples/example-runner-plan.yaml
+llmperfctl planner create CAMPAIGN_ID -f examples/example-runner-plan.yaml
 llmperfctl planner list
 llmperfctl planner status RUNNER_PLAN_ID
 llmperfctl planner pause RUNNER_PLAN_ID

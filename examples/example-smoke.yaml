@@ -1,13 +1,10 @@
-# Minimal end-to-end task for a DeepSeek OpenAI-compatible endpoint.
-label: deepseek-smoke-1x1
+# Minimal end-to-end request for the configured Aliyun Provider.
+label: example-smoke
 
 metadata:
-  test_type: smoke
-  provider: aliyun
-  purpose: verify-end-to-end-persistence
+  purpose: verify-provider-and-persistence
 
 benchmark:
-  # Replace this with the exact ID returned by the configured /v1/models API.
   provider: aliyun
   model: deepseek-v4-pro
   timeout_seconds: 30

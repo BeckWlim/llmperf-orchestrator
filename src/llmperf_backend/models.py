@@ -1,10 +1,12 @@
 """Validated request and configuration models used by the backend."""
 
 from datetime import datetime, time
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from llmperf_backend.protocol_schedules import expand_geographic_schedule
 
 
 DEFAULT_TOKENIZER_ID = "hf-internal-testing/llama-tokenizer"
@@ -61,6 +63,53 @@ class CacheProbeConfig(StrictModel):
     minimum_counter_coverage: float = Field(default=0.8, ge=0, le=1)
 
 
+class ProtocolRequestContext(StrictModel):
+    """Backend-owned identity for one request in a protocol instance."""
+
+    protocol: Literal["cache-retention/v1", "cache-residency/v1"]
+    definition_id: str = Field(min_length=1, max_length=36)
+    instance_id: str = Field(min_length=1, max_length=36)
+    role: Literal["prime", "warm", "cold_control"]
+    delay_seconds: int = Field(ge=0, le=31_536_000)
+    trial_index: Optional[int] = Field(default=None, ge=0)
+    chain_index: Optional[int] = Field(default=None, ge=0)
+    prompt_seed: Optional[int] = Field(default=None, ge=0, le=2_147_483_647)
+    prompt_seeds: Optional[List[int]] = Field(
+        default=None, min_length=1, max_length=10_000
+    )
+    mapping_key: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    mapping_keys: Optional[List[str]] = Field(
+        default=None, min_length=1, max_length=10_000
+    )
+    observation_index: Optional[int] = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> "ProtocolRequestContext":
+        if self.protocol == "cache-retention/v1":
+            if self.trial_index is None or self.prompt_seed is None:
+                raise ValueError(
+                    "cache retention request requires trial_index and prompt_seed"
+                )
+        if self.protocol == "cache-residency/v1":
+            if self.chain_index is None:
+                raise ValueError("cache residency request requires chain_index")
+            if self.role == "prime":
+                if not self.prompt_seeds or not self.mapping_keys:
+                    raise ValueError(
+                        "cache residency Prime requires prompt_seeds and mapping_keys"
+                    )
+                if len(self.prompt_seeds) != len(self.mapping_keys):
+                    raise ValueError(
+                        "cache residency prompt_seeds and mapping_keys must have "
+                        "equal length"
+                    )
+            elif self.prompt_seed is None or self.mapping_key is None:
+                raise ValueError(
+                    "cache residency Warm/Control requires prompt_seed and mapping_key"
+                )
+        return self
+
+
 class DatasetSpec(StrictModel):
     """A backend-resolved Hugging Face dataset artifact."""
 
@@ -95,6 +144,7 @@ class BenchmarkConfig(StrictModel):
         default_factory=lambda: TokenizerSpec(id=DEFAULT_TOKENIZER_ID)
     )
     cache_probe: Optional[CacheProbeConfig] = None
+    protocol_request: Optional[ProtocolRequestContext] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -112,6 +162,8 @@ class BenchmarkConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_cache_probe(self) -> "BenchmarkConfig":
+        if self.cache_probe is not None and self.protocol_request is not None:
+            raise ValueError("cache_probe and protocol_request cannot be combined")
         if self.cache_probe is None:
             return self
         if (
@@ -221,6 +273,146 @@ class BenchmarkRunnerBatchCreate(StrictModel):
     runners: List[BenchmarkRunnerSpec] = Field(min_length=1, max_length=100)
 
 
+class CacheRetentionProtocolCreate(StrictModel):
+    """A bounded cache-retention protocol definition."""
+
+    name: str = Field(min_length=1, max_length=200)
+    protocol: Literal["cache-retention/v1"] = "cache-retention/v1"
+    delay_seconds: List[int] = Field(min_length=1, max_length=100)
+    trials_per_delay: int = Field(default=20, ge=1, le=1_000)
+    seed: int = Field(default=11111, ge=0, le=2_147_483_647)
+    assignment: Literal["randomized_blocks"] = "randomized_blocks"
+    refresh_semantics: Literal["independent_family"] = "independent_family"
+    cold_control: bool = True
+    runner: BenchmarkRunnerSpec
+
+    @model_validator(mode="after")
+    def validate_sweep(self) -> "CacheRetentionProtocolCreate":
+        if any(delay < 0 or delay > 31_536_000 for delay in self.delay_seconds):
+            raise ValueError(
+                "cache retention delay_seconds must be between 0 and 31536000"
+            )
+        if len(set(self.delay_seconds)) != len(self.delay_seconds):
+            raise ValueError("cache retention delay_seconds must be unique")
+        if len(self.delay_seconds) * self.trials_per_delay > 10_000:
+            raise ValueError("cache retention protocol cannot exceed 10000 instances")
+        if self.runner.benchmark is not None:
+            benchmark = self.runner.benchmark
+            if benchmark.cache_probe is not None:
+                raise ValueError(
+                    "cache retention protocol runner cannot also define cache_probe"
+                )
+            if benchmark.protocol_request is not None:
+                raise ValueError(
+                    "protocol_request is backend-owned and cannot be submitted"
+                )
+        return self
+
+
+class RelativeCacheResidencySchedule(StrictModel):
+    """Observation instants measured from the actual Prime completion."""
+
+    kind: Literal["relative"] = "relative"
+    offsets_seconds: List[int] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_offsets(self) -> "RelativeCacheResidencySchedule":
+        if any(offset < 1 or offset > 31_536_000 for offset in self.offsets_seconds):
+            raise ValueError("relative offsets must be between 1 and 31536000")
+        if self.offsets_seconds != sorted(set(self.offsets_seconds)):
+            raise ValueError("relative offsets must be unique and strictly increasing")
+        return self
+
+
+class GeographicCacheResidencySchedule(StrictModel):
+    """A bounded wall-clock timetable interpreted in one IANA timezone."""
+
+    kind: Literal["geographic"] = "geographic"
+    timezone: str = Field(min_length=1, max_length=64)
+    starts_at: datetime
+    every_seconds: int = Field(ge=1, le=31_536_000)
+    duration_days: int = Field(ge=1, le=366)
+
+    @model_validator(mode="after")
+    def validate_timetable(self) -> "GeographicCacheResidencySchedule":
+        try:
+            zone = ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"unknown IANA timezone: {self.timezone}") from exc
+        if self.starts_at.tzinfo is None:
+            raise ValueError("geographic starts_at must include a UTC offset")
+        if self.starts_at.utcoffset() != self.starts_at.astimezone(zone).utcoffset():
+            raise ValueError(
+                "geographic starts_at UTC offset must match its IANA timezone"
+            )
+        observations = expand_geographic_schedule(
+            self.timezone,
+            self.starts_at,
+            self.every_seconds,
+            self.duration_days,
+        )
+        if not observations:
+            raise ValueError("geographic recurrence produces no observations")
+        if len(observations) > 100:
+            raise ValueError("geographic recurrence cannot exceed 100 observations")
+        return self
+
+
+CacheResidencySchedule = Annotated[
+    Union[RelativeCacheResidencySchedule, GeographicCacheResidencySchedule],
+    Field(discriminator="kind"),
+]
+
+
+class CacheResidencyProtocolCreate(StrictModel):
+    """A bounded timetable dispatch chain anchored by one Prime."""
+
+    name: str = Field(min_length=1, max_length=200)
+    protocol: Literal["cache-residency/v1"] = "cache-residency/v1"
+    schedule: CacheResidencySchedule
+    mapping: Literal["one_to_one"] = "one_to_one"
+    chains: int = Field(default=1, ge=1, le=1_000)
+    seed: int = Field(default=11111, ge=0, le=2_147_483_647)
+    cold_control: bool = True
+    runner: BenchmarkRunnerSpec
+
+    @model_validator(mode="after")
+    def validate_sequence(self) -> "CacheResidencyProtocolCreate":
+        observation_count = (
+            len(self.schedule.offsets_seconds)
+            if isinstance(self.schedule, RelativeCacheResidencySchedule)
+            else len(
+                expand_geographic_schedule(
+                    self.schedule.timezone,
+                    self.schedule.starts_at,
+                    self.schedule.every_seconds,
+                    self.schedule.duration_days,
+                )
+            )
+        )
+        if observation_count * self.chains > 10_000:
+            raise ValueError(
+                "cache residency protocol cannot exceed 10000 observation points"
+            )
+        if self.runner.benchmark is not None:
+            benchmark = self.runner.benchmark
+            if benchmark.cache_probe is not None:
+                raise ValueError(
+                    "cache residency protocol runner cannot also define cache_probe"
+                )
+            if benchmark.protocol_request is not None:
+                raise ValueError(
+                    "protocol_request is backend-owned and cannot be submitted"
+                )
+        return self
+
+
+ProtocolDefinitionCreate = Annotated[
+    Union[CacheRetentionProtocolCreate, CacheResidencyProtocolCreate],
+    Field(discriminator="protocol"),
+]
+
+
 class RunnerPlanRecurrence(StrictModel):
     """Bounded interval or geographic-calendar recurrence."""
 
@@ -317,14 +509,45 @@ class BenchmarkCampaignStart(StrictModel):
     campaign: BenchmarkCampaignCreate
     runners: List[BenchmarkRunnerSpec] = Field(default_factory=list, max_length=100)
     runner_plans: List[RunnerPlanCreate] = Field(default_factory=list, max_length=100)
+    protocol_definitions: List[ProtocolDefinitionCreate] = Field(
+        default_factory=list, max_length=20
+    )
 
     @model_validator(mode="after")
     def validate_workload(self) -> "BenchmarkCampaignStart":
-        workload_size = len(self.runners) + len(self.runner_plans)
+        workload_size = (
+            len(self.runners) + len(self.runner_plans) + len(self.protocol_definitions)
+        )
         if workload_size == 0:
-            raise ValueError("campaign requires runners or runner_plans")
+            raise ValueError(
+                "campaign requires runners, runner_plans, or protocol_definitions"
+            )
         if workload_size > 100:
             raise ValueError("campaign workload cannot contain more than 100 items")
+        protocol_point_count = sum(
+            (
+                len(definition.delay_seconds) * definition.trials_per_delay
+                if isinstance(definition, CacheRetentionProtocolCreate)
+                else (
+                    len(definition.schedule.offsets_seconds)
+                    if isinstance(definition.schedule, RelativeCacheResidencySchedule)
+                    else len(
+                        expand_geographic_schedule(
+                            definition.schedule.timezone,
+                            definition.schedule.starts_at,
+                            definition.schedule.every_seconds,
+                            definition.schedule.duration_days,
+                        )
+                    )
+                )
+                * definition.chains
+            )
+            for definition in self.protocol_definitions
+        )
+        if protocol_point_count > 10_000:
+            raise ValueError(
+                "campaign protocols cannot exceed 10000 total observation points"
+            )
         return self
 
 

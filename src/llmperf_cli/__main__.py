@@ -302,7 +302,9 @@ def print_campaign_status(document: Dict[str, Any]) -> None:
         f"Status: {_table_value(campaign.get('status'))}  "
         f"Outcome: {_table_value(campaign.get('outcome'))}  "
         f"Runners: {_table_value(campaign.get('runner_count'), '0')}  "
-        f"RunnerPlans: {_table_value(campaign.get('runner_plan_count'), '0')}"
+        f"RunnerPlans: {_table_value(campaign.get('runner_plan_count'), '0')}  "
+        f"ProtocolInstances: {_table_value(campaign.get('protocol_instance_count'), '0')}  "
+        f"Dispatches: {_table_value(campaign.get('dispatch_count'), '0')}"
     )
     print(
         "Runner states: "
@@ -317,6 +319,24 @@ def print_campaign_status(document: Dict[str, Any]) -> None:
             + "  ".join(
                 f"{status}={_table_value(plan_counts.get(status), '0')}"
                 for status in ("active", "paused", "completed", "cancelled")
+            )
+        )
+    if campaign.get("protocol_instance_count"):
+        protocol_counts = campaign.get("protocol_instance_status_counts") or {}
+        print(
+            "Protocol instance states: "
+            + "  ".join(
+                f"{state}={_table_value(protocol_counts.get(state), '0')}"
+                for state in ("planned", "active", "completed", "failed", "cancelled")
+            )
+        )
+    if campaign.get("dispatch_count"):
+        dispatch_counts = campaign.get("dispatch_status_counts") or {}
+        print(
+            "Dispatch states: "
+            + "  ".join(
+                f"{state}={_table_value(dispatch_counts.get(state), '0')}"
+                for state in ("blocked", "pending", "emitted", "cancelled")
             )
         )
 
@@ -413,6 +433,95 @@ def print_runner_table(document: Dict[str, Any]) -> None:
     offset = document.get("offset", 0)
     limit = document.get("limit", len(items))
     print(f"\nShowing {len(items)} Runner(s) (offset={offset}, limit={limit}).")
+
+
+def print_runner_summary(document: Dict[str, Any]) -> None:
+    """Render one compact Runner outcome without dumping nested JSON."""
+
+    requests = document.get("requests") or {}
+    worker = document.get("worker") or {}
+    print(
+        f"Runner: {_table_value(document.get('runner_id'))}  "
+        f"Status: {_table_value(document.get('status'))}"
+    )
+    print(
+        f"Target: {_table_value(document.get('provider'))}/"
+        f"{_table_value(document.get('model'))}  "
+        f"Requests: started={_table_value(requests.get('started'))} "
+        f"completed={_table_value(requests.get('completed'))} "
+        f"failed={_table_value(requests.get('failed'))}"
+    )
+    print(
+        f"Scheduler: {_table_value(document.get('scheduler_id'))}  "
+        f"Worker: pid={_table_value(worker.get('process_id'))} "
+        f"exit_code={_table_value(worker.get('exit_code'))}"
+    )
+    error = document.get("error") or {}
+    message = error.get("message") or document.get("message")
+    if message:
+        print(f"Message: {_table_value(message)}")
+
+
+def print_runner_logs(document: Dict[str, Any]) -> None:
+    """Render persisted Worker streams with unambiguous stream boundaries."""
+
+    worker = document.get("worker") or {}
+    print(
+        f"Runner: {_table_value(document.get('runner_id'))}  "
+        f"Status: {_table_value(document.get('status'))}  "
+        f"Scheduler: {_table_value(document.get('scheduler_id'))}  "
+        f"Worker: pid={_table_value(worker.get('process_id'))} "
+        f"exit_code={_table_value(worker.get('exit_code'))}"
+    )
+    for stream in ("stdout", "stderr"):
+        content = document.get(stream)
+        print(f"\n[{stream}]")
+        if content:
+            sys.stdout.write(content)
+            if not content.endswith("\n"):
+                sys.stdout.write("\n")
+        else:
+            print("(empty)")
+
+
+def render_result(arguments: argparse.Namespace, result: Any) -> None:
+    """Apply the single CLI display policy after command execution completes."""
+
+    command = arguments.command
+    subcommand = getattr(arguments, f"{command}_command", None)
+    if (
+        command == "campaign"
+        and subcommand == "status"
+        and not arguments.json
+        and not arguments.full
+        and not arguments.include_requests
+    ):
+        print_campaign_status(result)
+        return
+    if command == "campaign" and subcommand == "list" and not arguments.json:
+        print_campaign_table(result)
+        return
+    if (
+        command == "runner"
+        and subcommand == "list"
+        and not arguments.json
+        and not arguments.full
+    ):
+        print_runner_table(result)
+        return
+    if command == "runner" and subcommand == "status" and arguments.summary:
+        print_runner_summary(result)
+        return
+    if command == "runner" and subcommand == "logs":
+        print_runner_logs(result)
+        return
+    if command == "campaign" and subcommand in {"start", "cancel", "export"}:
+        if not getattr(arguments, "full", False):
+            return
+    if command == "runner" and subcommand in {"start", "wait", "cancel", "export"}:
+        if not getattr(arguments, "full", False):
+            return
+    print_json(result)
 
 
 def summarize_runner(runner: Dict[str, Any]) -> Dict[str, Any]:
@@ -737,12 +846,17 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
         raise ClientError("campaign.start file must define campaign.name")
     runners = plan.get("runners", [])
     runner_plans = plan.get("runner_plans", [])
+    protocol_definitions = plan.get("protocol_definitions", [])
     if not isinstance(runners, list):
         raise ClientError("campaign.start runners must be a list")
     if not isinstance(runner_plans, list):
         raise ClientError("campaign.start runner_plans must be a list")
-    if not runners and not runner_plans:
-        raise ClientError("campaign.start requires runners or runner_plans")
+    if not isinstance(protocol_definitions, list):
+        raise ClientError("campaign.start protocol_definitions must be a list")
+    if not runners and not runner_plans and not protocol_definitions:
+        raise ClientError(
+            "campaign.start requires runners, runner_plans, or protocol_definitions"
+        )
     prepared_runners = []
     for index, runner in enumerate(runners):
         if not isinstance(runner, dict):
@@ -753,13 +867,21 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
         if not isinstance(runner_plan, dict):
             raise ClientError(f"plan.runner_plans[{index}] must be a mapping")
         prepared_plans.append(dict(runner_plan))
+    prepared_definitions = []
+    for index, definition in enumerate(protocol_definitions):
+        if not isinstance(definition, dict):
+            raise ClientError(f"plan.protocol_definitions[{index}] must be a mapping")
+        prepared_definitions.append(dict(definition))
     batch = submit_with_artifact_progress(
-        lambda: client.start_campaign(campaign_spec, prepared_runners, prepared_plans)
+        lambda: client.start_campaign(
+            campaign_spec, prepared_runners, prepared_plans, prepared_definitions
+        )
     )
     campaign_id = batch["campaign"]["campaign_id"]
     LOGGER.info("Campaign created: %s", campaign_id)
     created = batch["items"]
     created_plans = batch["runner_plans"]
+    created_definitions = batch.get("protocol_definitions", [])
     LOGGER.info("Submitted %d Runner(s) to Campaign %s", len(created), campaign_id)
     for runner in created:
         _log_runner_state(runner, 0)
@@ -770,10 +892,16 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
     )
     for runner_plan in created_plans:
         _log_plan_state(runner_plan, "registered")
+    LOGGER.info(
+        "Registered %d protocol definition(s) in Campaign %s",
+        len(created_definitions),
+        campaign_id,
+    )
     result: Dict[str, Any] = {
         "campaign_id": campaign_id,
         "runners": created,
         "runner_plans": created_plans,
+        "protocol_definitions": created_definitions,
     }
     should_wait = arguments.wait or bool(plan.get("wait"))
     if should_wait:
@@ -786,13 +914,9 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
             initial_plans=created_plans,
             initial_runners=created,
         )
-        completed_document = client.export_campaign(campaign_id)
-        completed_runners = completed_document["runners"]
-        result["completed"] = (
-            completed_runners
-            if getattr(arguments, "full", False)
-            else [summarize_runner(runner) for runner in completed_runners]
-        )
+        if getattr(arguments, "full", False):
+            completed_document = client.export_campaign(campaign_id)
+            result["completed"] = completed_document["runners"]
     output = arguments.output or plan.get("export")
     if output:
         if not should_wait:
@@ -1002,7 +1126,10 @@ Examples:
         "preview",
         help="Preview RunnerPlan occurrence times",
         description="Validate a RunnerPlan YAML file and preview its occurrence times.",
-        epilog="Example:\n  llmperfctl planner preview -f runner-plan.yaml",
+        epilog=(
+            "Example:\n  llmperfctl planner preview "
+            "-f examples/example-runner-plan.yaml"
+        ),
     )
     planner_preview.add_argument("-f", "--file", required=True, help="RunnerPlan YAML")
     planner_create = _command_parser(
@@ -1011,7 +1138,8 @@ Examples:
         help="Create a RunnerPlan",
         description="Create a bounded RunnerPlan within an existing Campaign.",
         epilog=(
-            "Example:\n  llmperfctl planner create <campaign-id> " "-f runner-plan.yaml"
+            "Example:\n  llmperfctl planner create <campaign-id> "
+            "-f examples/example-runner-plan.yaml"
         ),
     )
     planner_create.add_argument("campaign_id", metavar="CAMPAIGN_ID")
@@ -1193,7 +1321,7 @@ Examples:
   llmperfctl campaign list
   llmperfctl campaign export <campaign-id> -o results.json
 
-See examples/glm-campaign.yaml for the Campaign YAML shape.
+See examples/example-campaign.yaml for the Campaign YAML shape.
 """,
     )
     campaign_commands = campaign.add_subparsers(
@@ -1212,7 +1340,7 @@ See examples/glm-campaign.yaml for the Campaign YAML shape.
         ),
         epilog="""\
 Examples:
-  llmperfctl campaign start -f examples/glm-campaign.yaml
+  llmperfctl campaign start -f examples/example-campaign.yaml
   llmperfctl campaign start -f campaign.yaml --wait -o results.json
 """,
     )
@@ -1385,7 +1513,7 @@ Use "llmperfctl runner <command> --help" for command-specific options.
         ),
         epilog="""\
 Examples:
-  llmperfctl runner start -f examples/glm-smoke.yaml
+  llmperfctl runner start -f examples/example-smoke.yaml
   llmperfctl runner start -f runner.yaml --label smoke --wait
   llmperfctl runner start -f runner.yaml --campaign-id <campaign-id>
 """,
@@ -1782,15 +1910,7 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
                 full_output=arguments.full,
             )
         if arguments.runner_command == "logs":
-            runner = client.get_runner(arguments.runner_id)
-            return {
-                "runner_id": runner["runner_id"],
-                "status": runner["status"],
-                "scheduler_id": runner.get("scheduler_id"),
-                "worker": runner.get("worker"),
-                "stdout": runner.get("stdout"),
-                "stderr": runner.get("stderr"),
-            }
+            return client.get_runner_logs(arguments.runner_id)
         document = client.export_runner(arguments.runner_id)
         write_json(Path(arguments.output), document)
         LOGGER.info("Exported Runner %s to %s", arguments.runner_id, arguments.output)
@@ -1864,29 +1984,7 @@ def main() -> None:
             str(environment_path) if environment_path is not None else "none",
         )
         result = execute(client, arguments)
-        if (
-            arguments.command == "campaign"
-            and arguments.campaign_command == "status"
-            and not arguments.json
-            and not arguments.full
-            and not arguments.include_requests
-        ):
-            print_campaign_status(result)
-        elif (
-            arguments.command == "campaign"
-            and arguments.campaign_command == "list"
-            and not arguments.json
-        ):
-            print_campaign_table(result)
-        elif (
-            arguments.command == "runner"
-            and arguments.runner_command == "list"
-            and not arguments.json
-            and not arguments.full
-        ):
-            print_runner_table(result)
-        else:
-            print_json(result)
+        render_result(arguments, result)
         if _has_unsuccessful_runner(result):
             raise SystemExit(2)
     except ClientError as exc:

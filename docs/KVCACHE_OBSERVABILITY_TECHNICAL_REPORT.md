@@ -143,7 +143,7 @@ prime 成功 ──> 释放 warm-1 ──> 释放 warm-2
      └─ 失败 ──> 跳过该 family 后续请求
 ```
 
-不同 family 可以并行执行，从而保留负载能力；family 内部必须保持因果顺序。P0 的 Delay 限制在 60 秒内，由同一 Worker 内存计时器完成。更长的 TTL 实验需要 P1 持久化阶段调度，不能占用 Worker 等待数小时。
+不同 family 可以并行执行，从而保留负载能力；family 内部必须保持因果顺序。P0 的单 Runner Delay 限制在 60 秒内，由同一 Worker 内存计时器完成。更长的 TTL 使用已实现的 `cache-retention/v1` Campaign 协议：建图时持久化完整 Dispatch 依赖，Prime 提交后写入 Protocol Instance checkpoint 并解锁到期后继，Planner 只从统一 Dispatch 队列物化 Warm/Cold-Control Runner，不占用 Worker 等待数小时。
 
 ### 5.4 分阶段实验
 
@@ -155,7 +155,7 @@ prime 成功 ──> 释放 warm-1 ──> 释放 warm-2
 4. 生命周期测试：改变 prime 到 warm 的间隔，估计外部可见复用窗口。
 5. 容量与淘汰测试：插入不同规模的干扰 Prompt，观察命中与延迟衰减。
 
-第 4、5 阶段属于 P1；P0 只覆盖同一 Runner、同一 Worker 内的短间隔实验。
+第 4 阶段已有跨 Runner 独立实例 delay sweep 支持；第 5 阶段的显式干扰流量、容量填充与淘汰模型仍属于后续工作。P0 仍只覆盖同一 Runner、同一 Worker 内的短间隔实验。
 
 ## 6. 指标与计算口径
 
@@ -239,7 +239,7 @@ P0 明确区分：
 | P0 需求 | 当前实现 | 关键文件 |
 |---|---|---|
 | Request-plan builder | 不可变 `CacheProbeRequest`；确定性 family 计划；Token 精确突变；Prompt Hash | `src/llmperf/cache_probe.py` |
-| Paired workload | `DependentPlanQueue`；prime 成功后释放 warm；失败跳过依赖；family 间并行 | `src/llmperf/cache_probe.py`, `token_benchmark_ray.py` |
+| Paired workload | `DependentPlanQueue`；prime 成功后释放 warm；失败跳过依赖；family 间并行 | `src/llmperf/cache_probe.py`, `src/llmperf/token_benchmark_ray.py` |
 | Complete usage normalization | 从每个 SSE 文档提取 Usage；归一化多种兼容格式；保存 Raw Usage 与校验状态 | `src/llmperf/usage.py`, OpenAI Client |
 | Correct aggregation | 缺失值不补零；完整分母、覆盖率、角色拆分和非法计数 | `src/llmperf/cache_analysis.py` |
 | Paired statistics | family 内 prime/warm 配对；Delta、Speedup、Bootstrap CI 与 Verdict | `src/llmperf/cache_analysis.py` |
@@ -365,9 +365,36 @@ INDEX  (provider_request_id) WHERE provider_request_id IS NOT NULL
 
 如果未来需要大规模时序分析，Inter-SSE Chunk 数据应进入独立明细表或列式存储，而不是在主请求表持续增加宽列。
 
-### 8.4 P1 Runner Planner 派发层
+### 8.4 跨 Runner Cache Retention 派发层
 
-分钟级或小时级 TTL 实验不应让一个 Worker 常驻等待。P1 将 RunnerPlan 独立持久化：RunnerPlan 保存地理时区、周期规则、下一次触发时间和不可变 Runner 模板；Planner 负责把到期计划物化为普通、一次性的 queued Runner；Scheduler 仍然只负责领取 Runner 和监管 Worker。
+分钟级或小时级 TTL 实验不让一个 Worker 常驻等待。Campaign 的 Cache Retention Definition 为每个 `delay × trial` 创建独立 Protocol Instance，并把完整执行图预装载为 Durable Dispatch：Prime 初始为 `pending`，Warm 和可选 Cold-Control 初始为 `blocked`。后继 Dispatch 的 `parent_dispatch_id` 是指向父调用 Dispatch UUID 的自引用外键，并有独立索引；Prompt Hash 仅用于验证 Prime/Warm 载荷一致，不参与因果链寻址。
+
+Planner 不查询或解释 Protocol Instance，只锁定 `pending AND due_at <= now()` 的通用 Dispatch 并物化普通、一次性的 queued Runner。Prime Runner 完成时通过唯一的 `dispatch.runner_id` 找回来源 Dispatch，在同一个 PostgreSQL 事务中把 Prompt Hash 和 UTC 锚点写入实例 checkpoint，再按 `parent_dispatch_id` 把直接子调用从 `blocked` 原子更新为 `pending`。Prime 失败则取消同一组直接子调用。Scheduler 仍然只负责领取 Runner 和监管 Worker。
+
+每个 `delay × trial` 对应一个 `cache-retention/v1` Protocol Instance，避免短 delay 的 Warm 刷新长 delay 样本。实验参数保存在 `spec`，Prompt Hash 与 Prime 锚点保存在 `checkpoint`，实际延迟保存在 `outcome`；Runner ID、阶段状态与到期时间由 Dispatch/Runner 直接提供，不再重复列化。Campaign 生命周期聚合实例状态，因此 Prime 完成但 Warm 尚未到期时仍为 `planned`。
+
+### 8.5 单 Prime 连续驻留协议
+
+`cache-residency/v1` 面向长会话、Agent 周期访问和按小时段观察的工程场景。协议插件
+将一个 Prime Runner 编译为多个独立 Prompt 的 bundle，并为每个后续 Warm 预编译稳定
+mapping key。运行期只按 key 校验 Prompt Hash，不再推导 Warm 与 Prime 的位置关系。
+该结果描述访问条件下的驻留状态，因此不能替代 `cache-retention/v1` 的被动失效曲线。
+
+时间表显式区分两种语义：
+
+- `relative`：观测点是 Prime 实际完成后的秒数；
+- `geographic`：从带 UTC offset 且与 IANA timezone 一致的 `starts_at` 开始，按
+  `every_seconds` 外推 `duration_days` 个当地日。
+
+地理时间表解决跨天不同业务小时段的派发问题；三天每小时一次会展开为 72 个触发点。
+分析横轴仍使用 Warm 开始时间减整个 Prime bundle 实际完成时间。导出同时保存计划
+绝对时刻、计划 offset 与实际 delay。Prime
+或前置阶段晚于计划点时，子 Dispatch 在依赖完成后作为 overdue work 立即物化，实际
+偏差不会被计划时间覆盖。
+
+每个观测点的 Cold Control 使用独立 seed，避免控制请求在后续小时段命中自身缓存；
+Warm/Control 顺序按 seed 确定性随机。任一阶段失败会取消仍为 blocked/pending 的后继，
+保证 Campaign 不会遗留永远无法释放的调用。
 
 Planner 不占 Runner Slot。多 Planner 通过 PostgreSQL 行锁、原子事务和 `(runner_plan_id, plan_occurrence)` 唯一约束实现幂等。及时到达的 occurrence 即使前一轮仍在执行也会继续入队；等待、停机恢复、Misfire、Overlap 和 DST 规则详见[《LLMPerf Runner Planner 架构与实现》](RUNNER_PLANNER_ARCHITECTURE.zh-CN.md)。
 
@@ -383,7 +410,7 @@ Planner 不占 Runner Slot。多 Planner 通过 PostgreSQL 行锁、原子事务
 6. Scheduler 保存有限日志、退出码并释放槽位；
 7. Backend 关闭时停止领取、终止受管 Worker，并由恢复逻辑处理过期 Runner。
 
-P0 的依赖队列存在于 Worker 内部，不改变全局 Scheduler 的 Runner 粒度。这个边界适合几十秒内的 prime/warm 实验，但不适合长 TTL；后者应由 Planner 根据有界 RunnerPlan 定时产生一次性 Runner，而不是扩大 Worker 生命周期。
+P0 的依赖队列存在于 Worker 内部，不改变全局 Scheduler 的 Runner 粒度，适合几十秒内的 prime/warm 实验。长 TTL 由 Prime 完成事务给依赖 Dispatch 写入 `warm_due_at`，再由 Planner 的统一 Dispatch 查询产生一次性 Runner；普通 RunnerPlan 也先编译到同一 Dispatch 协议，只负责日历/周期触发，不承担 Prime/Warm 信息交换。
 
 ## 10. Provider 协议兼容策略
 
@@ -410,7 +437,6 @@ P0 的依赖队列存在于 Worker 内部，不改变全局 Scheduler 的 Runner
 
 ### 11.1 P1：缓存与队列动态
 
-- 有界 Runner 派发模板与到期领取；
 - 前缀长度和突变位置 Sweep；
 - 干扰流量、容量压力和淘汰曲线；
 - 路由亲和性、实例命中差异与 Header 关联；

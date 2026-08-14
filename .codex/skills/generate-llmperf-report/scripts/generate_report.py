@@ -155,13 +155,19 @@ def classify_diagnostic(runner: Mapping[str, Any], info: Mapping[str, Any]) -> s
 
 
 def normalize_document(document: Mapping[str, Any]) -> Dict[str, Any]:
-    if document.get("version") == 3 and isinstance(document.get("runners"), list):
+    if document.get("version") == 5 and isinstance(document.get("runners"), list):
         return {
             "kind": "campaign",
-            "version": 3,
+            "version": document["version"],
             "meta": dict(document.get("campaign") or {}),
             "aggregate": dict(document.get("aggregate") or {}),
             "runner_plans": list(document.get("runner_plans") or []),
+            "protocol_definitions": list(
+                document.get("protocol_definitions") or []
+            ),
+            "protocol_instances": list(document.get("protocol_instances") or []),
+            "dispatches": list(document.get("dispatches") or []),
+            "protocol_analyses": list(document.get("protocol_analyses") or []),
             "runners": [dict(item) for item in document["runners"] if isinstance(item, Mapping)],
         }
     if document.get("version") == 1 and isinstance(document.get("runner"), Mapping):
@@ -190,7 +196,7 @@ def normalize_document(document: Mapping[str, Any]) -> Dict[str, Any]:
             "runners": [runner],
         }
     raise ValueError(
-        "Unsupported JSON: expected Campaign export version 3 or Runner export version 1"
+        "Unsupported JSON: expected Campaign export version 5 or Runner export version 1"
     )
 
 

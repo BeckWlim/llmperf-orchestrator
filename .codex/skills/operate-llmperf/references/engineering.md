@@ -4,15 +4,18 @@
 
 - `src/llmperf_backend/models.py`：API/YAML 严格模型与配置约束。
 - `src/llmperf_backend/persistence.py`：PostgreSQL 事务、队列、状态聚合与导出。
-- `src/llmperf_backend/planner.py`：扫描到期 RunnerPlan 并物化 Runner。
+- `src/llmperf_backend/planner.py`：驱动 RunnerPlan 编译，并从统一 Durable Dispatch 物化 Runner。
 - `src/llmperf_backend/scheduler.py`：竞争 queued Runner、管理 slot 与 Worker。
-- `src/llmperf_backend/worker.py`：调用原有 `token_benchmark_ray.py` 并持久化结果。
+- `src/llmperf_backend/worker.py`：调用 `llmperf.token_benchmark_ray` 并持久化结果。
 - `src/llmperf_cli/__main__.py`：命令解析、等待轮询、日志和显示。
 - `src/llmperf_cli/client.py`：HTTP 边界、认证重试和 JSON 序列化。
 - `src/llmperf/cache_probe.py`、`usage.py`、`cache_analysis.py`：KV Cache P0。
 
-保持 Planner 与 Scheduler 分工：Planner 只生产数据库中的 Runner；Scheduler 只消费
+保持 Planner 与 Scheduler 分工：RunnerPlan 和依赖实验先编译到统一 Durable Dispatch；
+Planner 只消费到期的 `pending` Dispatch 并生产数据库中的 Runner，Scheduler 只消费
 queued Runner。不要让等待时间占 Worker slot，不要从 CLI 直接计算周期或访问数据库。
+跨 Runner 因果链使用 `parent_dispatch_id` 自引用 UUID 与索引寻址；Prompt Hash 只校验
+实验载荷一致性，不得充当调度键。Planner 不读取父调用字段，只消费可用 Dispatch。
 
 ## 2. 数据持久化
 
@@ -74,6 +77,12 @@ export LLMPERF_TEST_DB='postgresql+asyncpg:///llmperf_test'
 ## 5. 示例与文档规范
 
 - `examples/` 是可运行操作示例，不是测试脚本目录。
+- 文件名统一采用 `example-<主要功能>.yaml`，必须以 `example` 开头，名称简洁，
+  整个文件名最多包含三个 `-`。
+- 示例默认配置必须在 Provider 可用时立即启动并快速得到结果。RunnerPlan、TTL 等
+  周期能力应使用秒级、有界的默认值；地理时间能力的操作示例默认使用秒级相对时间表，
+  把绝对地理时间表作为扩展说明。真实长周期参数只在注释或文档中说明，不得让用户
+  为了验证示例等待数小时或数天。
 - 当前示例基准使用 Provider `aliyun`、Model `deepseek-v4-pro`。
 - 密钥只出现在环境或 `llmperf-backend config set ... --stdin`，不得提交到示例。
 - 修改 YAML/API/状态语义时同步 README、`docs/ARCHITECTURE.md` 和相关中文技术报告。

@@ -364,20 +364,74 @@ def create_app(
             await resolve_plan(request, runner_plan, default_benchmark)
             for runner_plan in payload.runner_plans
         ]
+        protocol_definitions = []
+        for definition in payload.protocol_definitions:
+            runner = await resolve_runner(request, definition.runner, default_benchmark)
+            benchmark = runner["benchmark"]
+            if benchmark.get("cache_probe") is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="cache protocol runner cannot define cache_probe",
+                )
+            if benchmark.get("protocol_request") is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="protocol_request is backend-owned and cannot be submitted",
+                )
+            if benchmark.get("dataset") is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="cache protocols require generated deterministic prompts",
+                )
+            if benchmark.get("llm_api") != "openai":
+                raise HTTPException(
+                    status_code=422,
+                    detail="cache protocols currently require llm_api=openai",
+                )
+            if int(benchmark.get("stddev_input_tokens", 0)) != 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail="cache protocols require stddev_input_tokens=0",
+                )
+            if int(benchmark.get("stddev_output_tokens", 0)) != 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail="cache protocols require stddev_output_tokens=0",
+                )
+            tokenizer = benchmark.get("tokenizer") or {}
+            if (
+                not tokenizer.get("immutable_revision")
+                or tokenizer.get("accuracy") == "approximate"
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "cache protocol requires an explicit/model-bound "
+                        "tokenizer at an immutable Hugging Face revision"
+                    ),
+                )
+            protocol_definitions.append(
+                {
+                    "definition": dump_model(definition),
+                    "runner_template": runner,
+                }
+            )
         workload = await request.app.state.runner_repository.create_campaign_workload(
             payload.campaign.name,
             payload.campaign.description,
             payload.campaign.tags,
             runners,
             runner_plans,
+            protocol_definitions,
             actor,
         )
         campaign_id = workload["campaign"]["campaign_id"]
         LOGGER.info(
-            "Campaign %s workload accepted: runners=%d runner_plans=%d",
+            "Campaign %s workload accepted: runners=%d runner_plans=%d protocol_definitions=%d",
             campaign_id,
             len(workload["items"]),
             len(workload["runner_plans"]),
+            len(workload["protocol_definitions"]),
         )
         for runner_plan in workload["runner_plans"]:
             LOGGER.info(
@@ -636,6 +690,22 @@ def create_app(
         if runner is None:
             raise HTTPException(status_code=404, detail="Runner not found")
         return runner
+
+    @api.get("/runners/{runner_id}/logs", tags=["runners"])
+    async def get_runner_logs(request: Request, runner_id: str) -> Dict[str, Any]:
+        """Return only the persisted Worker identity and captured output."""
+
+        runner = await request.app.state.runner_repository.get_runner(runner_id)
+        if runner is None:
+            raise HTTPException(status_code=404, detail="Runner not found")
+        return {
+            "runner_id": runner["runner_id"],
+            "status": runner["status"],
+            "scheduler_id": runner.get("scheduler_id"),
+            "worker": runner.get("worker"),
+            "stdout": runner.get("stdout"),
+            "stderr": runner.get("stderr"),
+        }
 
     @api.post("/runners/{runner_id}/cancel", tags=["runners"])
     async def cancel_runner(request: Request, runner_id: str) -> Dict[str, Any]:

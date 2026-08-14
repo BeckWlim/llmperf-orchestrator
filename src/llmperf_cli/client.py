@@ -202,6 +202,7 @@ class LLMPerfClient:
         campaign: Dict[str, Any],
         runners: List[Dict[str, Any]],
         runner_plans: List[Dict[str, Any]],
+        protocol_definitions: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         return self._request(
             "POST",
@@ -210,6 +211,7 @@ class LLMPerfClient:
                 "campaign": campaign,
                 "runners": runners,
                 "runner_plans": runner_plans,
+                "protocol_definitions": protocol_definitions or [],
             },
         )
 
@@ -273,6 +275,13 @@ class LLMPerfClient:
     def get_runner(self, runner_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/api/v1/runners/{runner_id}")
 
+    def get_runner_logs(self, runner_id: str) -> Dict[str, Any]:
+        """Return the stable log projection from the dedicated Backend API."""
+
+        return _validate_runner_logs(
+            self._request("GET", f"/api/v1/runners/{runner_id}/logs"), runner_id
+        )
+
     def cancel_runner(self, runner_id: str) -> Dict[str, Any]:
         return self._request("POST", f"/api/v1/runners/{runner_id}/cancel")
 
@@ -327,3 +336,30 @@ def write_json(path: Path, document: Any) -> None:
         json.dumps(document, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _validate_runner_logs(document: Any, runner_id: str) -> Dict[str, Any]:
+    """Validate the dedicated Runner log response contract."""
+
+    if not isinstance(document, dict):
+        raise ClientError("Runner logs response must be an object")
+    required = {"runner_id", "status", "stdout", "stderr"}
+    missing = sorted(required.difference(document))
+    if missing:
+        raise ClientError(
+            "Runner logs response is missing required fields: " + ", ".join(missing)
+        )
+    if str(document["runner_id"]) != runner_id:
+        raise ClientError("Runner logs response does not match the requested Runner")
+    for stream in ("stdout", "stderr"):
+        value = document[stream]
+        if value is not None and not isinstance(value, str):
+            raise ClientError(f"Runner logs {stream} must be text or null")
+    return {
+        "runner_id": document["runner_id"],
+        "status": document["status"],
+        "scheduler_id": document.get("scheduler_id"),
+        "worker": document.get("worker"),
+        "stdout": document.get("stdout"),
+        "stderr": document.get("stderr"),
+    }

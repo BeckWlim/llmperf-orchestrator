@@ -1,0 +1,41 @@
+campaign:
+  name: example-campaign
+  description: Run two small benchmark configurations in one durable Campaign.
+  tags:
+    provider: aliyun
+    model: deepseek-v4-pro
+
+wait: true
+
+runners:
+  - label: example-serial
+    metadata:
+      purpose: serial-baseline
+    benchmark:
+      provider: aliyun
+      model: deepseek-v4-pro
+      timeout_seconds: 60
+      max_completed_requests: 2
+      concurrent_requests: 1
+      mean_input_tokens: 128
+      stddev_input_tokens: 0
+      mean_output_tokens: 16
+      stddev_output_tokens: 0
+      additional_sampling_params:
+        temperature: 0
+
+  - label: example-parallel
+    metadata:
+      purpose: parallel-comparison
+    benchmark:
+      provider: aliyun
+      model: deepseek-v4-pro
+      timeout_seconds: 60
+      max_completed_requests: 2
+      concurrent_requests: 2
+      mean_input_tokens: 128
+      stddev_input_tokens: 0
+      mean_output_tokens: 16
+      stddev_output_tokens: 0
+      additional_sampling_params:
+        temperature: 0

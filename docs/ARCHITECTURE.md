@@ -35,7 +35,7 @@ llmperf/
 │   └── llmperf_cli/
 │       ├── client.py            # 仅使用 HTTP 的轻量客户端
 │       └── __main__.py          # llmperfctl 命令入口
-├── examples/glm-campaign.yaml   # 多运行编排示例
+├── examples/example-campaign.yaml # 多运行编排示例
 └── tests/                        # 配置、API、仓储与 Runner 测试
 ```
 
@@ -68,7 +68,7 @@ API、Scheduler、Runner 和 Worker 是四个不同边界：
 
 ### Campaign
 
-`campaign_id` 表示一次完整调研或实验批次，例如“GLM-4 不同并发度下的 KVCache 调研”。它保存名称、说明和标签，并关联多次 Runner。
+`campaign_id` 表示一次完整调研或实验批次，例如“DeepSeek 跨小时 KV Cache 保留曲线”。它保存名称、说明和标签，并关联即时 Runner、RunnerPlan，以及需要跨 Runner 交换状态的 Protocol Definition/Instance。
 
 ### Runner
 
@@ -85,6 +85,9 @@ API、Scheduler、Runner 和 Worker 是四个不同边界：
 | 表 | 作用 | 关键字段 |
 |---|---|---|
 | `benchmark_campaigns` | 多次运行的实验分组 | `id`, `name`, `description`, `tags`, `created_at` |
+| `benchmark_protocol_definitions` | Campaign 级高级协议定义与不可变 Runner 模板 | `id`, `campaign_id`, `protocol`, `config`, `runner_template` |
+| `benchmark_protocol_instances` | 通用协议状态机实例 | definition, protocol, instance key, state, spec/checkpoint/outcome |
+| `benchmark_runner_dispatches` | RunnerPlan 与协议实例共用的持久派发协议 | typed owner, role/key, `parent_dispatch_id`, blocked/pending/emitted, `due_at`, template |
 | `benchmark_runners` | 单次运行及状态机 | `id`, `campaign_id`, `label`, `status`, `benchmark_config`, timestamps, heartbeat, process/log/error, `summary` |
 | `benchmark_request_results` | 每个 LLM 请求的原始指标 | `runner_id`, `sequence`, `metrics` |
 | `benchmark_runner_events` | 状态变化审计记录 | `runner_id`, `status`, `message`, `created_at` |
@@ -202,6 +205,7 @@ Worker 退出码只表示执行进程是否正常。业务完成状态还检查�
 
 ```http
 GET /api/v1/runners/{runner_id}/export
+GET /api/v1/runners/{runner_id}/logs
 ```
 
 只允许导出 `succeeded` 的 Runner，文件包含固定运行配置、元数据、summary 和逐请求指标。
@@ -218,6 +222,8 @@ GET /api/v1/campaigns/{campaign_id}/export?include_requests=true
 - Runner 总数及各状态数量。
 - 所有已完成请求数量。
 - 每个 Runner 的标签、配置、状态、summary 和错误信息。
+- Cache Retention 协议定义、逐实例 checkpoint/outcome 和按 delay 聚合的 Provider
+  命中概率、Token 命中率及 Prime/Warm/Cold-Control TTFT 差。
 
 `include_requests=true` 才附带各 Runner 的逐请求指标，以避免大 Campaign 默认生成过大的文件。
 
@@ -302,29 +308,64 @@ systemd service 是否继承系统代理设置；进程级 `HTTP_PROXY`、`HTTPS
 Runner 未声明 tokenizer 时使用 backend 默认的
 `hf-internal-testing/llama-tokenizer`，并经过同一解析与缓存流程。
 
-等待命令默认返回不含 stdout/stderr 的紧凑摘要，包括 Provider、Model、请求成功/
-失败数与首个错误；`--full` 才输出完整 Runner。失败或取消时 CLI 进程返回退出码 2，
-适合脚本和 CI 判断。轮询期间会在状态变化时打印 `queued/running/终态`，避免长任务
-静默看似卡死。`--timeout` 只终止本地等待，不取消已经持久化的任务；任务可继续用
+启动、等待、取消和导出命令默认不向 stdout 倾倒 Backend JSON；轮询期间只在状态变化
+时向 stderr 打印 `queued/running/终态`。展示与查询统一由 CLI 最终渲染层处理：
+`status --summary/list` 使用紧凑视图，`runner logs` 只调用专用日志投影接口并明确分隔 Worker
+stdout/stderr，`--full` 才显示完整 Runner。失败或取消时 CLI 进程返回退出码 2，适合
+脚本和 CI 判断。`--timeout` 只终止本地等待，不取消已经持久化的任务；任务可继续用
 Runner ID 查询。Benchmark 的 `timeout_seconds` 会继续传递为模型 HTTP 请求时限。
 
 完整 Campaign 编排：
 
 ```bash
 llmperfctl campaign start \
-  -f examples/glm-campaign.yaml \
+  -f examples/example-campaign.yaml \
   --wait \
   -o result_outputs/glm-study.json
 ```
 
-CLI 创建 Campaign 后，通过一个批量接口在服务端事务中上传所有 Runners：全部入队成功或全部失败。随后 CLI 轮询最终状态，并请求数据库驱动的总结导出。CLI 进程退出不会造成任务丢失，因为任务已经持久化在 PostgreSQL 中。
+CLI 创建 Campaign 后，通过一个批量接口在服务端事务中上传所有即时 Runner、
+RunnerPlan 和 Protocol Definition：全部接受或全部失败。Cache Retention 定义为每个
+`delay × trial` 建立独立 Protocol Instance，并预装载 Prime `pending` 与 Warm/Control `blocked`
+Dispatch。Prime 成功提交结果时在同一事务中发布 Prompt Hash、UTC 锚点和
+`warm_due_at`，并把直接子 Dispatch 解锁为 `pending`。Planner 只查询通用的到期 Dispatch
+并物化普通 Runner，不查询或解释 Protocol Instance；长时间等待不占 Scheduler slot 或 Worker。CLI 进程退出不会造成
+任务丢失，因为任务已经持久化在 PostgreSQL 中。
 
 Campaign 聚合状态分为两个正交维度。`status` 只表达派发生命周期：
 `planned/queued/running/paused/completed/cancelled`；`outcome` 表达 Runner
 结果：`pending/succeeded/partial_failed/failed/cancelled/no_runs`。因此某一轮
 失败不会把已经完成派发的 Campaign 生命周期标成 `failed`。例如 8 轮中 7 轮成功、
 1 轮失败时返回 `status=completed, outcome=partial_failed`。这两个字段由 Runner 与
-RunnerPlan 的持久化状态实时聚合，无需在 Campaign 表中维护容易失真的重复状态。
+RunnerPlan recurrence 和 Protocol Instance 父子调用都编译到同一个 Durable Dispatch
+协议。前者推进 occurrence cursor，后者由父调用完成事件解锁子调用；Planner 只执行
+`pending && due_at <= now` 的幂等物化。RunnerPlan、Dispatch 与 Protocol Instance 的持久化状态实时聚合；处于 `active` 等待期的实例会让
+Campaign 保持 `planned`，不会在 Warm 物化前误报完成。
+
+Cache Retention Sweep 使用 `cache-retention/v1` 协议。每个 delay 点使用独立 Prompt
+family，避免较早 Warm 刷新较晚 TTL 样本；Prime/Warm 的 Prompt SHA-256 必须一致。
+导出横轴同时保留计划 delay 和由跨进程 UTC 时间计算的实际 delay。Cold Control 使用
+独立 seed，并按实例确定性随机化 Warm/Control 顺序，用于降低长时间跨度上的负载漂移。
+
+连续观测使用 `cache-residency/v1` 协议插件。插件先把时间表编译成稳定 mapping keys，
+再生成一个包含多个独立请求的 Prime bundle，以及一条严格串行的
+`Prime -> Observation-0 -> ... -> Observation-N` 派生调用链。每个 Warm 在模板中直接
+携带与 Prime 请求相同的 mapping key；运行时只校验 key 对应的 Prompt Hash，不计算
+位置索引。每个观测点的 Cold Control 使用独立 Prompt。
+
+协议支持两种有界时间表：`relative` 以 Prime bundle 实际完成时间加 offsets 计算
+`due_at`；`geographic` 使用 `timezone + starts_at + every_seconds + duration_days` 展开
+绝对触发时间。例如三天、每小时一次会在提交事务中展开为 72 个观测点。地理时间控制
+在哪个业务小时段触发，缓存年龄仍从 Prime bundle 实际完成时间计算。
+
+协议插件位于 `llmperf_backend.protocols`，通过注册表按协议名选择纯编译器；Repository
+只把通用 Instance/Dispatch Blueprint 写入 PostgreSQL。所有后继 Dispatch 在 Campaign
+创建事务中预装载并通过 `parent_dispatch_id` 串联。
+Prime 完成事务发布 Prompt Hash 和时间锚点、计算相对时间表的 `due_at`，并只解锁直接
+子调用；每个后继成功后以相同方式解锁下一阶段。失败会取消尚未派发的后继。Planner
+仍然只消费 `pending && due_at <= now()`，不会识别时间表类型、Prime、Warm 或 Control。
+该协议的分析结论明确标记为 `access_conditioned_residency`，不得与无中间访问的被动
+TTL 曲线合并。
 
 查询后端已配置的供应商及其模型目录：
 
@@ -534,7 +575,7 @@ CLI：
 ```bash
 export LLMPERF_PRIVATE_KEY=~/.config/llmperf/keys/ctl-private.pem
 llmperfctl health
-llmperfctl campaign start -f examples/glm-campaign.yaml --wait
+llmperfctl campaign start -f examples/example-campaign.yaml --wait
 ```
 
 `issuer` 和 `audience` 如有修改，CLI 的 `LLMPERF_AUTH_ISSUER` 与 `LLMPERF_AUTH_AUDIENCE` 必须保持一致。

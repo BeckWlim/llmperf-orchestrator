@@ -1,17 +1,19 @@
 ---
 name: operate-llmperf
-description: "Configure, operate, diagnose, and modify this LLMPerf project. Use when working with llmperfctl commands, Runner or Campaign YAML, bounded RunnerPlans and geographic-time scheduling, Provider Profiles, tokenizer or dataset resolution, KV-cache probes, Campaign lifecycle/outcome interpretation, Scheduler/Planner/Worker behavior, exports, logs, PostgreSQL persistence, or repository tests and implementation conventions."
+description: "Turn benchmark requirements into safe, runnable LLMPerf workloads and operate this project end to end. Use when Codex needs to create or review Runner/Campaign YAML, select or configure Backend Provider Profiles, verify models and credentials, run smoke/load/KV-cache/retention/residency tests, operate llmperfctl, diagnose Runner or Campaign failures, interpret or export results, or modify Scheduler/Planner/Worker/PostgreSQL implementation."
 ---
 
 # Operate LLMPerf
 
-Use the repository's durable execution model consistently when authoring workloads,
-running commands, diagnosing failures, or changing implementation.
+Translate the user's measurement goal into the smallest bounded workload that can
+answer it, prove the Provider with a smoke request, then scale deliberately.
 
 ## Load the relevant reference
 
 - Read [references/yaml.md](references/yaml.md) completely before creating,
   reviewing, or changing Runner/Campaign/RunnerPlan YAML.
+- Read [references/provider.md](references/provider.md) completely before checking,
+  creating, changing, or diagnosing a Provider Profile or model selection.
 - Read [references/cli.md](references/cli.md) completely before operating the
   Backend or CLI, diagnosing a run, interpreting status, or exporting results.
 - Read [references/engineering.md](references/engineering.md) completely before
@@ -35,21 +37,76 @@ Apply these invariants:
 6. Distinguish Campaign lifecycle `status` from aggregate execution `outcome`.
    Never infer that `completed` means every Runner succeeded.
 
-## Follow the task workflow
+## Translate requirements into a workload
+
+Establish these facts from the request or local context:
+
+- measurement: availability, latency/throughput, concurrency comparison, scheduled
+  repetition, exact-repeat cache, passive retention, or access-conditioned residency;
+- target: Provider Profile ID and exact model ID;
+- scale: input/output token distributions, concurrency, request/trial count, delays,
+  recurrence bounds, timeout, tokenizer/dataset, and export needs;
+- action: create/review YAML only, or configure and run it.
+
+Make low-risk assumptions when they preserve the user's intent. Ask only when a missing
+choice changes the experiment meaning, creates substantial Provider spend, or requires a
+credential/configuration mutation the user has not authorized.
+
+Select the durable shape:
+
+- Use one Runner for a bounded smoke or single load point.
+- Use Campaign `runners` to compare several immediate configurations.
+- Use a bounded RunnerPlan for repeated wall-clock or interval measurements.
+- Use `cache_probe` for within-Runner exact-repeat or prefix/mutation comparisons.
+- Use `cache-retention/v1` for independent-family passive delay/TTL sweeps.
+- Use `cache-residency/v1` for one Prime bundle followed by mapped repeated access.
+
+## Follow the end-to-end workflow
 
 1. Inspect `git status --short` and preserve unrelated user changes.
-2. Read the active Pydantic models and CLI help when exact accepted fields or
-   options matter; repository documentation may lag implementation.
-3. Use the current Aliyun `deepseek-v4-pro` examples as the operational baseline.
-4. Validate YAML structure before submission. Remember that Backend validation
-   may resolve Provider, tokenizer, and dataset artifacts before accepting the
-   complete workload.
-5. For implementation work, make the smallest coherent cross-layer change:
+2. Inspect current examples, active Pydantic models, and CLI help when exact fields or
+   options matter; checked-in documentation may lag implementation.
+3. Check `health`, Scheduler, Planner, Provider list, and exact model visibility. Configure
+   a Provider only when necessary and authorized; never place its URL/key in workload YAML.
+4. Create a short, bounded smoke YAML first. Estimate its Provider request count and run it
+   before any longer or more expensive workload when execution is in scope.
+5. Create the requested YAML from the proven smoke configuration. Keep stochastic fields
+   fixed when the experiment requires reproducibility and bound every plan/protocol.
+6. Validate YAML locally with
+   `.venv/bin/python .codex/skills/operate-llmperf/scripts/validate_workload.py FILE`.
+   Preview RunnerPlan occurrences. Remember submission may resolve Provider, tokenizer, and
+   dataset artifacts before it accepts the complete workload.
+7. Run only when requested or clearly included in the task. Use `-w` for observation, retain
+   the durable ID, and inspect the final `status` and `outcome`; CLI exit alone is not proof.
+8. On failure, inspect `runner status --summary` and dedicated `runner logs` from the first
+   failed Runner before changing the workload.
+9. For implementation work, make the smallest coherent cross-layer change:
    model, persistence, API, CLI, docs, and focused tests as applicable.
-6. Run focused tests, then the complete test suite. Do not silently substitute a
+10. Run focused tests, then the complete test suite. Do not silently substitute a
    different database or provider.
-7. Report whether Backend restart, PostgreSQL configuration, artifact download,
-   or credentials are required for the change to take effect.
+11. Report assumptions, YAML path, Provider/model, estimated and actual request counts,
+    durable IDs, lifecycle status, outcome, failures, exports, and whether restart,
+    PostgreSQL configuration, artifact download, credentials, or further paid runs remain.
+
+## Keep examples direct
+
+- Name every file under `examples/` as `example-<main-purpose>.yaml`.
+- Keep the name concise and use no more than three `-` characters in the filename.
+- Make the checked-in defaults finish promptly and return observable results when
+  run with a configured Provider. Periodic and TTL examples must use short bounded
+  timings; geographic-time capabilities use a short relative schedule by default.
+  Document longer production timings in comments instead of making users wait.
+
+## Control cost and authority
+
+- If the user asks only for YAML, do not configure a Provider or submit it.
+- If the user asks to run a test, treat the required bounded Provider calls as in scope;
+  call out the request budget before a materially larger multi-round or multi-delay run.
+- Never invent, display, log, or commit credentials. Have the user supply secrets through
+  `llmperf-backend config set ... --stdin` or configure them manually.
+- Provider changes require a Backend restart. Do not restart an externally managed service
+  unless the user authorized it; state the exact remaining action instead.
+- Do not infer inference support from `/models`; require a successful 1x1 smoke Runner.
 
 ## Diagnose from the first concrete failure
 

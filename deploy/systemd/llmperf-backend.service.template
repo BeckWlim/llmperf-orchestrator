@@ -1,0 +1,32 @@
+[Unit]
+Description=LLMPerf Backend
+Wants=network-online.target
+After=network-online.target postgresql.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=@LLMPERF_USER@
+Group=@LLMPERF_GROUP@
+WorkingDirectory=@LLMPERF_ROOT@
+
+ExecStart="@LLMPERF_ROOT@/.venv/bin/llmperf-backend"
+Restart=always
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=60s
+KillSignal=SIGTERM
+KillMode=control-group
+
+UMask=0027
+NoNewPrivileges=true
+LimitNOFILE=65536
+TasksMax=infinity
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llmperf-backend
+
+[Install]
+WantedBy=multi-user.target

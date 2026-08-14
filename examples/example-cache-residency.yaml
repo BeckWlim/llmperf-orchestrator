@@ -1,0 +1,45 @@
+campaign:
+  name: example-cache-residency
+  description: Run one bundled Prime followed by two mapped Warm observations.
+  tags:
+    provider: aliyun
+    model: deepseek-v4-pro
+    experiment: cache-residency
+
+wait: true
+
+protocol_definitions:
+  - name: example-cache-residency
+    protocol: cache-residency/v1
+    schedule:
+      kind: relative
+      offsets_seconds: [1, 2]
+    mapping: one_to_one
+    chains: 1
+    seed: 22222
+    cold_control: true
+    runner:
+      label: example-cache-residency
+      metadata:
+        purpose: cache-residency
+      benchmark:
+        provider: aliyun
+        model: deepseek-v4-pro
+        llm_api: openai
+        tokenizer:
+          id: deepseek-ai/DeepSeek-V3
+          revision: main
+          use_fast: true
+        timeout_seconds: 60
+        concurrent_requests: 1
+        mean_input_tokens: 2048
+        stddev_input_tokens: 0
+        mean_output_tokens: 8
+        stddev_output_tokens: 0
+        additional_sampling_params:
+          temperature: 0
+          stream_options:
+            include_usage: true
+
+# Increase offsets_seconds for long residency studies. Use a geographic schedule
+# only when wall-clock placement is part of the experiment.

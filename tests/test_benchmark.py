@@ -1,14 +1,10 @@
 import json
 from collections import Counter
-from pathlib import Path
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 import time
 
-import token_benchmark_ray as benchmark_module
+from llmperf import token_benchmark_ray as benchmark_module
 from llmperf import common_metrics
 from llmperf.models import RequestConfig
 from llmperf.ray_clients.openai_chat_completions_client import (
@@ -19,7 +15,7 @@ from llmperf.ray_clients.openai_chat_completions_client import (
 from llmperf.cache_analysis import analyze_cache_probe, summarize_cache_counters
 from llmperf.cache_probe import DependentPlanQueue, build_cache_probe_plan
 from llmperf.usage import normalize_usage
-from token_benchmark_ray import (
+from llmperf.token_benchmark_ray import (
     metrics_summary,
     normalize_request_metrics,
     sample_sharegpt_requests,
@@ -573,3 +569,78 @@ def test_probe_execution_order(monkeypatch):
         2,
         3,
     }
+
+
+def test_protocol_bundle_mapping(monkeypatch):
+    launched = []
+
+    class FakeLauncher:
+        def __init__(self, clients):
+            self.config = None
+
+        def launch_requests(self, request_config):
+            self.config = request_config
+            launched.append(request_config)
+
+        def get_next_ready(self, block=False):
+            if self.config is None:
+                return []
+            metadata = self.config.metadata
+            metrics = {
+                common_metrics.INTER_TOKEN_LAT: 0.1,
+                common_metrics.TTFT: 0.2,
+                common_metrics.E2E_LAT: 0.3,
+                common_metrics.REQ_OUTPUT_THROUGHPUT: 1.0,
+                common_metrics.NUM_INPUT_TOKENS: 64,
+                common_metrics.NUM_OUTPUT_TOKENS: 1,
+                common_metrics.ERROR_CODE: None,
+                common_metrics.ERROR_MSG: "",
+                common_metrics.REQUEST_METADATA: metadata,
+            }
+            return [(metrics, "x", self.config)]
+
+    def generated_prompt(**kwargs):
+        text = f"prompt-{benchmark_module.random.random()}"
+        return text, 64
+
+    monkeypatch.setattr(benchmark_module, "get_tokenizer", FakeMutationTokenizer)
+    monkeypatch.setattr(
+        benchmark_module, "randomly_sample_sonnet_lines_prompt", generated_prompt
+    )
+    monkeypatch.setattr(benchmark_module, "construct_clients", lambda **kwargs: [])
+    monkeypatch.setattr(benchmark_module, "RequestsLauncher", FakeLauncher)
+
+    base = {
+        "model": "model",
+        "mean_input_tokens": 64,
+        "stddev_input_tokens": 0,
+        "mean_output_tokens": 1,
+        "stddev_output_tokens": 0,
+        "num_concurrent_requests": 1,
+        "test_timeout_s": 10,
+    }
+    benchmark_module.get_token_throughput_latencies(
+        **base,
+        max_num_completed_requests=2,
+        protocol_request={
+            "protocol": "cache-residency/v1",
+            "role": "prime",
+            "prompt_seeds": [11, 22],
+            "mapping_keys": ["first", "second"],
+        },
+    )
+    prime_prompts = {item.metadata["mapping_key"]: item.prompt[0] for item in launched}
+    launched.clear()
+    benchmark_module.get_token_throughput_latencies(
+        **base,
+        max_num_completed_requests=1,
+        protocol_request={
+            "protocol": "cache-residency/v1",
+            "role": "warm",
+            "prompt_seed": 22,
+            "mapping_key": "second",
+        },
+    )
+
+    assert launched[0].prompt[0] == prime_prompts["second"]
+    assert launched[0].metadata["mapping_key"] == "second"

@@ -216,15 +216,15 @@ class Planner:
             raise RuntimeError("Planner must be started before running")
         while not self._stop.is_set():
             try:
-                emitted = await self.repository.materialize_due_plans(
+                emitted = await self.repository.materialize_due_work(
                     self.config.batch_size, self.planner_id
                 )
                 if emitted:
-                    LOGGER.info("Planner materialized %d Runner(s)", emitted)
+                    LOGGER.info("Planner materialized %d due Runner(s)", emitted)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOGGER.exception("Planner failed to materialize due RunnerPlans")
+                LOGGER.exception("Planner failed to materialize due workload")
             try:
                 await asyncio.wait_for(
                     self._stop.wait(), self.config.poll_interval_seconds

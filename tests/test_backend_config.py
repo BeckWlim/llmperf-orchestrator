@@ -46,7 +46,7 @@ def test_postgres_only():
 
 
 def test_campaign_workload():
-    with pytest.raises(ValueError, match="runners or runner_plans"):
+    with pytest.raises(ValueError, match="protocol_definitions"):
         BenchmarkCampaignStart.model_validate({"campaign": {"name": "empty"}})
 
     campaign = BenchmarkCampaignStart.model_validate(
@@ -67,6 +67,71 @@ def test_campaign_workload():
     assert campaign.runners == []
     assert campaign.runner_plans[0].max_occurrences == 8
     assert campaign.runner_plans[0].starts_at is None
+
+    sweep = BenchmarkCampaignStart.model_validate(
+        {
+            "campaign": {"name": "retention"},
+            "protocol_definitions": [
+                {
+                    "name": "ttl",
+                    "protocol": "cache-retention/v1",
+                    "delay_seconds": [0, 60, 3600],
+                    "trials_per_delay": 2,
+                    "runner": {},
+                }
+            ],
+        }
+    )
+    assert sweep.protocol_definitions[0].refresh_semantics == "independent_family"
+    assert sweep.protocol_definitions[0].trials_per_delay == 2
+
+    residency = BenchmarkCampaignStart.model_validate(
+        {
+            "campaign": {"name": "residency"},
+            "protocol_definitions": [
+                {
+                    "name": "daily-hours",
+                    "protocol": "cache-residency/v1",
+                    "schedule": {
+                        "kind": "geographic",
+                        "timezone": "Asia/Shanghai",
+                        "starts_at": "2026-08-15T00:00:00+08:00",
+                        "every_seconds": 3600,
+                        "duration_days": 1,
+                    },
+                    "mapping": "one_to_one",
+                    "chains": 2,
+                    "runner": {},
+                }
+            ],
+        }
+    )
+    definition = residency.protocol_definitions[0]
+    assert definition.protocol == "cache-residency/v1"
+    assert definition.schedule.timezone == "Asia/Shanghai"
+    assert definition.chains == 2
+
+    with pytest.raises(ValueError, match="UTC offset"):
+        BenchmarkCampaignStart.model_validate(
+            {
+                "campaign": {"name": "bad-residency"},
+                "protocol_definitions": [
+                    {
+                        "name": "bad-hours",
+                        "protocol": "cache-residency/v1",
+                        "schedule": {
+                            "kind": "geographic",
+                            "timezone": "Asia/Shanghai",
+                            "starts_at": "2026-08-15T00:00:00Z",
+                            "every_seconds": 3600,
+                            "duration_days": 1,
+                        },
+                        "mapping": "one_to_one",
+                        "runner": {},
+                    }
+                ],
+            }
+        )
 
 
 def test_runner_tokenizer():

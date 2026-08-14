@@ -29,7 +29,7 @@ def _calculate(
 ) -> Tuple[Dict[str, Any], Sequence[Dict[str, Any]]]:
     import ray
 
-    from token_benchmark_ray import get_token_throughput_latencies
+    from llmperf.token_benchmark_ray import get_token_throughput_latencies
 
     runtime_environment = dict(os.environ)
     runtime_environment.pop(WORKER_DATABASE_URL, None)
@@ -63,6 +63,7 @@ def _calculate(
             additional_sampling_params=benchmark["additional_sampling_params"],
             cache_probe=benchmark.get("cache_probe"),
             tokenizer_provenance=benchmark.get("tokenizer"),
+            protocol_request=benchmark.get("protocol_request"),
         )
     finally:
         ray.shutdown()

@@ -1,0 +1,36 @@
+campaign:
+  name: example-runner-plan
+  description: Materialize two small Runners one second apart.
+  tags:
+    provider: aliyun
+    workload: runner-plan
+
+wait: true
+
+runner_plans:
+  - name: example-runner-plan
+    timezone: Asia/Shanghai
+    max_occurrences: 2
+    recurrence:
+      kind: interval
+      every_seconds: 1
+    overlap_policy: queue
+    misfire_grace_seconds: 60
+    runner:
+      label: example-planned-runner
+      metadata:
+        purpose: bounded-plan
+      benchmark:
+        provider: aliyun
+        model: deepseek-v4-pro
+        timeout_seconds: 60
+        max_completed_requests: 1
+        concurrent_requests: 1
+        mean_input_tokens: 64
+        stddev_input_tokens: 0
+        mean_output_tokens: 16
+        stddev_output_tokens: 0
+        additional_sampling_params:
+          temperature: 0
+
+# Increase every_seconds and max_occurrences for a real periodic study.

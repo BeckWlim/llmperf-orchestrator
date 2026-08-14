@@ -1,4 +1,4 @@
 interface:
   display_name: "Operate LLMPerf"
-  short_description: "Configure and operate LLMPerf campaigns safely"
-  default_prompt: "Use $operate-llmperf to prepare and run an LLMPerf campaign YAML."
+  short_description: "Turn benchmark goals into safe LLMPerf runs"
+  default_prompt: "Use $operate-llmperf to create a validated workload YAML, configure its Provider if needed, and run a bounded test."

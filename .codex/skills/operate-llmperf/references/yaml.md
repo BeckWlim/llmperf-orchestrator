@@ -22,8 +22,8 @@ benchmark:
     temperature: 0
 ```
 
-Campaign 文件必须包含 `campaign`，并至少包含非空的 `runners` 或
-`runner_plans`。两者可以同时存在：
+Campaign 文件必须包含 `campaign`，并至少包含非空的 `runners`、
+`runner_plans` 或 `protocol_definitions`。三者可以同时存在：
 
 ```yaml
 campaign:
@@ -34,6 +34,7 @@ campaign:
 wait: true
 runners: []
 runner_plans: []
+protocol_definitions: []
 ```
 
 不要在 Runner YAML 中放 endpoint 或 API key。`provider` 是 Backend Provider
@@ -48,13 +49,27 @@ Profile ID，`model` 应使用该 Profile 可见的精确模型 ID。
 - `concurrent_requests`：Runner 内同时在途的请求数；增大它改变并发压力，
   不代表增加 Runner 或 Scheduler slot。
 - `mean_input_tokens`、`stddev_input_tokens`：输入 token 分布。
-- `mean_output_tokens`、`stddev_output_tokens`：输出 token 分布。
+- `mean_output_tokens`、`stddev_output_tokens`：每次请求 `max_tokens` 上限的目标分布；
+  模型仍可能因为 EOS、过滤或 Provider 行为提前停止，不能把它解释为实际输出保证。
 - `shared_prefix_tokens`：普通共享前缀长度；CacheProbe 也可单独声明。
 - `additional_sampling_params`：原样加入兼容推理请求，例如 `temperature: 0`
   和 `stream_options.include_usage: true`。
 - `dataset_repeat_count`、`dataset_seed`：数据集重复与可复现实验顺序。
 
 所有配置模型使用严格字段校验；拼错或未知字段会被拒绝，不要依赖静默忽略。
+
+提交前估算计划 Provider 请求数，并向用户说明较大的预算：
+
+- 普通 Runner：`max_completed_requests`。
+- 多 Runner Campaign：所有即时 Runner 请求数之和。
+- RunnerPlan：每轮请求数乘以最大 occurrence 数；只有 `ends_at` 时按 preview 结果计算。
+- `cache_probe`：`trials × (1 + repeats_after_prime)`。
+- `cache-retention/v1`：`delay 数 × trials_per_delay × (2 + cold_control)`。
+- `cache-residency/v1`：`chains × observation 数 × (2 + cold_control)`；Prime bundle
+  虽是一个 Runner，但包含每个 observation 的独立 Prime 请求。
+
+其中 `cold_control` 为 true 时在公式中取 1，否则取 0。超时、失败和人工重跑可能令实际
+计费调用与计划数不同，不要把估算当作账单保证。
 
 ## 3. Tokenizer 与 Dataset
 
@@ -161,10 +176,105 @@ runner_plans:
 以 Campaign YAML 启动周期工作负载。`planner create` 仅用于把一个计划附加到已经
 存在的 Campaign；不要把 Planner 当作独立工作负载所有者。
 
-## 6. 修改前校验
+## 6. 跨 Runner Cache Retention Sweep
+
+长 TTL 不使用 `cache_probe.delay_seconds` 让 Worker 常驻等待，而是在 Campaign 中
+声明持久化、独立 family 的 delay sweep：
+
+```yaml
+protocol_definitions:
+  - name: deepseek-cache-retention
+    protocol: cache-retention/v1
+    delay_seconds: [0, 30, 300, 1800]
+    trials_per_delay: 20
+    seed: 11111
+    assignment: randomized_blocks
+    refresh_semantics: independent_family
+    cold_control: true
+    runner:
+      benchmark:
+        provider: aliyun
+        model: deepseek-v4-pro
+        tokenizer:
+          id: deepseek-ai/DeepSeek-V3
+          revision: main
+        mean_input_tokens: 4096
+        stddev_input_tokens: 0
+        mean_output_tokens: 16
+        stddev_output_tokens: 0
+        additional_sampling_params:
+          stream_options:
+            include_usage: true
+```
+
+每个 `delay × trial` 使用独立 Prompt family。建图时 Prime Dispatch 为 `pending`，
+Warm 与可选 Cold Control Dispatch 为 `blocked`，并通过 Prime Dispatch UUID 建立依赖。
+Prime 完成事务把直接后继解锁并将到期时间设为 `prime_completed_at + delay`；Planner
+只物化统一协议中已到期的 `pending` Dispatch。等待期间不占 Scheduler slot。当前协议
+要求 OpenAI 客户端、显式或模型绑定的 immutable tokenizer，以及固定输入/输出长度。
+Campaign export v5 保存通用 Protocol Definition/Instance、Dispatch 调用图和按 delay
+聚合的缓存命中/TTFT 协议分析；不再暴露 Cache Pair 专用持久化模型。
+
+## 7. 单 Prime 长时间驻留链
+
+`cache-residency/v1` 用一个 Prime Runner 打包多个独立 Prompt，并把后续 Warm 在
+YAML 编译阶段一对一映射到这些 Prompt。它测量的是访问条件下的缓存驻留，不得解释为
+无中间访问的自然 TTL。时间表有两种显式语义：
+
+```yaml
+protocol_definitions:
+  - name: deepseek-cache-residency
+    protocol: cache-residency/v1
+    schedule:
+      kind: relative
+      offsets_seconds: [3600, 7200, 14400]
+    mapping: one_to_one
+    chains: 1
+    seed: 22222
+    cold_control: true
+    runner:
+      benchmark:
+        provider: aliyun
+        model: deepseek-v4-pro
+        tokenizer:
+          id: deepseek-ai/DeepSeek-V3
+          revision: main
+        mean_input_tokens: 4096
+        stddev_input_tokens: 0
+        mean_output_tokens: 16
+        stddev_output_tokens: 0
+```
+
+`relative` 以整个 Prime bundle 实际完成时间为零点。需要跨多个本地日按小时观测时，
+使用有界的地理周期时间表：
+
+```yaml
+schedule:
+  kind: geographic
+  timezone: Asia/Shanghai
+  starts_at: 2026-08-15T00:00:00+08:00
+  every_seconds: 3600
+  duration_days: 3
+```
+
+`starts_at` 必须携带 UTC offset，且 offset 必须与声明的 IANA 时区在该时刻一致。
+插件按当地日边界外推时间表；上述配置产生 72 个逐小时观测点。`starts_at` 决定 Prime
+bundle 的绝对派发时刻，派生触发点由周期展开；报告仍以 Prime bundle 实际完成时间
+计算每次 Warm 的真实缓存年龄。Prime 延迟导致某个观测点已经过期时，该阶段在前置
+依赖完成后立即进入通用到期队列，并在结果中体现真实延迟。
+
+`mapping: one_to_one` 令插件为每个观测点生成一个稳定 `mapping_key`；Prime bundle
+请求与 Warm Dispatch 直接携带该 key，运行时只校验 `mapping_key -> prompt_hash`，不再
+推导数组索引。每个 chain 编译为严格因果链。Warm/Control 的先后顺序按 seed 确定性
+随机化，每个 Cold Control 使用不同 Prompt seed。任一阶段失败会取消尚未派发的后继；
+等待期间不占 Worker。`chains` 用于创建独立复现链，默认为 1。
+
+## 8. 修改前校验
 
 1. 对照 `src/llmperf_backend/models.py` 确认字段和范围。
-2. 对照 `examples/runner-plan.yaml`、`examples/test-smoke.yaml` 和
-   `examples/test-campaign.yaml`。
-3. 用 `llmperfctl planner preview -f FILE` 检查 RunnerPlan occurrence。
-4. 先用 1x1 smoke Runner 验证 provider/model/key，再运行长 Campaign。
+2. 对照 `examples/example-runner-plan.yaml`、`examples/example-smoke.yaml` 和
+   `examples/example-campaign.yaml`。
+3. 用 `.venv/bin/python .codex/skills/operate-llmperf/scripts/validate_workload.py FILE`
+   执行无 Provider 调用的本地严格校验。
+4. 用 `llmperfctl planner preview -f FILE` 检查 RunnerPlan occurrence。
+5. 先用 1x1 smoke Runner 验证 provider/model/key，再运行长 Campaign。

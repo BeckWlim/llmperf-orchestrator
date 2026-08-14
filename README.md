@@ -58,6 +58,9 @@ and persisted before results are exported as JSON or professional HTML reports.
 - **KV-cache evidence, not guesses** — deterministic prime/warm pairs, normalized
   Provider cache counters, timing phases, bootstrap confidence intervals, and
   explicit evidence verdicts distinguish cache accounting from proven speedup.
+- **Durable retention curves** — Campaign protocol instances exchange immutable
+  checkpoints through PostgreSQL; the Planner emits long-delay warm/control Runners
+  without holding a Worker while TTL time elapses.
 - **Audit-ready reporting** — aggregate and per-request metrics are persisted in
   PostgreSQL; lightweight status views, JSON exports, and self-contained HTML
   reports are derived from the same durable records.
@@ -87,7 +90,7 @@ python -m pip install -e '.[litellm]'
 # Amazon SageMaker
 python -m pip install -e '.[sagemaker]'
 
-# Standalone llm_correctness.py benchmark
+# Standalone correctness benchmark (`python -m llmperf.llm_correctness ...`)
 python -m pip install -e '.[correctness]'
 ```
 
@@ -119,6 +122,13 @@ Start the service:
 ```bash
 llmperf-backend
 ```
+
+For persistent Ubuntu operation after the virtual environment and PostgreSQL schema
+are ready, render the template from [`deploy/systemd/`](deploy/systemd/README.md)
+into `/etc/systemd/system`. The
+[`llmperf-backend.service.template`](deploy/systemd/llmperf-backend.service.template)
+starts the existing `.venv` directly as a configured non-root user and never stores
+Provider credentials.
 
 `llmperfctl` loads its own optional user environment from
 `~/.config/llmperf/cli.env` (or `$XDG_CONFIG_HOME/llmperf/cli.env`). Configure a
@@ -152,16 +162,16 @@ Provider catalog visibility does not guarantee inference access. Run the smoke
 test before submitting a longer experiment:
 
 ```bash
-llmperfctl runner start -f examples/test-smoke.yaml --wait
+llmperfctl runner start -f examples/example-smoke.yaml --wait
 ```
 
 ### 3. Run a multi-round Campaign
 
-Preview and submit the bounded eight-round RunnerPlan example:
+Preview and submit the bounded two-round RunnerPlan example:
 
 ```bash
-llmperfctl planner preview -f examples/runner-plan.yaml
-llmperfctl campaign start -f examples/runner-plan.yaml
+llmperfctl planner preview -f examples/example-runner-plan.yaml
+llmperfctl campaign start -f examples/example-runner-plan.yaml
 ```
 
 Copy the returned `campaign_id`, then inspect the Campaign and its Runners:
@@ -172,7 +182,9 @@ llmperfctl runner list --limit 20
 ```
 
 The CLI may exit without affecting execution; Campaign, RunnerPlan, and Runner
-state remain durable in PostgreSQL.
+state remain durable in PostgreSQL. Mutation and wait commands write operational
+state changes to stderr and do not dump response JSON to stdout by default.
+Use `status`, `list`, `logs`, or an explicit export command when output is needed.
 
 ### 4. Export results and generate an HTML report
 
@@ -199,9 +211,11 @@ metrics, data-quality warnings, and failure diagnostics. Add
 
 | File | Purpose |
 |---|---|
-| [`examples/test-smoke.yaml`](examples/test-smoke.yaml) | Minimal 1x1 end-to-end Provider and persistence check |
-| [`examples/test-campaign.yaml`](examples/test-campaign.yaml) | Immediate cold-versus-repeated ShareGPT KV-cache Campaign |
-| [`examples/runner-plan.yaml`](examples/runner-plan.yaml) | Eight bounded KV-cache rounds emitted every 30 seconds |
+| [`examples/example-smoke.yaml`](examples/example-smoke.yaml) | Minimal 1x1 Provider and persistence check |
+| [`examples/example-campaign.yaml`](examples/example-campaign.yaml) | Two small Runner configurations in one durable Campaign |
+| [`examples/example-runner-plan.yaml`](examples/example-runner-plan.yaml) | Two bounded Runners materialized one second apart |
+| [`examples/example-cache-retention.yaml`](examples/example-cache-retention.yaml) | Short independent-pair retention sweep with cold controls |
+| [`examples/example-cache-residency.yaml`](examples/example-cache-residency.yaml) | Bundled Prime with two mapped Warm observations |
 
 Workload YAML selects stable Provider and model IDs only. Provider URLs, keys,
 artifact caches, and service settings belong to the Backend configuration.

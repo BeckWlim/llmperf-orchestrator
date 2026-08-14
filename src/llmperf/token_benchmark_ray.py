@@ -1,6 +1,9 @@
+"""Token benchmark orchestration used by the packaged Worker and module CLI."""
+
 import threading
 import argparse
 from collections.abc import Iterable
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -318,6 +321,7 @@ def get_token_throughput_latencies(
     llm_api="openai",
     cache_probe: Optional[Dict[str, Any]] = None,
     tokenizer_provenance: Optional[Dict[str, Any]] = None,
+    protocol_request: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Get the token throughput and latencies for the given model.
 
@@ -344,7 +348,25 @@ def get_token_throughput_latencies(
         (e.g. throughput, latencies, etc.)
         The individual metrics for each request.
     """
-    random.seed(dataset_seed if cache_probe else 11111)
+    protocol_prompt_seeds = (
+        list(protocol_request.get("prompt_seeds") or []) if protocol_request else []
+    )
+    if (
+        protocol_request
+        and not protocol_prompt_seeds
+        and protocol_request.get("prompt_seed") is not None
+    ):
+        protocol_prompt_seeds = [int(protocol_request["prompt_seed"])]
+    initial_protocol_seed = (
+        protocol_request.get("prompt_seed") if protocol_request else None
+    )
+    if initial_protocol_seed is None and protocol_prompt_seeds:
+        initial_protocol_seed = protocol_prompt_seeds[0]
+    random.seed(
+        int(initial_protocol_seed)
+        if initial_protocol_seed is not None
+        else (dataset_seed if cache_probe else 11111)
+    )
 
     tokenizer = get_tokenizer()
     get_token_length = lambda text: len(
@@ -383,6 +405,8 @@ def get_token_throughput_latencies(
     base_prompt_count = (
         int(cache_probe["trials"]) if cache_probe else max_num_completed_requests
     )
+    if protocol_prompt_seeds and len(protocol_prompt_seeds) != base_prompt_count:
+        raise ValueError("protocol prompt_seeds must match max_completed_requests")
     num_output_tokens_list = [
         sample_random_positive_int(mean_output_tokens, stddev_output_tokens)
         for _ in range(probe_request_count)
@@ -412,6 +436,8 @@ def get_token_throughput_latencies(
                 tokenizer=tokenizer,
             )
         for i in range(base_prompt_count):
+            if protocol_prompt_seeds:
+                random.seed(int(protocol_prompt_seeds[i]))
             suffix = randomly_sample_sonnet_lines_prompt(
                 prompt_tokens_mean=mean_input_tokens - shared_prefix_tokens,
                 prompt_tokens_stddev=stddev_input_tokens,
@@ -481,6 +507,31 @@ def get_token_throughput_latencies(
                     prompt=prompts[request_index],
                     sampling_params=default_sampling_params,
                     llm_api=llm_api,
+                    metadata=(
+                        {
+                            **dict(protocol_request),
+                            **(
+                                {
+                                    "mapping_key": protocol_request["mapping_keys"][
+                                        request_index
+                                    ]
+                                }
+                                if protocol_request.get("mapping_keys")
+                                else (
+                                    {"mapping_key": protocol_request["mapping_key"]}
+                                    if protocol_request.get("mapping_key") is not None
+                                    else {}
+                                )
+                            ),
+                            "prompt_hash": "sha256:"
+                            + hashlib.sha256(
+                                prompts[request_index][0].encode("utf-8")
+                            ).hexdigest(),
+                            "local_input_tokens": prompts[request_index][1],
+                        }
+                        if protocol_request
+                        else None
+                    ),
                     timeout_seconds=remaining_seconds,
                 )
                 req_launcher.launch_requests(request_config)
@@ -570,6 +621,7 @@ def get_token_throughput_latencies(
                 "warning": "Tokenizer was not explicitly selected for this model",
             }
         ),
+        "protocol_request": dict(protocol_request or {}),
         "timed_out": timed_out,
     }
 
