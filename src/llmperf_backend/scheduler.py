@@ -4,13 +4,15 @@ import asyncio
 import logging
 import os
 import socket
-import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from llmperf.utils import TOKENIZER_FAST, TOKENIZER_PATH
-from llmperf_backend.models import DatabaseConfig, SchedulerConfig
+from llmperf_backend.models import (
+    DatabaseConfig,
+    PerformanceGuardConfig,
+    SchedulerConfig,
+)
 from llmperf_backend.persistence import (
     CANCELLED,
     FAILED,
@@ -21,14 +23,22 @@ from llmperf_backend.persistence import (
 from llmperf_backend.providers import ProviderRegistry
 from llmperf_backend.tokenizers import TokenizerCache
 from llmperf_backend.datasets import DatasetCache, WORKER_DATASET_PATH
+from llmperf_backend.safety import RuntimePerformanceGuard
+from llmperf_backend.worker import (
+    Worker,
+    benchmark_actor_count,
+    summarize_outcome,
+)
+from llmperf.common import RAY_ACTOR_CPUS_ENV
 
 
 WORKER_DATABASE_URL = "LLMPERF_WORKER_DB"
+WORKER_RAY_ACTOR_CPUS = RAY_ACTOR_CPUS_ENV
 LOGGER = logging.getLogger(__name__)
 
 
 class Scheduler:
-    """Claim durable Runners and supervise calculation-only Worker subprocesses."""
+    """Claim durable Runners and supervise Ray-backed Worker handles."""
 
     def __init__(
         self,
@@ -38,6 +48,7 @@ class Scheduler:
         provider_registry: ProviderRegistry,
         tokenizer_cache: Optional[TokenizerCache] = None,
         dataset_cache: Optional[DatasetCache] = None,
+        performance_guard_config: Optional[PerformanceGuardConfig] = None,
     ):
         self.repository = repository
         self.config = config
@@ -45,21 +56,42 @@ class Scheduler:
         self.provider_registry = provider_registry
         self.tokenizer_cache = tokenizer_cache or TokenizerCache()
         self.dataset_cache = dataset_cache or DatasetCache()
+        self.performance_guard = RuntimePerformanceGuard(
+            performance_guard_config or PerformanceGuardConfig()
+        )
         self.scheduler_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
         self._slots: List[asyncio.Task] = []
         self._busy_slots = set()
         self._stop: Optional[asyncio.Event] = None
+        self._ray_module: Any = None
+        self._ray_context: Any = None
+        self._ray_address: Optional[str] = None
+        self._ray_mode = "external" if config.ray_address else "embedded"
+        self._ray_healthy = False
+        self._ray_object_store_tripped = False
+        self._ray_status: Dict[str, Any] = {"status": "stopped"}
+        self._ray_monitor_task: Optional[asyncio.Task] = None
+        self._worker_remote: Any = None
+        self._active_workers: Dict[str, Worker] = {}
 
     async def start(self) -> None:
         if not self.config.enabled:
             LOGGER.info("Scheduler %s is disabled", self.scheduler_id)
             return
         self._stop = asyncio.Event()
-        await self.repository.requeue_stale(self.config.stale_after_seconds)
-        self._slots = [
-            asyncio.create_task(self._worker(index), name=f"llmperf-scheduler-{index}")
-            for index in range(self.config.max_concurrent_runners)
-        ]
+        try:
+            await self._start_ray_runtime()
+            await self.repository.requeue_stale(self.config.stale_after_seconds)
+            self._slots = [
+                asyncio.create_task(
+                    self._worker(index), name=f"llmperf-scheduler-{index}"
+                )
+                for index in range(self.config.max_concurrent_runners)
+            ]
+        except Exception:
+            await self._stop_ray_runtime()
+            self._stop = None
+            raise
         LOGGER.info(
             "Scheduler %s started with %d slot(s)",
             self.scheduler_id,
@@ -74,6 +106,11 @@ class Scheduler:
             task.cancel()
         if self._slots:
             await asyncio.gather(*self._slots, return_exceptions=True)
+        if self._ray_monitor_task is not None:
+            self._ray_monitor_task.cancel()
+            await asyncio.gather(self._ray_monitor_task, return_exceptions=True)
+            self._ray_monitor_task = None
+        await self._stop_ray_runtime()
         self._slots.clear()
         self._busy_slots.clear()
         self._stop = None
@@ -93,13 +130,167 @@ class Scheduler:
             "live_slots": sum(not slot.done() for slot in self._slots),
             "busy_slots": busy_slots,
             "worker_module": self.config.worker_module,
+            "worker_kind": "ray_task",
+            "active_workers": len(self._active_workers),
+            "ray_mode": self._ray_mode,
+            "ray_address": self._ray_address or self.config.ray_address,
+            "ray_actor_num_cpus": self.config.ray_actor_num_cpus,
+            "ray_runtime": dict(self._ray_status),
+            "performance_guard": self.performance_guard.status(),
         }
+
+    async def _start_ray_runtime(self) -> None:
+        import ray
+
+        options: Dict[str, Any] = {
+            "namespace": "llmperf-control",
+            "ignore_reinit_error": False,
+        }
+        if self.config.ray_address:
+            options["address"] = self.config.ray_address
+        else:
+            options.update(
+                {
+                    "include_dashboard": False,
+                    "num_cpus": self.config.ray_num_cpus,
+                    "object_store_memory": (
+                        self.config.ray_object_store_memory_bytes
+                    ),
+                }
+            )
+        self._ray_module = ray
+        self._ray_context = await asyncio.to_thread(ray.init, **options)
+        address_info = getattr(self._ray_context, "address_info", {}) or {}
+        self._ray_address = self.config.ray_address or address_info.get("address")
+        if not self._ray_address:
+            raise RuntimeError("Ray runtime did not expose a connectable address")
+        await self._sample_ray_runtime()
+        if not self._ray_healthy:
+            raise RuntimeError("Ray runtime failed its initial health check")
+        self._worker_remote = Worker.remote(ray)
+        self._ray_monitor_task = asyncio.create_task(
+            self._monitor_ray_runtime(), name="llmperf-ray-monitor"
+        )
+        LOGGER.info(
+            "Ray runtime ready: mode=%s address=%s resources=%s",
+            self._ray_mode,
+            self._ray_address,
+            self._ray_status.get("cluster_resources"),
+        )
+
+    async def _stop_ray_runtime(self) -> None:
+        ray = self._ray_module
+        self._ray_healthy = False
+        self._ray_object_store_tripped = False
+        self._ray_status = {"status": "stopped"}
+        self._ray_context = None
+        self._ray_address = None
+        self._worker_remote = None
+        self._ray_module = None
+        if ray is not None:
+            await asyncio.to_thread(ray.shutdown)
+
+    async def _sample_ray_runtime(self) -> None:
+        ray = self._ray_module
+        if ray is None:
+            self._ray_healthy = False
+            self._ray_status = {"status": "stopped"}
+            return
+
+        def snapshot() -> Dict[str, Any]:
+            cluster_resources = ray.cluster_resources()
+            result = {
+                "status": "healthy",
+                "cluster_resources": cluster_resources,
+                "available_resources": ray.available_resources(),
+            }
+            object_store_total = float(
+                cluster_resources.get("object_store_memory", 0) or 0
+            )
+            object_store_available = float(
+                result["available_resources"].get("object_store_memory", 0) or 0
+            )
+            result["object_store_available_ratio"] = (
+                object_store_available / object_store_total
+                if object_store_total > 0
+                else None
+            )
+            # ``ray.nodes`` is useful with a native driver but is not guaranteed by
+            # every Ray Client transport. Resource RPCs are the health invariant;
+            # node detail is best-effort to keep external runtimes compatible.
+            try:
+                nodes = ray.nodes()
+                result["alive_nodes"] = sum(
+                    bool(node.get("Alive")) for node in nodes
+                )
+            except Exception:
+                result["alive_nodes"] = None
+            return result
+
+        try:
+            self._ray_status = await asyncio.wait_for(
+                asyncio.to_thread(snapshot),
+                timeout=self.config.ray_health_timeout_seconds,
+            )
+            self._ray_healthy = (
+                float(self._ray_status["cluster_resources"].get("CPU", 0)) > 0
+            )
+            object_store_ratio = self._ray_status.get(
+                "object_store_available_ratio"
+            )
+            if isinstance(object_store_ratio, (int, float)):
+                guard_config = self.performance_guard.config
+                if self._ray_object_store_tripped:
+                    self._ray_object_store_tripped = (
+                        object_store_ratio
+                        < guard_config.resume_ray_object_store_available_ratio
+                    )
+                else:
+                    self._ray_object_store_tripped = (
+                        object_store_ratio
+                        <= guard_config.min_ray_object_store_available_ratio
+                    )
+            self._ray_status["claim_blocked"] = self._ray_object_store_tripped
+            self._ray_status["claim_block_reason"] = (
+                "ray_object_store_low" if self._ray_object_store_tripped else None
+            )
+            if not self._ray_healthy:
+                self._ray_status["status"] = "unhealthy"
+                self._ray_status["error"] = "Ray runtime exposes no CPU resources"
+        except Exception as exc:
+            if self._ray_healthy:
+                LOGGER.error("Ray runtime health check failed: %s", exc)
+            self._ray_healthy = False
+            self._ray_status = {"status": "unhealthy", "error": str(exc)}
+
+    async def _monitor_ray_runtime(self) -> None:
+        if self._stop is None:
+            return
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), self.config.ray_health_interval_seconds
+                )
+            except asyncio.TimeoutError:
+                await self._sample_ray_runtime()
 
     async def _worker(self, index: int) -> None:
         if self._stop is None:
             raise RuntimeError("Scheduler must be started before running workers")
         scheduler_slot_id = f"{self.scheduler_id}:{index}"
         while not self._stop.is_set():
+            if (
+                not self.performance_guard.allow_claim()
+                or not self._ray_healthy
+                or self._ray_object_store_tripped
+            ):
+                try:
+                    await asyncio.wait_for(
+                        self._stop.wait(), self.config.poll_interval_seconds
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                continue
             try:
                 runner = await self.repository.claim_next(scheduler_slot_id)
             except asyncio.CancelledError:
@@ -132,21 +323,6 @@ class Scheduler:
             finally:
                 self._busy_slots.discard(index)
 
-    def _working_directory(self) -> Path:
-        return Path(self.config.working_directory).expanduser().resolve()
-
-    def build_command(self, runner_id: str) -> List[str]:
-        return [
-            sys.executable,
-            "-m",
-            self.config.worker_module,
-            "--runner-id",
-            runner_id,
-        ]
-
-    def _bounded_log(self, content: bytes) -> str:
-        return content[-self.config.log_bytes_limit :].decode("utf-8", errors="replace")
-
     async def worker_environment(
         self, runner: Dict[str, Any], base_environment: Dict[str, str]
     ) -> Dict[str, str]:
@@ -163,90 +339,192 @@ class Scheduler:
         if dataset is not None:
             resolution = await self.dataset_cache.resolve(dataset)
             environment[WORKER_DATASET_PATH] = str(resolution.path)
+        environment[WORKER_RAY_ACTOR_CPUS] = str(self.config.ray_actor_num_cpus)
         return environment
+
+    async def _prepare_worker_environment(
+        self, runner: Dict[str, Any], base_environment: Dict[str, str]
+    ) -> Optional[Dict[str, str]]:
+        """Resolve local artifacts while retaining cancellation and timeout control."""
+
+        runner_id = runner["runner_id"]
+
+        async def finish_cancelled() -> None:
+            await self.repository.finish_runner(
+                runner_id,
+                CANCELLED,
+                "Benchmark cancelled before Worker start",
+                None,
+                "",
+                "",
+            )
+            LOGGER.info("Runner %s cancelled before Worker start", runner_id)
+
+        # A previous Scheduler may have requeued a running Runner while preserving
+        # its durable cancellation request. Check before touching artifacts so a
+        # restart cannot turn that Runner into a Provider call.
+        if await self.repository.heartbeat(runner_id):
+            await finish_cancelled()
+            return None
+        task = asyncio.create_task(self.worker_environment(runner, base_environment))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.config.artifact_resolution_timeout_seconds
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Worker artifact resolution exceeded "
+                        f"{self.config.artifact_resolution_timeout_seconds:g} seconds"
+                    )
+                done, _ = await asyncio.wait(
+                    {task},
+                    timeout=min(self.config.poll_interval_seconds, remaining),
+                )
+                if done:
+                    environment = task.result()
+                    if await self.repository.heartbeat(runner_id):
+                        await finish_cancelled()
+                        return None
+                    return environment
+                if await self.repository.heartbeat(runner_id):
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    await finish_cancelled()
+                    return None
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def _wait_worker(self, worker: Worker, runner_id: str) -> bool:
+        if self._stop is None:
+            raise RuntimeError("Scheduler must be started before supervising Workers")
+        while not worker.ready():
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), self.config.poll_interval_seconds
+                )
+            except asyncio.TimeoutError:
+                if await self.repository.heartbeat(runner_id):
+                    return True
+                continue
+            raise asyncio.CancelledError
+        return False
+
+    async def _cancel_worker(self, worker: Worker) -> None:
+        worker.cancel(force=False)
+        deadline = asyncio.get_running_loop().time() + self.config.cancel_grace_seconds
+        while not worker.ready() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(min(0.1, self.config.cancel_grace_seconds))
+        if not worker.ready():
+            worker.cancel(force=True)
+        worker.close()
 
     async def _execute(self, runner: Dict[str, Any]) -> None:
         runner_id = runner["runner_id"]
-        process: Optional[asyncio.subprocess.Process] = None
-        communicate_task: Optional[asyncio.Task] = None
+        worker: Optional[Worker] = None
         try:
-            environment = await self.worker_environment(runner, dict(os.environ))
-            environment[WORKER_DATABASE_URL] = self.database_config.url
-            process = await asyncio.create_subprocess_exec(
-                *self.build_command(runner_id),
-                cwd=str(self._working_directory()),
-                env=environment,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            environment = await self._prepare_worker_environment(
+                runner, dict(os.environ)
             )
-            await self.repository.set_process(runner_id, process.pid)
-            LOGGER.info("Started Worker pid=%s for Runner %s", process.pid, runner_id)
-            communicate_task = asyncio.create_task(process.communicate())
-            cancelled = False
-            while not communicate_task.done():
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(communicate_task),
-                        timeout=self.config.poll_interval_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    cancelled = await self.repository.heartbeat(runner_id)
-                    if cancelled:
-                        await self._terminate(process)
-                        break
-
-            stdout_bytes, stderr_bytes = await communicate_task
-            stdout = self._bounded_log(stdout_bytes)
-            stderr = self._bounded_log(stderr_bytes)
-            if not cancelled:
-                current = await self.repository.get_runner(runner_id)
-                cancelled = bool(current and current["cancel_requested"])
+            if environment is None:
+                return
+            if self._ray_module is None or self._worker_remote is None:
+                raise RuntimeError("Ray Worker runtime is not initialized")
+            actor_count = benchmark_actor_count(runner["benchmark"])
+            worker = Worker(
+                self._ray_module,
+                self._worker_remote,
+                runner_id,
+                actor_count,
+                self.config.ray_actor_num_cpus,
+            )
+            self._active_workers[runner_id] = worker
+            execution_runtime = {
+                "backend": "ray",
+                "worker_kind": "ray_task",
+                "ray_mode": self._ray_mode,
+                "ray_namespace": "llmperf-control",
+                "ray_actor_num_cpus": self.config.ray_actor_num_cpus,
+                "ray_actor_count": actor_count,
+                "resource_scheduling": "independent_actors",
+                "runner_id": runner_id,
+                "campaign_id": runner.get("campaign_id"),
+            }
+            worker.start(
+                runner["benchmark"],
+                environment,
+                execution_runtime,
+                self.config.log_bytes_limit,
+            )
+            LOGGER.info(
+                "Started Ray Worker task=%s for Runner %s with %d actor(s)",
+                worker.task_id(),
+                runner_id,
+                actor_count,
+            )
+            cancelled = await self._wait_worker(worker, runner_id)
             if cancelled:
+                await self._cancel_worker(worker)
                 await self.repository.finish_runner(
                     runner_id,
                     CANCELLED,
                     "Benchmark cancelled by user",
-                    process.returncode,
-                    stdout,
-                    stderr,
+                    None,
+                    "",
+                    "",
                 )
                 LOGGER.info("Runner %s cancelled", runner_id)
                 return
-            if process.returncode != 0:
+
+            payload = worker.result()
+            stdout = str(payload.get("stdout") or "")
+            stderr = str(payload.get("stderr") or "")
+            if not payload.get("ok"):
+                message = str(payload.get("error") or "Ray Worker failed")
                 await self.repository.finish_runner(
                     runner_id,
                     FAILED,
-                    f"Benchmark worker exited with code {process.returncode}",
-                    process.returncode,
+                    message,
+                    1,
                     stdout,
                     stderr,
                 )
-                LOGGER.error(
-                    "Worker for Runner %s exited with code %s",
-                    runner_id,
-                    process.returncode,
-                )
+                LOGGER.error("Ray Worker for Runner %s failed: %s", runner_id, message)
                 return
-            current = await self.repository.get_runner(runner_id)
-            if current is None or current["status"] not in {SUCCEEDED, FAILED}:
-                await self.repository.finish_runner(
-                    runner_id,
-                    FAILED,
-                    "Worker exited successfully without committing benchmark results",
-                    process.returncode,
-                    stdout,
-                    stderr,
-                )
-                return
-            await self.repository.set_logs(
-                runner_id, process.returncode, stdout, stderr
+
+            summary = payload["summary"]
+            requests = payload["requests"]
+            summary["runner_metadata"] = runner["metadata"]
+            summary["execution_runtime"]["worker_id"] = worker.task_id()
+            terminal_status, message = summarize_outcome(summary, requests)
+            committed = await self.repository.complete_runner(
+                runner_id,
+                summary,
+                requests,
+                0,
+                stdout,
+                stderr,
+                terminal_status=terminal_status,
+                error_message=message if terminal_status == FAILED else None,
             )
-            LOGGER.info("Worker completed Runner %s", runner_id)
+            if not committed:
+                current = await self.repository.get_runner(runner_id)
+                if current is not None and current["cancel_requested"]:
+                    await self.repository.finish_runner(
+                        runner_id,
+                        CANCELLED,
+                        "Benchmark cancelled before result commit",
+                        None,
+                        stdout,
+                        stderr,
+                    )
+            LOGGER.info("Ray Worker completed Runner %s: %s", runner_id, terminal_status)
         except asyncio.CancelledError:
-            if process is not None and process.returncode is None:
-                await self._terminate(process)
-            if communicate_task is not None:
-                await asyncio.gather(communicate_task, return_exceptions=True)
+            if worker is not None:
+                worker.cancel(force=True)
+                worker.close()
             current = await self.repository.get_runner(runner_id)
             if current is not None and current["status"] not in TERMINAL_STATUSES:
                 await self.repository.requeue_runner(
@@ -255,26 +533,10 @@ class Scheduler:
             raise
         except Exception as exc:
             LOGGER.exception("Scheduler failed while executing Runner %s", runner_id)
-            stdout = ""
-            stderr = ""
-            exit_code = process.returncode if process is not None else None
-            if communicate_task is not None and communicate_task.done():
-                try:
-                    stdout_bytes, stderr_bytes = communicate_task.result()
-                    stdout = self._bounded_log(stdout_bytes)
-                    stderr = self._bounded_log(stderr_bytes)
-                except Exception:
-                    pass
             await self.repository.finish_runner(
-                runner_id, FAILED, str(exc), exit_code, stdout, stderr
+                runner_id, FAILED, str(exc), 1, "", str(exc)
             )
-
-    async def _terminate(self, process: asyncio.subprocess.Process) -> None:
-        if process.returncode is not None:
-            return
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), self.config.cancel_grace_seconds)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+        finally:
+            if worker is not None:
+                worker.close()
+            self._active_workers.pop(runner_id, None)

@@ -563,7 +563,8 @@ def get_token_throughput_latencies(
             request_threads_stop.set()
 
     threads = []
-    for i in range(num_concurrent_requests):
+    worker_count = min(num_concurrent_requests, max_num_completed_requests)
+    for i in range(worker_count):
         thread = threading.Thread(target=launch_request, args=(i,))
         threads.append(thread)
         thread.start()
@@ -580,21 +581,6 @@ def get_token_throughput_latencies(
     timed_out = end_time - start_time >= test_timeout_s
     if timed_out:
         print("Test timed out before all requests could be completed.")
-
-    # check one last time that there are no remaining results to collect.
-    clients = construct_clients(llm_api=llm_api, num_clients=1)
-    req_launcher = RequestsLauncher(clients)
-    outs = req_launcher.get_next_ready()
-    all_metrics = []
-    for out in outs:
-        request_metrics, gen_text, _ = out
-        request_metrics = normalize_request_metrics(
-            request_metrics, gen_text, get_token_length
-        )
-        with completed_requests_lock:
-            if num_completed_requests < max_num_completed_requests:
-                completed_requests.append(request_metrics)
-                num_completed_requests += 1
 
     print(f"Results for token benchmark for {model} queried with the {llm_api} api.\n")
     ret = metrics_summary(completed_requests, start_time, end_time)
@@ -944,7 +930,7 @@ args.add_argument(
 
 if __name__ == "__main__":
     env_vars = dict(os.environ)
-    ray.init(runtime_env={"env_vars": env_vars})
+    ray.init(runtime_env={"env_vars": env_vars}, include_dashboard=False)
     args = args.parse_args()
 
     # Parse user metadata.

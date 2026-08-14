@@ -12,7 +12,7 @@
 ## 1. 配置边界
 
 Provider Profile 由 Backend 拥有。Runner/Campaign YAML 只写稳定的 `provider` ID 和
-精确 `model` ID，不写 endpoint、API key，也不要依赖 Worker 进程的桌面 shell 环境。
+精确 `model` ID，不写 endpoint、API key，也不要依赖 Backend 桌面 shell 的隐式环境。
 
 只有用户要求配置 Provider、或已要求运行但目标 Profile 不存在/不可用时才修改配置。
 缺少密钥时不要猜测或要求用户把密钥贴进对话；给出 `--stdin` 命令并让用户安全输入。
@@ -76,8 +76,9 @@ Backend 配置优先级为：进程环境、`LLMPERF_ENV_FILE`、用户持久化
 目录 `.env`。`llmperf-backend config set` 修改用户持久化文件，不热更新正在运行的
 ProviderRegistry；任何 Profile、默认 Provider、URL 或 key 变化后都必须重启 Backend。
 
-Scheduler 启动 Worker 时会移除所有 Profile 的 endpoint/key 变量，只把当前 Runner
-选中的 Profile 注入 Worker。不要把 secret 复制到 YAML、metadata、日志或导出文件。
+Scheduler 创建 Worker Ray task 时会移除所有 Profile 的 endpoint/key 变量，只把当前
+Runner 选中的 Profile 注入 task runtime environment。不要把 secret 复制到 YAML、
+metadata、日志或导出文件。
 
 ## 6. 验证与排障
 

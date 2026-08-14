@@ -154,14 +154,29 @@ class TokenizerCache:
         revision = str(raw_revision).strip() if raw_revision is not None else "main"
         if not revision:
             raise TokenizerResolutionError("Tokenizer revision must not be empty")
+        raw_requested_revision = spec.get("requested_revision")
+        requested_revision = (
+            str(raw_requested_revision).strip()
+            if raw_requested_revision is not None
+            else None
+        )
         use_fast = bool(spec.get("use_fast", True))
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, self._resolve_sync, tokenizer_id, revision, use_fast
+            None,
+            self._resolve_sync,
+            tokenizer_id,
+            revision,
+            use_fast,
+            requested_revision,
         )
 
     def _resolve_sync(
-        self, tokenizer_id: str, revision: str, use_fast: bool
+        self,
+        tokenizer_id: str,
+        revision: str,
+        use_fast: bool,
+        requested_revision: Optional[str] = None,
     ) -> TokenizerResolution:
         requested_key = (tokenizer_id, revision, use_fast)
         with self._lock:
@@ -199,11 +214,17 @@ class TokenizerCache:
             existing_target = self.resolved_directory / self._artifact_key(
                 tokenizer_id, resolved_revision, use_fast
             )
-            legacy_target = self.resolved_directory / self._artifact_key(
-                tokenizer_id, revision, use_fast
-            )
-            if not existing_target.is_dir() and legacy_target.is_dir():
-                existing_target = legacy_target
+            legacy_revisions = [revision]
+            if requested_revision and requested_revision not in legacy_revisions:
+                legacy_revisions.append(requested_revision)
+            if not existing_target.is_dir():
+                for legacy_revision in legacy_revisions:
+                    legacy_target = self.resolved_directory / self._artifact_key(
+                        tokenizer_id, legacy_revision, use_fast
+                    )
+                    if legacy_target.is_dir():
+                        existing_target = legacy_target
+                        break
             if existing_target.is_dir():
                 LOGGER.info(
                     "Tokenizer artifact-cache hit: %s requested=%s resolved=%s "
@@ -221,8 +242,14 @@ class TokenizerCache:
                     path=existing_target,
                     cached=True,
                 )
+                resolved_key = (tokenizer_id, resolved_revision, use_fast)
                 with self._lock:
                     self._entries[requested_key] = resolution
+                    # The API resolves mutable aliases such as ``main`` before
+                    # persistence. The Scheduler then receives the immutable
+                    # revision. Register both keys so that handoff is a local
+                    # memory-cache hit instead of a second Hub lookup.
+                    self._entries[resolved_key] = resolution
                 return resolution
             try:
                 self.download_directory.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,6 @@
 ---
 name: operate-llmperf
-description: "Turn benchmark requirements into safe, runnable LLMPerf workloads and operate this project end to end. Use when Codex needs to create or review Runner/Campaign YAML, select or configure Backend Provider Profiles, verify models and credentials, run smoke/load/KV-cache/retention/residency tests, operate llmperfctl, diagnose Runner or Campaign failures, interpret or export results, or modify Scheduler/Planner/Worker/PostgreSQL implementation."
+description: "Turn benchmark requirements into safe, runnable LLMPerf workloads and operate this project end to end. Use when Codex needs to create or review Runner/Campaign YAML, select or configure Backend Provider Profiles, verify models and credentials, run smoke/load/KV-cache/retention/residency tests, operate llmperfctl, diagnose Runner or Campaign failures, interpret or export results, define CLI/API input-output contracts, or modify Scheduler/Planner/Worker/PostgreSQL implementation."
 ---
 
 # Operate LLMPerf
@@ -18,6 +18,8 @@ answer it, prove the Provider with a smoke request, then scale deliberately.
   Backend or CLI, diagnosing a run, interpreting status, or exporting results.
 - Read [references/engineering.md](references/engineering.md) completely before
   changing source, database behavior, tests, architecture, or project docs.
+- Read [references/io.md](references/io.md) completely before changing CLI/API input,
+  validation, projection, rendering, logging, redaction, or export behavior.
 - Read more than one reference when the task crosses those boundaries.
 
 ## Preserve the execution model
@@ -29,13 +31,54 @@ Apply these invariants:
 2. Treat a RunnerPlan as a template. The Planner materializes due occurrences as
    ordinary queued Runners; it never occupies a Scheduler slot while waiting.
 3. Treat the Scheduler as the queue consumer and Worker owner. A Worker is a
-   temporary subprocess for exactly one claimed Runner.
-4. Persist control state and benchmark results in PostgreSQL. Do not add SQLite
+   Scheduler-local Ray execution handle for exactly one claimed Runner, not an OS
+   subprocess.
+4. Keep that one-Runner Worker resource boundary. The Scheduler is the only Ray driver.
+   Every Worker submits one retry-free Ray task and obtains at least one Runner-owned LLM
+   client actor. Actors request resources independently and release them with their request
+   slot. Keep every client actor serial (`max_concurrency=1`) and exclusive to one Runner;
+   never initialize Ray or connect PostgreSQL inside a Worker task.
+5. Persist control state and benchmark results in PostgreSQL. Do not add SQLite
    fallback behavior or in-memory authoritative state.
-5. Keep Provider endpoints and credentials in Backend-owned profiles. Put only
+6. Keep Provider endpoints and credentials in Backend-owned profiles. Put only
    the stable provider ID and model ID in workload YAML.
-6. Distinguish Campaign lifecycle `status` from aggregate execution `outcome`.
+7. Distinguish Campaign lifecycle `status` from aggregate execution `outcome`.
    Never infer that `completed` means every Runner succeeded.
+
+## Run the performance safety gate
+
+Before submission, read `scheduler status` and validate with the active slot/Ray shape:
+
+```bash
+.venv/bin/python .codex/skills/operate-llmperf/scripts/validate_workload.py FILE \
+  --scheduler-slots SLOTS --ray-num-cpus CPUS --ray-actor-num-cpus ACTOR_CPUS
+```
+
+Treat a non-zero result as a stop condition. Report planned Runner count, estimated
+Provider requests, mean-token budget, maximum Runner concurrency, effective concurrency,
+and warnings. In addition:
+
+- verify the shared Ray actor capacity can satisfy the effective concurrency; every
+  Runner must use Ray, but no Runner may create its own runtime;
+- verify concurrent Campaigns receive fair claims while Ray independently queues their
+  actors; do not require all actors of one Runner to become ready simultaneously;
+- account for all RunnerPlan occurrences and protocol phases, not only YAML item count;
+- inspect host CPU/memory, PostgreSQL latency, Ray worker churn, and queue growth before
+  increasing slots; a 1x1 Runner can still be expensive when its runtime is heavyweight;
+- treat `scheduler status.performance_guard.tripped=true` as a runtime circuit breaker:
+  new claims stop, queued work stays durable, and running Runners are not killed;
+- treat `scheduler status.ray_runtime.claim_blocked=true` as Ray Object Store pressure;
+  wait for ObjectRefs to be persisted/released before increasing slots;
+- when a Campaign causes resource pressure, cancel the Campaign before restarting the
+  Backend so queued Runners and pending Dispatches cannot resume unexpectedly.
+
+Do not add blanket Provider retries to performance or cache probes. Retry only a bounded,
+explicit set of transient failures with exponential backoff and jitter. Never retry 4xx
+authentication/model/parameter errors. For cache protocols, do not retry a phase in the
+same prompt family after an ambiguous send: mark the instance failed and, if repetition is
+required, create a new independent instance/seed so the retry cannot warm or refresh the
+cache being measured. For load/reliability measurements, keep retries disabled by default
+because retries hide the error rate and increase offered load.
 
 ## Translate requirements into a workload
 
@@ -72,8 +115,8 @@ Select the durable shape:
    before any longer or more expensive workload when execution is in scope.
 5. Create the requested YAML from the proven smoke configuration. Keep stochastic fields
    fixed when the experiment requires reproducibility and bound every plan/protocol.
-6. Validate YAML locally with
-   `.venv/bin/python .codex/skills/operate-llmperf/scripts/validate_workload.py FILE`.
+6. Validate YAML locally with the performance safety command above using the active
+   Scheduler slot count and shared Ray address (if configured).
    Preview RunnerPlan occurrences. Remember submission may resolve Provider, tokenizer, and
    dataset artifacts before it accepts the complete workload.
 7. Run only when requested or clearly included in the task. Use `-w` for observation, retain
@@ -118,7 +161,7 @@ Select the durable shape:
 - For long `-w` commands, remember that logs are rendered by HTTP polling and
   change detection; exiting the CLI stops observation, not durable execution.
 - Avoid masking a failed request as a zero-request success. Preserve the first
-  request error and Worker process details in the Runner result.
+  request error and Worker task details in the Runner result.
 
 ## Keep outputs safe
 
@@ -127,3 +170,12 @@ Select the durable shape:
 - Keep JSON/table output on stdout and operational logs on stderr.
 - Use `--log-level debug` only when HTTP timing and response metadata are needed;
   credentials must remain redacted.
+
+## Preserve the input-output boundary
+
+Apply the decode -> validate -> resolve -> persist input pipeline and the authoritative
+record -> command compatibility adapter -> whitelist projector -> render/export output
+pipeline in [references/io.md](references/io.md). Register every CLI request explicitly;
+never use an identity adapter, a generic raw fallback, or let a renderer accept dict/list
+responses. Keep default views stable and filtered, make `--full` a larger whitelist rather
+than a raw escape hatch, and update adapters, help, redaction, and boundary tests together.

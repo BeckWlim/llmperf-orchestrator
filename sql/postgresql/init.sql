@@ -198,6 +198,9 @@ CREATE INDEX IF NOT EXISTS ix_runners_status_created_at
 CREATE INDEX IF NOT EXISTS ix_runners_queue_created_at
     ON benchmark_runners (created_at)
     WHERE status = 'queued';
+CREATE INDEX IF NOT EXISTS ix_runners_running_campaign
+    ON benchmark_runners (campaign_id)
+    WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS ix_runners_created_at
     ON benchmark_runners (created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_runner_plan_time

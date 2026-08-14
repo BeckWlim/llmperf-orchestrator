@@ -1,3 +1,5 @@
+"""Pure benchmark, request normalization, and cache-probe algorithm tests."""
+
 import json
 from collections import Counter
 
@@ -466,7 +468,7 @@ def test_client_observability(monkeypatch):
         OpenAIChatCompletionsClient,
     )
 
-    client = OpenAIChatCompletionsClient.__ray_metadata__.modified_class()
+    client = OpenAIChatCompletionsClient()
     metrics, text, _ = client.llm_request(
         RequestConfig(
             model="model",

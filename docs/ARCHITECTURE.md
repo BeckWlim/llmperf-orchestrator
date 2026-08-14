@@ -30,7 +30,7 @@ llmperf/
 │   │   ├── persistence.py       # SQLAlchemy Async ORM 与事务仓储
 │   │   ├── providers.py         # 供应商配置、凭据隔离与模型发现
 │   │   ├── scheduler.py         # Runner 领取、心跳、取消、Worker 监管
-│   │   ├── worker.py            # 指标计算与数据库首写
+│   │   ├── worker.py            # Ray task/ObjectRef 封装与指标计算
 │   │   └── configs/default.yaml # 默认运行配置
 │   └── llmperf_cli/
 │       ├── client.py            # 仅使用 HTTP 的轻量客户端
@@ -46,10 +46,11 @@ flowchart LR
     CLI[llmperfctl\n独立 CLI] -->|HTTP/JSON| API[FastAPI 控制面]
     API -->|异步事务| PG[(PostgreSQL)]
     Scheduler[Async Scheduler] -->|FOR UPDATE\nSKIP LOCKED| PG
-    Scheduler -->|受控子进程| Worker[Benchmark Worker]
-    Worker -->|调用计算函数| Core[LLMPerf + Ray]
+    Scheduler -->|创建执行句柄| Worker[Worker: Ray task + ObjectRef]
+    Worker -->|提交 retry-free task| Core[Shared Ray + Runner Actors]
     Core -->|summary + request metrics| Worker
-    Worker -->|首个持久化写入\n单事务| PG
+    Worker -->|交回结果| Scheduler
+    Scheduler -->|首个持久化写入\n单事务| PG
     API -->|按需读取| Export[单次/批次 JSON 导出]
 ```
 
@@ -58,11 +59,13 @@ API、Scheduler、Runner 和 Worker 是四个不同边界：
 - API 是控制面：接受任务、查询状态、请求取消、导出数据。
 - Scheduler 是调度面：常驻 backend、领取 queued Runner、监管 Worker。
 - Runner 是持久化执行对象：保存 YAML 快照、状态、取消意图和结果。
-- Worker 是一次性执行进程：为一个 Runner 调用 LLMPerf，提交结果后退出。
+- Worker 是 Scheduler 进程内的一次性 Ray 执行句柄：为一个 Runner 持有 task
+  ObjectRef、取消状态和清理责任。
 
 同一个 Runner 在 Scheduler 重启或心跳过期后可能先后产生多个 Worker 执行尝试，
 但始终只有一个 `runner_id` 和一份受事务保护的最终结果。Worker 不是用户可直接
-创建的资源，其 PID、退出码和日志作为 Runner 的运行时信息查询。
+创建的资源。旧 PID 字段保持可空兼容，Ray task ID 记录在
+`summary.execution_runtime.worker_id`。
 
 ## 4. 领域标识
 
@@ -153,13 +156,45 @@ Scheduler 通过下面的数据库语义领取 Runner：
 SELECT ...
 FROM benchmark_runners
 WHERE status = 'queued'
-ORDER BY created_at
+ORDER BY campaign_running_count, created_at
 FOR UPDATE SKIP LOCKED
 LIMIT 1;
 ```
 
 因此多个 Scheduler 可以竞争队列，而不会重复领取同一 Runner。
-`max_concurrent_runners` 控制每个 Scheduler 进程的并发槽位。
+`max_concurrent_runners` 控制每个 Scheduler 进程的并发槽位。每个 executing Runner
+都由 Worker 提交 Ray task，且至少申请一个 LLM client actor，不存在无 actor 执行路径。
+`scheduler.ray_address` 为空时 Scheduler 启动一套 embedded shared runtime；配置后连接
+external runtime。Scheduler 是唯一 Ray driver；Worker task 不会自行创建 GCS、dashboard、raylet 或
+对象存储。Embedded 模式要求 `server.workers=1`；多 Backend 进程必须显式连接 external
+runtime，避免每个 Uvicorn Worker 各启一套 Ray。Worker 句柄负责 Runner 级取消、日志
+和任务清理。`ray_num_cpus / ray_actor_num_cpus` 是本 Backend 声明的全局
+actor 安全预算，即使 external 集群物理容量更大也不会绕过提交前容量检查。
+
+共享 Ray 只共享集群基础设施，不共享 LLM client actor。每个 Runner 创建自己的 actor，
+actor 生命周期与 Worker task 的请求槽绑定，并显式设置 `max_concurrency=1`。因此 Actor
+是 Scheduler 可见的串行原子执行单元，不启用 Threaded/Async Actor，也不跨 Runner
+复用；不同 Campaign 的凭据、请求队列、Prompt family 和取消信号不得进入共享可变
+actor。Campaign 并跑是核心能力：PostgreSQL 优先
+领取当前 running 数较少的 Campaign，Ray 独立排队每个 Actor，不要求同一 Runner 的
+全部 Actor 同时 ready。共享节点争用记录为结果 provenance，而不是正确性限制。
+
+API 在写入队列前通过统一性能守护估算完整 RunnerPlan occurrence 与协议 phase，限制
+planned Runner、Provider 请求、mean-token 预算、单 Runner 并发和 Scheduler slot 放大
+后的有效并发。超硬限制返回 422，不产生部分 Campaign。
+
+运行期性能守护从 `/proc/meminfo`（不可用时使用 `sysconf`）读取宿主机可用内存。
+达到 `max_host_memory_utilization` 后 Scheduler 熔断新 claim，queued Runner 保持不变；
+降到更低的 `resume_host_memory_utilization` 后恢复。迟滞避免水位附近频繁启停，守护
+不会擅自终止 running Runner。`scheduler status.performance_guard` 暴露当前采样和
+熔断原因。Ray actor 使用 `ray_actor_num_cpus` 声明资源，且 `max_restarts=0`、
+`max_task_retries=0`，防止 OOM/基础设施故障触发隐式流量重放。Scheduler 周期采样
+Ray cluster/available resources，并尽力采集 alive nodes；不健康时停止新 claim。
+Object Store 可用比例低于 `min_ray_object_store_available_ratio` 时同样暂停 claim，恢复到
+`resume_ray_object_store_available_ratio` 后继续；Worker 持久化完成即丢弃 ObjectRef，
+减少并跑 Campaign 的结果 spill 与宿主机 swap 风险。
+每个 Runner summary 持久化 `execution_runtime`，记录 Ray backend、Ray mode、
+namespace 和 actor CPU 配额，报告可以据此识别不同运行时或共享集群争用带来的偏差。
 
 运行期间 Scheduler 定期更新 `heartbeat_at` 并读取 `cancel_requested`。超过
 `stale_after_seconds` 的 Runner 可重新排队。成功提交和取消请求都会锁定同一
@@ -173,25 +208,25 @@ sequenceDiagram
     participant A as FastAPI
     participant D as PostgreSQL
     participant R as Scheduler
-    participant W as Worker Process
-    participant L as LLMPerf/Ray
+    participant W as Worker Handle
+    participant L as Shared Ray
 
     C->>A: POST /api/v1/runners
     A->>D: INSERT queued Runner + event
     R->>D: claim with SKIP LOCKED
     D-->>R: running Runner
-    R->>W: python -m llmperf_backend.worker --runner-id ...
-    W->>D: load immutable Runner configuration
-    W->>L: execute benchmark calculation
+    R->>W: create task/ObjectRef handle
+    W->>L: execute benchmark and create request actors
     L-->>W: summary + individual metrics
-    W->>D: lock Runner; INSERT metrics; UPDATE succeeded
-    D-->>W: commit
-    R->>D: persist bounded stdout/stderr
+    W-->>R: summary + metrics + bounded logs
+    R->>D: lock Runner; INSERT metrics; UPDATE terminal state
+    D-->>R: commit
 ```
 
-Worker 的计算结果先存在进程内存，首个持久化位置是 PostgreSQL。Summary 与全部逐请求指标在一个事务中提交；如果事务前已经请求取消，则拒绝成功提交。
+Worker 的计算结果先存在 Ray task 返回值中，首个持久化位置是 PostgreSQL。Summary 与
+全部逐请求指标由 Scheduler 在一个事务中提交；如果事务前已经请求取消，则拒绝成功提交。
 
-Worker 退出码只表示执行进程是否正常。业务完成状态还检查请求结果：零成功请求
+Ray Worker task 正常返回只表示编排函数完成。业务完成状态还检查请求结果：零成功请求
 写为 `failed`，部分失败写为 `succeeded` 且
 `summary.outcome.status=degraded`，全部成功才写为普通 `succeeded`。三种情况
 都会在同一事务中保存 Summary 与逐请求指标；因此具有持久化结果的失败 Runner 也
@@ -271,8 +306,8 @@ llmperfctl runner export RUNNER_ID -o runner.json
 
 `runner list` 默认显示紧凑表格，只包含状态、Runner ID、Provider/Model、成功/失败请求数、
 创建时间和标签，默认最多 20 条。后端列表接口同样默认返回轻量投影，不携带完整
-summary、stdout 或 stderr；`--json` 输出轻量 JSON，只有 `--full` 请求并显示完整 Runner。
-CLI 与服务端使用单一严格列表契约。
+summary、stdout 或 stderr；`--json` 输出轻量 JSON，`--full` 请求详细记录但仍由 CLI
+兼容层投影为扩展白名单。CLI 与服务端使用单一严格列表契约，完整记录只进入版本化 export。
 
 Benchmark tokenizer 优先由每个 Runner 的 YAML 主动选择：
 
@@ -311,7 +346,8 @@ Runner 未声明 tokenizer 时使用 backend 默认的
 启动、等待、取消和导出命令默认不向 stdout 倾倒 Backend JSON；轮询期间只在状态变化
 时向 stderr 打印 `queued/running/终态`。展示与查询统一由 CLI 最终渲染层处理：
 `status --summary/list` 使用紧凑视图，`runner logs` 只调用专用日志投影接口并明确分隔 Worker
-stdout/stderr，`--full` 才显示完整 Runner。失败或取消时 CLI 进程返回退出码 2，适合
+stdout/stderr，`--full` 也只显示扩展白名单。每个 CLI 请求必须经过显式注册的兼容
+adapter 和资源 projector，renderer 拒绝原始 dict/list。失败或取消时 CLI 进程返回退出码 2，适合
 脚本和 CI 判断。`--timeout` 只终止本地等待，不取消已经持久化的任务；任务可继续用
 Runner ID 查询。Benchmark 的 `timeout_seconds` 会继续传递为模型 HTTP 请求时限。
 
@@ -535,7 +571,7 @@ FastAPI 自动生成的 OpenAPI 页面位于 `/docs`。
 - PostgreSQL 数据目录应位于 WSL Linux 文件系统，不应放在 `/mnt/c`。
 - 应用数据库角色只需拥有 `llmperf` 数据库，不应授予 `SUPERUSER`。
 - 数据库 URL 通过环境变量提供；配置查询接口会隐藏密码。
-- Worker 数据库 URL 通过子进程环境传递，不出现在命令参数中，并在启动 Ray 前从 Ray runtime 环境移除。
+- Worker task 不接收数据库 URL，也不连接 PostgreSQL；Scheduler 是结果的唯一持久化者。
 - stdout/stderr 仅保留末尾 `log_bytes_limit` 字节，防止日志无限增长。
 - 当前 `auto_create_schema` 适合全新开发数据库；`create_all` 不会升级已有表。进入稳定部署前应引入 Alembic 迁移。
 - `/api/v1` 使用固定 PEM 公钥验证短时效 RS256 JWT；`/health` 保持公开，便于本地健康检查。

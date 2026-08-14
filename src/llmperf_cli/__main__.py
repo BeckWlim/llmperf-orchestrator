@@ -23,6 +23,12 @@ from llmperf.user_config import (
     unset_environment_value,
 )
 from llmperf_cli.client import ClientError, LLMPerfClient, write_json
+from llmperf_cli.compatibility import (
+    CLIProjection,
+    adapt_cli_response,
+    project_health,
+    project_runner,
+)
 from llmperf_cli.environment import load_cli_environment, resolve_cli_environment_path
 
 
@@ -45,7 +51,7 @@ Concepts:
   Planner    The backend component that materializes due RunnerPlans.
   Campaign   A named workload containing Runners and/or RunnerPlans.
   Scheduler  The backend component that assigns queued Runners to Workers.
-  Worker     A temporary backend-owned process; it is not started directly.
+  Worker     A backend-owned Ray execution handle; it is not started directly.
 
 Typical workflow:
   1. Inspect providers:  llmperfctl provider list
@@ -104,6 +110,21 @@ def load_runner_plan(path: Path) -> Dict[str, Any]:
 
 def print_json(document: Any) -> None:
     print(json.dumps(document, ensure_ascii=False, indent=2, default=str))
+
+
+def print_health(document: Dict[str, Any]) -> None:
+    """Render the stable health projection without internal configuration data."""
+
+    auth = document.get("auth") or {}
+    print(f"Backend: {_table_value(document.get('status'))}")
+    print(
+        f"Database: {_table_value(document.get('database'))}  "
+        f"Planner: {_table_value(document.get('planner'))}"
+    )
+    print(
+        f"Providers: {_table_value(document.get('providers'), '0')}  "
+        f"Auth: {_table_value(auth.get('status'))}"
+    )
 
 
 def submit_with_artifact_progress(action):
@@ -484,77 +505,29 @@ def print_runner_logs(document: Dict[str, Any]) -> None:
             print("(empty)")
 
 
-def render_result(arguments: argparse.Namespace, result: Any) -> None:
-    """Apply the single CLI display policy after command execution completes."""
+def render_result(result: CLIProjection) -> None:
+    """Render only compatibility-layer projections; raw documents are rejected."""
 
-    command = arguments.command
-    subcommand = getattr(arguments, f"{command}_command", None)
-    if (
-        command == "campaign"
-        and subcommand == "status"
-        and not arguments.json
-        and not arguments.full
-        and not arguments.include_requests
-    ):
-        print_campaign_status(result)
-        return
-    if command == "campaign" and subcommand == "list" and not arguments.json:
-        print_campaign_table(result)
-        return
-    if (
-        command == "runner"
-        and subcommand == "list"
-        and not arguments.json
-        and not arguments.full
-    ):
-        print_runner_table(result)
-        return
-    if command == "runner" and subcommand == "status" and arguments.summary:
-        print_runner_summary(result)
-        return
-    if command == "runner" and subcommand == "logs":
-        print_runner_logs(result)
-        return
-    if command == "campaign" and subcommand in {"start", "cancel", "export"}:
-        if not getattr(arguments, "full", False):
-            return
-    if command == "runner" and subcommand in {"start", "wait", "cancel", "export"}:
-        if not getattr(arguments, "full", False):
-            return
-    print_json(result)
+    if not isinstance(result, CLIProjection):
+        raise ClientError("CLI renderer accepts only compatibility projections")
+    renderers = {
+        "health": print_health,
+        "campaign_status": print_campaign_status,
+        "campaign_table": print_campaign_table,
+        "runner_table": print_runner_table,
+        "runner_summary": print_runner_summary,
+        "runner_logs": print_runner_logs,
+        "json": print_json,
+        "silent": lambda document: None,
+    }
+    renderer = renderers.get(result.renderer)
+    if renderer is None:
+        raise ClientError(f"Unsupported CLI renderer: {result.renderer}")
+    renderer(result.payload)
 
 
 def summarize_runner(runner: Dict[str, Any]) -> Dict[str, Any]:
-    benchmark = runner.get("benchmark") or {}
-    summary = runner.get("summary") or {}
-    results = summary.get("results") or {}
-    outcome = summary.get("outcome") or {}
-    error = outcome.get("first_error")
-    if error is None and runner.get("error_message"):
-        error = {"code": None, "message": runner["error_message"]}
-    return {
-        "runner_id": runner.get("runner_id"),
-        "status": runner.get("status"),
-        "label": runner.get("label"),
-        "provider": benchmark.get("provider"),
-        "model": benchmark.get("model"),
-        "requests": {
-            "started": outcome.get(
-                "requests_started", results.get("num_requests_started")
-            ),
-            "completed": outcome.get(
-                "requests_completed", results.get("num_completed_requests")
-            ),
-            "failed": outcome.get("requests_failed", results.get("number_errors")),
-            "error_rate": results.get("error_rate"),
-        },
-        "error": error,
-        "message": outcome.get("message") or runner.get("error_message"),
-        "scheduler_id": runner.get("scheduler_id"),
-        "worker": runner.get("worker"),
-        "started_at": runner.get("started_at"),
-        "finished_at": runner.get("finished_at"),
-    }
+    return project_runner(runner)
 
 
 def campaign_status_view(client: LLMPerfClient, campaign_id: str) -> Dict[str, Any]:
@@ -1065,12 +1038,29 @@ Examples:
         description="Print the selected CLI environment file and whether it exists.",
     )
 
-    _command_parser(
+    health = _command_parser(
         commands,
         "health",
         help="Check backend availability and component counts",
-        description="Return backend health, database state, and component counts.",
-        epilog="Example:\n  llmperfctl health",
+        description=(
+            "Show a filtered Backend health projection. Use --json for the same "
+            "stable fields or --full for the detailed compatible projection."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  llmperfctl health\n"
+            "  llmperfctl health --json\n"
+            "  llmperfctl health --full"
+        ),
+    )
+    health_output = health.add_mutually_exclusive_group()
+    health_output.add_argument(
+        "--json", action="store_true", help="Print the filtered health projection as JSON"
+    )
+    health_output.add_argument(
+        "--full",
+        action="store_true",
+        help="Print the detailed compatibility projection (never the raw response)",
     )
 
     scheduler = _command_parser(
@@ -1079,7 +1069,7 @@ Examples:
         help="Inspect the backend Runner scheduler",
         description=(
             "Inspect the backend-owned Scheduler. The Scheduler claims queued "
-            "Runners and starts temporary Worker processes; it is started with "
+            "Runners and supervises Ray-backed Workers; it is started with "
             "the backend, not through llmperfctl."
         ),
         epilog="Example:\n  llmperfctl scheduler status",
@@ -1406,7 +1396,7 @@ Examples:
     campaign_status.add_argument(
         "--full",
         action="store_true",
-        help="Return complete Campaign and Runner result documents",
+        help="Print a detailed compatibility projection; use export for raw results",
     )
     campaign_status.add_argument(
         "--include-requests",
@@ -1483,8 +1473,8 @@ Examples:
         help="Start and inspect durable benchmark executions",
         description=(
             "A Runner is one durable benchmark execution. Starting a Runner queues "
-            "it in the backend; the Scheduler selects it and launches a temporary "
-            "Worker process."
+            "it in the backend; the Scheduler selects it and creates a Ray-backed "
+            "Worker execution handle."
         ),
         epilog="""\
 Examples:
@@ -1556,16 +1546,28 @@ Examples:
 Examples:
   llmperfctl runner status <runner-id>
   llmperfctl runner status <runner-id> --wait
-  llmperfctl runner status <runner-id> --summary
+  llmperfctl runner status <runner-id> --json
+  llmperfctl runner status <runner-id> --full
 """,
     )
     runner_status.add_argument(
         "runner_id", metavar="RUNNER_ID", help="Runner identifier"
     )
-    runner_status.add_argument(
+    runner_status_output = runner_status.add_mutually_exclusive_group()
+    runner_status_output.add_argument(
         "--summary",
         action="store_true",
-        help="Print a compact outcome instead of the complete Runner",
+        help="Print the compact default view (compatibility alias)",
+    )
+    runner_status_output.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the compact Runner projection as JSON",
+    )
+    runner_status_output.add_argument(
+        "--full",
+        action="store_true",
+        help="Print a detailed compatibility projection; use logs/export for raw data",
     )
     runner_status.add_argument(
         "-w",
@@ -1592,7 +1594,7 @@ Examples:
         help="List and filter Runners",
         description=(
             "List Runners as a compact table by default. Use --json for the same "
-            "lightweight records or --full for complete records and logs."
+            "lightweight records or --full for detailed compatibility projections."
         ),
         epilog="""\
 Examples:
@@ -1620,7 +1622,7 @@ Examples:
     runner_list_output.add_argument(
         "--full",
         action="store_true",
-        help="Request complete Runners, including summaries and logs",
+        help="Request detailed records and print only their compatibility projections",
     )
     runner_cancel = _command_parser(
         runner_commands,
@@ -1664,7 +1666,7 @@ Examples:
     runner_wait.add_argument(
         "--full",
         action="store_true",
-        help="Print complete Runners and captured Worker logs",
+        help="Print detailed Runner compatibility projections",
     )
     runner_logs = _command_parser(
         runner_commands,
@@ -1885,10 +1887,10 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
                     [arguments.runner_id],
                     arguments.poll_interval,
                     arguments.timeout,
-                    full_output=not arguments.summary,
+                    full_output=arguments.full,
                 )[0]
             runner = client.get_runner(arguments.runner_id)
-            return summarize_runner(runner) if arguments.summary else runner
+            return runner if arguments.full else summarize_runner(runner)
         if arguments.runner_command == "list":
             document = client.list_runners(
                 arguments.status,
@@ -1932,7 +1934,8 @@ def main() -> None:
         parser.exit(1, f"error: {environment_error}\n")
     if arguments.command == "config":
         try:
-            print_json(execute_cli_config(arguments))
+            result = execute_cli_config(arguments)
+            render_result(adapt_cli_response(arguments, result))
         except UserConfigError as exc:
             parser.exit(1, f"error: {exc}\n")
         return
@@ -1984,7 +1987,7 @@ def main() -> None:
             str(environment_path) if environment_path is not None else "none",
         )
         result = execute(client, arguments)
-        render_result(arguments, result)
+        render_result(adapt_cli_response(arguments, result))
         if _has_unsuccessful_runner(result):
             raise SystemExit(2)
     except ClientError as exc:

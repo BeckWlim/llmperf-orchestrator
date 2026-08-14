@@ -4,7 +4,7 @@ from datetime import datetime, time
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from llmperf_backend.protocol_schedules import expand_geographic_schedule
 
@@ -211,9 +211,56 @@ class SchedulerConfig(StrictModel):
     poll_interval_seconds: float = Field(default=1.0, gt=0)
     cancel_grace_seconds: float = Field(default=5.0, gt=0)
     stale_after_seconds: int = Field(default=300, gt=0)
+    # Legacy configuration keys retained while Worker remains the public domain name.
     working_directory: str = "."
     worker_module: str = "llmperf_backend.worker"
     log_bytes_limit: int = Field(default=1_000_000, ge=1024)
+    ray_address: Optional[str] = Field(default=None, min_length=1)
+    ray_num_cpus: int = Field(default=8, ge=1, le=1024)
+    ray_actor_num_cpus: float = Field(default=1.0, gt=0, le=64)
+    ray_object_store_memory_bytes: int = Field(default=268_435_456, ge=78_643_200)
+    ray_health_interval_seconds: float = Field(default=5.0, gt=0, le=300)
+    ray_health_timeout_seconds: float = Field(default=3.0, gt=0, le=60)
+    artifact_resolution_timeout_seconds: float = Field(default=60.0, gt=0, le=3600)
+
+    @field_validator("ray_address", mode="before")
+    @classmethod
+    def empty_ray_address(cls, value: Any) -> Any:
+        return None if value == "" else value
+
+
+class PerformanceGuardConfig(StrictModel):
+    """Fail-closed limits for runtime fan-out and submitted workloads."""
+
+    enabled: bool = True
+    max_runner_concurrency: int = Field(default=32, ge=1)
+    max_effective_concurrency: int = Field(default=32, ge=1)
+    max_campaign_runners: int = Field(default=1_000, ge=1)
+    max_campaign_provider_requests: int = Field(default=10_000, ge=1)
+    max_campaign_token_budget: int = Field(default=100_000_000, ge=1)
+    warning_ratio: float = Field(default=0.8, gt=0, lt=1)
+    max_host_memory_utilization: float = Field(default=0.90, gt=0, lt=1)
+    resume_host_memory_utilization: float = Field(default=0.80, gt=0, lt=1)
+    min_ray_object_store_available_ratio: float = Field(default=0.10, ge=0, lt=1)
+    resume_ray_object_store_available_ratio: float = Field(default=0.20, gt=0, le=1)
+    sample_interval_seconds: float = Field(default=1.0, gt=0, le=60)
+
+    @model_validator(mode="after")
+    def validate_runtime_watermarks(self) -> "PerformanceGuardConfig":
+        if self.resume_host_memory_utilization >= self.max_host_memory_utilization:
+            raise ValueError(
+                "resume_host_memory_utilization must be lower than "
+                "max_host_memory_utilization"
+            )
+        if (
+            self.resume_ray_object_store_available_ratio
+            <= self.min_ray_object_store_available_ratio
+        ):
+            raise ValueError(
+                "resume_ray_object_store_available_ratio must be greater than "
+                "min_ray_object_store_available_ratio"
+            )
+        return self
 
 
 class PlannerConfig(StrictModel):
@@ -246,7 +293,34 @@ class AppConfig(StrictModel):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     planner: PlannerConfig = Field(default_factory=PlannerConfig)
+    performance_guard: PerformanceGuardConfig = Field(
+        default_factory=PerformanceGuardConfig
+    )
     auth: AuthConfig = Field(default_factory=AuthConfig)
+
+    @model_validator(mode="after")
+    def validate_ray_runtime_shape(self) -> "AppConfig":
+        if (
+            self.scheduler.enabled
+            and self.scheduler.ray_address is None
+            and self.server.workers != 1
+        ):
+            raise ValueError(
+                "embedded Ray requires server.workers=1; configure scheduler.ray_address "
+                "for a multi-process Backend"
+            )
+        actor_capacity = int(
+            self.scheduler.ray_num_cpus / self.scheduler.ray_actor_num_cpus
+        )
+        minimum_actor_demand = (
+            self.server.workers * self.scheduler.max_concurrent_runners
+        )
+        if self.scheduler.enabled and minimum_actor_demand > actor_capacity:
+            raise ValueError(
+                "Ray actor capacity must cover at least one actor per Scheduler slot: "
+                f"demand={minimum_actor_demand}, capacity={actor_capacity}"
+            )
+        return self
 
 
 class YAMLValidationRequest(StrictModel):

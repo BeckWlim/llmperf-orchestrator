@@ -44,6 +44,7 @@ from llmperf_backend.providers import (
     ProviderRegistry,
 )
 from llmperf_backend.scheduler import Scheduler
+from llmperf_backend.safety import WorkloadSafetyError, assess_workload
 from llmperf_backend.tokenizers import TokenizerCache, TokenizerResolutionError
 from llmperf_backend.datasets import DatasetCache, DatasetResolutionError
 
@@ -100,6 +101,7 @@ def create_app(
         providers,
         tokenizers,
         datasets,
+        validated_config.performance_guard,
     )
     active_planner = planner or Planner(repository, validated_config.planner)
 
@@ -244,6 +246,36 @@ def create_app(
             ),
         }
 
+    def enforce_performance_guard(
+        request: Request,
+        runners: Any = (),
+        runner_plans: Any = (),
+        protocol_definitions: Any = (),
+    ) -> Dict[str, Any]:
+        config = request.app.state.config_store.current()
+        try:
+            assessment = assess_workload(
+                runners,
+                runner_plans,
+                protocol_definitions,
+                config.performance_guard,
+                request.app.state.scheduler.config.max_concurrent_runners,
+                int(
+                    request.app.state.scheduler.config.ray_num_cpus
+                    / request.app.state.scheduler.config.ray_actor_num_cpus
+                ),
+            )
+        except WorkloadSafetyError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": str(exc),
+                    "performance_safety": exc.assessment,
+                },
+            ) from exc
+        LOGGER.info("Performance safety assessment: %s", assessment)
+        return assessment
+
     @application.get("/health", tags=["system"])
     async def health(request: Request) -> Dict[str, Any]:
         snapshot = request.app.state.config_store.snapshot()
@@ -318,6 +350,7 @@ def create_app(
         else:
             benchmark = dump_model(payload.benchmark)
         benchmark = await resolve_benchmark(request, benchmark)
+        enforce_performance_guard(request, runners=[{"benchmark": benchmark}])
         runner = await request.app.state.runner_repository.create_runner(
             benchmark,
             payload.metadata,
@@ -416,6 +449,12 @@ def create_app(
                     "runner_template": runner,
                 }
             )
+        enforce_performance_guard(
+            request,
+            runners=runners,
+            runner_plans=runner_plans,
+            protocol_definitions=protocol_definitions,
+        )
         workload = await request.app.state.runner_repository.create_campaign_workload(
             payload.campaign.name,
             payload.campaign.description,
@@ -458,6 +497,7 @@ def create_app(
             await resolve_runner(request, runner, default_benchmark)
             for runner in payload.runners
         ]
+        enforce_performance_guard(request, runners=runners)
         created = await request.app.state.runner_repository.create_runners(
             campaign_id, runners, actor
         )
@@ -501,6 +541,7 @@ def create_app(
             "benchmark"
         ]
         resolved_plan = await resolve_plan(request, payload, default_benchmark)
+        enforce_performance_guard(request, runner_plans=[resolved_plan])
         plan = await request.app.state.runner_repository.create_runner_plan(
             campaign_id,
             resolved_plan["plan"],

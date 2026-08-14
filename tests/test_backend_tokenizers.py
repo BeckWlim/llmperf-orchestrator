@@ -67,10 +67,16 @@ def test_legacy_artifact(tmp_path, monkeypatch):
     legacy_target.mkdir(parents=True)
 
     resolution = cache._resolve_sync("deepseek-ai/DeepSeek-V3", "main", True)
+    restarted_cache = TokenizerCache(cache_directory=tmp_path, proxy_url="")
+    immutable_resolution = restarted_cache._resolve_sync(
+        "deepseek-ai/DeepSeek-V3", commit, True, "main"
+    )
 
     assert resolution.revision == commit
     assert resolution.path == legacy_target
     assert resolution.benchmark_spec()["immutable_revision"] is True
+    assert immutable_resolution.path == legacy_target
+    assert immutable_resolution.cached is True
 
 
 def test_cache(tmp_path, monkeypatch):

@@ -10,7 +10,14 @@ from llmperf_backend.config import (
     load_config_text,
 )
 from llmperf_backend.environment import load_environment
-from llmperf_backend.models import BenchmarkCampaignStart, DatabaseConfig
+from llmperf_backend.models import (
+    AppConfig,
+    BenchmarkCampaignStart,
+    DatabaseConfig,
+    PerformanceGuardConfig,
+    SchedulerConfig,
+    ServerConfig,
+)
 
 
 VALID_CONFIG = """
@@ -38,6 +45,67 @@ def test_defaults():
     assert config.benchmark.tokenizer.accuracy == "approximate"
     assert config.planner.enabled is True
     assert config.planner.batch_size == 20
+    assert config.scheduler.ray_num_cpus == 8
+    assert config.scheduler.ray_actor_num_cpus == 1.0
+    assert config.scheduler.ray_object_store_memory_bytes == 268_435_456
+    assert config.scheduler.artifact_resolution_timeout_seconds == 60.0
+    assert config.performance_guard.min_ray_object_store_available_ratio == 0.1
+    assert config.performance_guard.resume_ray_object_store_available_ratio == 0.2
+
+
+def test_ray_runtime_config():
+    external = load_config_text(
+        VALID_CONFIG
+        + """
+scheduler:
+  max_concurrent_runners: 2
+  ray_address: ray://127.0.0.1:10001
+  ray_actor_num_cpus: 0.5
+"""
+    )
+    assert external.scheduler.ray_address == "ray://127.0.0.1:10001"
+    assert external.scheduler.ray_actor_num_cpus == 0.5
+    assert SchedulerConfig(ray_address="").ray_address is None
+
+
+def test_worker_config_compatibility():
+    config = load_config_text(
+        VALID_CONFIG
+        + """
+scheduler:
+  working_directory: /legacy/worker/path
+  worker_module: custom.worker.module
+  cancel_grace_seconds: 7
+  log_bytes_limit: 4096
+"""
+    )
+
+    assert config.scheduler.working_directory == "/legacy/worker/path"
+    assert config.scheduler.worker_module == "custom.worker.module"
+    assert config.scheduler.cancel_grace_seconds == 7
+    assert config.scheduler.log_bytes_limit == 4096
+
+
+def test_ray_worker_limit():
+    with pytest.raises(ValueError, match="embedded Ray requires server.workers=1"):
+        AppConfig(
+            server=ServerConfig(workers=2),
+            scheduler=SchedulerConfig(),
+            benchmark={"provider": "test", "model": "test"},
+        )
+
+
+def test_ray_slot_capacity():
+    with pytest.raises(ValueError, match="Ray actor capacity"):
+        AppConfig(
+            scheduler=SchedulerConfig(
+                max_concurrent_runners=3,
+                ray_num_cpus=2,
+                ray_actor_num_cpus=1,
+            ),
+            performance_guard=PerformanceGuardConfig(),
+            benchmark={"provider": "test", "model": "test"},
+        )
 
 
 def test_postgres_only():

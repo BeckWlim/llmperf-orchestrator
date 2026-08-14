@@ -4,7 +4,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-import ray
 import requests
 
 from llmperf.ray_llm_client import LLMClient
@@ -103,7 +102,6 @@ def _safe_response_headers(headers: Any) -> Dict[str, str]:
     }
 
 
-@ray.remote
 class OpenAIChatCompletionsClient(LLMClient):
     """Client for OpenAI Chat Completions API."""
 

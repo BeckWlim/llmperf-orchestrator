@@ -82,7 +82,7 @@ def test_main_environment(tmp_path, monkeypatch, capsys):
         "url": "http://main-env.example:12666",
         "command": "health",
     }
-    assert '"status": "ok"' in capsys.readouterr().out
+    assert "Backend: ok" in capsys.readouterr().out
     monkeypatch.delenv("LLMPERF_URL", raising=False)
 
 

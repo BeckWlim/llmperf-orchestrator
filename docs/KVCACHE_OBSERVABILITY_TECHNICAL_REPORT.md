@@ -404,11 +404,11 @@ Planner 不占 Runner Slot。多 Planner 通过 PostgreSQL 行锁、原子事务
 
 1. API 创建 `queued` Runner；
 2. Scheduler 事务领取并置为 `running`；
-3. 一个槽位启动一个一次性 Worker 子进程；
-4. Worker 初始化 Ray，完成该 Runner 的全部请求与内存计算；
-5. Worker 在事务中写入 Summary 和请求明细；
-6. Scheduler 保存有限日志、退出码并释放槽位；
-7. Backend 关闭时停止领取、终止受管 Worker，并由恢复逻辑处理过期 Runner。
+3. 一个槽位创建一个一次性 Worker Ray task/ObjectRef 句柄；
+4. Worker task 在 Scheduler 已连接的 shared Ray 中创建请求 Actor 并完成计算；
+5. Worker 把 Summary、请求明细和有限日志返回 Scheduler；
+6. Scheduler 在事务中持久化结果并释放槽位；
+7. Backend 关闭时停止领取、取消受管 Worker task，并由恢复逻辑处理过期 Runner。
 
 P0 的依赖队列存在于 Worker 内部，不改变全局 Scheduler 的 Runner 粒度，适合几十秒内的 prime/warm 实验。长 TTL 由 Prime 完成事务给依赖 Dispatch 写入 `warm_due_at`，再由 Planner 的统一 Dispatch 查询产生一次性 Runner；普通 RunnerPlan 也先编译到同一 Dispatch 协议，只负责日历/周期触发，不承担 Prime/Warm 信息交换。
 

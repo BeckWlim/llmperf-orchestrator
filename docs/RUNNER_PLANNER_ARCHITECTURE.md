@@ -29,7 +29,7 @@ Runner/Worker 执行链，并由新的 Runner 产生层提供地理时间周期�
 | `Planner` | Backend 运行组件 | 把到期 RunnerPlan 物化为 queued Runner |
 | `Scheduler` | Backend 运行组件 | 领取 queued Runner，装配并监管 Worker |
 | `Runner` | 持久化执行对象 | 表示一次 Benchmark 执行及其结果 |
-| `Worker` | 一次性子进程 | 执行一个 Runner |
+| `Worker` | Scheduler 内 Ray 执行句柄 | 为一个 Runner 管理 task、ObjectRef 与取消 |
 
 数据库和 API 使用 `runner_plan`，进程、日志和指标使用 `planner`。`scheduled_for` 只表示 Runner 的计划执行时间，不代表一种领域对象。禁止再使用裸 `Schedule` 或 `Schedule Dispatcher` 指代这些组件。
 
@@ -44,9 +44,9 @@ Scheduler Slot 领取 Runner
         ↓
 装配 Provider/Tokenizer/Dataset 环境
         ↓
-启动一次性 Worker 子进程
+创建一次性 Worker Ray 执行句柄
         ↓
-Worker 执行 Ray Benchmark 并持久化结果
+Worker 返回 Ray Benchmark 结果，Scheduler 持久化
         ↓
 Runner 进入 terminal 状态
 ```
@@ -373,13 +373,14 @@ flowchart LR
     PL[Planner
 不占 Worker 槽]
     RS[Runner Slot 0..N]
-    W[Worker 子进程]
+    W[Worker Ray task/ObjectRef]
 
     PL -->|锁定到期 RunnerPlan| DB
     PL -->|INSERT queued Runner| DB
     RS -->|claim queued Runner| DB
     RS -->|装配并监管| W
-    W -->|提交结果| DB
+    W -->|返回结果| RS
+    RS -->|提交结果| DB
 ```
 
 每个 Backend 进程启动后维护两类协程：
@@ -406,6 +407,10 @@ Planner 物化 Runner 时只写入统一的 `queued` 队列，不指定 Schedule
 scheduler:
   enabled: true
   max_concurrent_runners: 4
+  ray_num_cpus: 8
+  ray_actor_num_cpus: 1
+  # null means one Scheduler-owned embedded shared runtime.
+  ray_address: null
   poll_interval_seconds: 1
 planner:
   enabled: true
@@ -413,7 +418,18 @@ planner:
   batch_size: 20
 ```
 
-`max_concurrent_runners` 仍是每个 Scheduler 的本地执行上限。多 Scheduler 的全局 Provider 配额不在 RunnerPlan 中解决，应另行增加数据库租约或 Provider 级全局信号量。
+`max_concurrent_runners` 仍是每个 Scheduler 的本地执行上限。每个 Runner 必须申请
+Ray actor；地址为空时所有 slot 共享 Scheduler-owned embedded runtime，配置地址时共享
+external runtime。`ray_num_cpus / ray_actor_num_cpus` 给出 embedded runtime 的 actor
+容量；external 模式下它是本 Backend 的 actor 安全预算。Embedded 模式要求
+`server.workers=1`，多 Backend 进程必须使用 external runtime。多 Scheduler 的全局
+Provider 配额仍不由 RunnerPlan 解决，应另行增加数据库
+租约或 Provider 级全局信号量。
+
+Campaign 并跑属于核心调度能力。`claim_next()` 在极短 advisory-lock 事务中按 Campaign
+当前 running Runner 数量升序选择，再按创建时间排序；没有其他 Campaign 等待时，单个
+Campaign 仍可填满全部 slot。请求 Actor 独立申请 Ray 资源，完成槽位释放 Actor 引用，
+不要求同一 Runner 的全部 Actor 同时 ready，也不使用全量 placement group 阻塞队首。
 
 空闲 Slot 通过 `scheduler.poll_interval_seconds` 周期轮询 queued Runner，首版
 没有进程内信号或 PostgreSQL `LISTEN/NOTIFY`。`live_slots` 表示存活的 Slot

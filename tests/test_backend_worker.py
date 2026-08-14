@@ -1,11 +1,22 @@
+"""Worker/Ray execution, resource isolation, environment, and outcome tests."""
+
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from llmperf import common_metrics
+from llmperf.common import RAY_ACTOR_CPUS_ENV, _ray_client_class, construct_clients
+import llmperf_backend.worker as worker_module
+from llmperf_backend.models import BenchmarkConfig, dump_model
 from llmperf_backend.persistence import FAILED, SUCCEEDED, _runner_list_dict, json_safe
-from llmperf_backend.worker import summarize_outcome
+from llmperf_backend.worker import (
+    Worker,
+    _calculate,
+    benchmark_actor_count,
+    runtime_environment,
+    summarize_outcome,
+)
 
 
 OUTCOME_CASES = [
@@ -87,6 +98,146 @@ def test_outcome(case):
 
 def test_finite_float():
     assert json_safe(1.0) == 1.0
+
+
+def test_shared_ray_options(monkeypatch):
+    fake_benchmark = SimpleNamespace(
+        get_token_throughput_latencies=lambda **options: ({"ok": True}, [])
+    )
+    import sys
+
+    monkeypatch.setitem(sys.modules, "llmperf.token_benchmark_ray", fake_benchmark)
+
+    result = _calculate(
+        dump_model(BenchmarkConfig(provider="test", model="test")),
+        {
+            "backend": "ray",
+            "worker_kind": "ray_task",
+            "ray_mode": "external",
+            "ray_namespace": "llmperf-control",
+        },
+    )
+
+    assert result[0]["ok"] is True
+    assert result[0]["execution_runtime"] == {
+        "backend": "ray",
+        "worker_kind": "ray_task",
+        "ray_mode": "external",
+        "ray_namespace": "llmperf-control",
+        "ray_actor_num_cpus": 1.0,
+    }
+    assert result[1] == []
+
+
+def test_worker_environment():
+    runtime = runtime_environment(
+        {
+            "OPENAI_API_KEY": "provider-key",
+            "LLMPERF_PRIVATE_KEY": "must-not-propagate",
+            "DATABASE_URL": "must-not-propagate",
+            "LLMPERF_WORKER_RAY_ACTOR_CPUS": "0.5",
+        }
+    )
+
+    assert runtime["OPENAI_API_KEY"] == "provider-key"
+    assert runtime["LLMPERF_WORKER_RAY_ACTOR_CPUS"] == "0.5"
+    assert "LLMPERF_PRIVATE_KEY" not in runtime
+    assert "DATABASE_URL" not in runtime
+
+
+def test_worker_actor_count():
+    benchmark = dump_model(BenchmarkConfig(provider="test", model="test"))
+    benchmark["concurrent_requests"] = 8
+    benchmark["max_completed_requests"] = 3
+    assert benchmark_actor_count(benchmark) == 3
+    benchmark["cache_probe"] = {"trials": 2}
+    assert benchmark_actor_count(benchmark) == 2
+
+
+def test_worker_handle():
+    calls = {}
+
+    class Reference:
+        def __init__(self, value):
+            self.value = value
+
+        def task_id(self):
+            return SimpleNamespace(hex=lambda: "task-1")
+
+    class RemoteFunction:
+        def options(self, **options):
+            calls["options"] = options
+            return self
+
+        def remote(self, *arguments):
+            calls["arguments"] = arguments
+            return Reference({"ok": True})
+
+    fake_ray = SimpleNamespace(
+        wait=lambda refs, timeout=0: (refs, []),
+        get=lambda ref: ref.value,
+        cancel=lambda ref, force=False: calls.setdefault("cancel", force),
+    )
+    worker = Worker(fake_ray, RemoteFunction(), "runner-1", 2, 0.5)
+
+    worker.start(
+        {"model": "test"},
+        {"OPENAI_API_KEY": "key"},
+        {"backend": "ray"},
+        1024,
+    )
+    assert worker.ready() is True
+    assert worker.result() == {"ok": True}
+    assert worker.task_id() == "task-1"
+    assert calls["options"]["runtime_env"]["env_vars"] == {
+        "OPENAI_API_KEY": "key"
+    }
+    assert "scheduling_strategy" not in calls["options"]
+    worker.close()
+    assert worker.task_ref is None
+
+
+def test_worker_task_failure(monkeypatch):
+    def fail(benchmark, execution_runtime):
+        raise RuntimeError("benchmark failed")
+
+    monkeypatch.setattr(worker_module, "_calculate", fail)
+
+    result = worker_module.execute_worker_task({}, {"backend": "ray"}, 4096)
+
+    assert result["ok"] is False
+    assert result["error"] == "RuntimeError: benchmark failed"
+    assert "RuntimeError: benchmark failed" in result["stderr"]
+
+
+def test_actor_resource_options(monkeypatch):
+    import sys
+
+    captured = {}
+
+    class RemoteClass:
+        @staticmethod
+        def remote():
+            return "actor"
+
+    def remote(**options):
+        captured.update(options)
+        return lambda client_class: RemoteClass
+
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(remote=remote))
+    monkeypatch.setenv(RAY_ACTOR_CPUS_ENV, "0.5")
+    _ray_client_class.cache_clear()
+
+    clients = construct_clients("openai", 2)
+
+    assert clients == ["actor", "actor"]
+    assert captured == {
+        "num_cpus": 0.5,
+        "max_concurrency": 1,
+        "max_restarts": 0,
+        "max_task_retries": 0,
+    }
+    _ray_client_class.cache_clear()
 
 
 def test_list_projection():

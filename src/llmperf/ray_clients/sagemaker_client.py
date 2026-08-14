@@ -5,7 +5,6 @@ import time
 from typing import Any, Dict
 
 import boto3
-import ray
 
 from llmperf.ray_llm_client import LLMClient
 from llmperf.models import RequestConfig
@@ -13,7 +12,6 @@ from llmperf import common_metrics
 from llmperf.utils import get_tokenizer
 
 
-@ray.remote
 class SageMakerClient(LLMClient):
     """Client for OpenAI Chat Completions API."""
 

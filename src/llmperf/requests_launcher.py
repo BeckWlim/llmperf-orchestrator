@@ -1,14 +1,17 @@
 from typing import Any, List
 
+from ray.util import ActorPool
+
 from llmperf.ray_llm_client import LLMClient
 from llmperf.models import RequestConfig
-from ray.util import ActorPool
 
 
 class RequestsLauncher:
     """Launch requests from LLMClients to their respective LLM APIs."""
 
     def __init__(self, llm_clients: List[LLMClient]):
+        if not llm_clients:
+            raise ValueError("RequestsLauncher requires at least one LLM client")
         self._llm_client_pool = ActorPool(llm_clients)
 
     def launch_requests(self, request_config: RequestConfig) -> None:

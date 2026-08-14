@@ -1,13 +1,11 @@
 import time
 from typing import Any, Dict
-import ray
 
 from llmperf.ray_llm_client import LLMClient
 from llmperf.models import RequestConfig
 from llmperf import common_metrics
 
 
-@ray.remote
 class LiteLLMClient(LLMClient):
     """Client for LiteLLM Completions API."""
 

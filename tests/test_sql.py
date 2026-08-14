@@ -1,4 +1,4 @@
-"""Opt-in tests against a dedicated disposable PostgreSQL database."""
+"""Opt-in PostgreSQL state-machine, concurrency, and Campaign fairness tests."""
 
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -9,6 +9,22 @@ pytest.importorskip("asyncpg")
 
 from llmperf_backend.models import DatabaseConfig
 from llmperf_backend.persistence import Base, Database, RunnerRepository
+
+
+def _benchmark(model):
+    return {
+        "provider": "test",
+        "model": model,
+        "llm_api": "openai",
+        "timeout_seconds": 10,
+        "max_completed_requests": 1,
+        "concurrent_requests": 1,
+        "mean_input_tokens": 40,
+        "stddev_input_tokens": 0,
+        "mean_output_tokens": 10,
+        "stddev_output_tokens": 0,
+        "additional_sampling_params": {},
+    }
 
 
 @pytest.mark.postgresql
@@ -147,6 +163,53 @@ def test_postgres_lifecycle(postgresql_url):
             assert persisted_skip["status"] == "completed"
             assert persisted_skip["emitted_count"] == 1
             assert persisted_skip["skipped_count"] == 1
+        finally:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.dispose()
+
+    asyncio.run(exercise_repository())
+
+
+@pytest.mark.postgresql
+def test_campaign_claim_fairness(postgresql_url):
+    async def exercise_repository():
+        database = Database(DatabaseConfig(url=postgresql_url))
+        try:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+                await connection.run_sync(Base.metadata.create_all)
+            repository = RunnerRepository(database)
+            campaign_a = await repository.create_campaign(
+                "campaign-a", "fairness A", {}, "bootstrap-test"
+            )
+            campaign_b = await repository.create_campaign(
+                "campaign-b", "fairness B", {}, "bootstrap-test"
+            )
+            for index in range(2):
+                await repository.create_runner(
+                    _benchmark(f"a-{index}"),
+                    {},
+                    "bootstrap-test",
+                    campaign_id=campaign_a["campaign_id"],
+                )
+            await repository.create_runner(
+                _benchmark("b-0"),
+                {},
+                "bootstrap-test",
+                campaign_id=campaign_b["campaign_id"],
+            )
+
+            claimed = await asyncio.gather(
+                repository.claim_next("fair-slot-1"),
+                repository.claim_next("fair-slot-2"),
+            )
+            assert {runner["campaign_id"] for runner in claimed} == {
+                campaign_a["campaign_id"],
+                campaign_b["campaign_id"],
+            }
+            remaining = await repository.claim_next("fair-slot-3")
+            assert remaining["campaign_id"] == campaign_a["campaign_id"]
         finally:
             async with database.engine.begin() as connection:
                 await connection.run_sync(Base.metadata.drop_all)

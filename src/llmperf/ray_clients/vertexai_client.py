@@ -3,7 +3,6 @@ import os
 import time
 from typing import Any, Dict
 
-import ray
 import requests
 
 from llmperf.ray_llm_client import LLMClient
@@ -12,7 +11,6 @@ from llmperf import common_metrics
 from llmperf.utils import get_tokenizer
 
 
-@ray.remote
 class VertexAIClient(LLMClient):
     """Client for VertexAI API."""
 
@@ -119,7 +117,7 @@ if __name__ == "__main__":
     # export GCLOUD_REGION=YOUR_REGION
     # export VERTEXAI_ENDPOINT_ID=YOUR_ENDPOINT_ID
 
-    client = VertexAIClient.remote()
+    client = VertexAIClient()
     request_config = RequestConfig(
         prompt=("Give me ten interview questions for the role of program manager.", 10),
         model="gpt3",
@@ -130,4 +128,4 @@ if __name__ == "__main__":
             "top_p": 0.95,
         },
     )
-    ray.get(client.llm_request.remote(request_config))
+    client.llm_request(request_config)

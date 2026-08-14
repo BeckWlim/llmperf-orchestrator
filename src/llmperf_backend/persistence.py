@@ -30,7 +30,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, aliased, mapped_column
 
 from llmperf_backend.models import DatabaseConfig
 from llmperf_backend.planner import as_utc, next_fire_details
@@ -51,6 +51,7 @@ PLAN_CANCELLED = "cancelled"
 PLAN_STATUSES = {PLAN_ACTIVE, PLAN_PAUSED, PLAN_COMPLETED, PLAN_CANCELLED}
 PROTOCOL_INSTANCE_PENDING_STATES = {"planned", "active"}
 JSON_DOCUMENT = JSONB
+RUNNER_CLAIM_LOCK_ID = 0x4C4C4D50
 
 
 def utcnow() -> datetime:
@@ -303,6 +304,11 @@ class BenchmarkRunnerRecord(Base):
             postgresql_where=text("status = 'queued'"),
         ),
         Index("ix_runners_status_created_at", "status", "created_at"),
+        Index(
+            "ix_runners_running_campaign",
+            "campaign_id",
+            postgresql_where=text("status = 'running'"),
+        ),
         Index("ix_runner_plan_time", "runner_plan_id", "scheduled_for"),
     )
 
@@ -1812,10 +1818,30 @@ class RunnerRepository:
 
     async def claim_next(self, scheduler_id: str) -> Optional[Dict[str, Any]]:
         async with self.database.sessions() as session, session.begin():
+            # Serialize the very small claim transaction across Backend replicas.
+            # Without this lock, simultaneous slots can all observe the same campaign
+            # counts before any claim commits and defeat fair sharing in a burst.
+            await session.execute(
+                select(func.pg_advisory_xact_lock(RUNNER_CLAIM_LOCK_ID))
+            )
+            running_runner = aliased(BenchmarkRunnerRecord)
+            campaign_running_count = (
+                select(func.count(running_runner.id))
+                .where(
+                    running_runner.status == RUNNING,
+                    running_runner.campaign_id
+                    == BenchmarkRunnerRecord.campaign_id,
+                )
+                .correlate(BenchmarkRunnerRecord)
+                .scalar_subquery()
+            )
             statement = (
                 select(BenchmarkRunnerRecord)
                 .where(BenchmarkRunnerRecord.status == QUEUED)
-                .order_by(BenchmarkRunnerRecord.created_at.asc())
+                .order_by(
+                    campaign_running_count.asc(),
+                    BenchmarkRunnerRecord.created_at.asc(),
+                )
                 .with_for_update(skip_locked=True)
                 .limit(1)
             )

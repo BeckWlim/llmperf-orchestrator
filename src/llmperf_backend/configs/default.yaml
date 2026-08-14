@@ -22,9 +22,34 @@ scheduler:
   poll_interval_seconds: "${LLMPERF_RUNNER_POLL:-1.0}"
   cancel_grace_seconds: "${LLMPERF_RUNNER_GRACE:-5.0}"
   stale_after_seconds: "${LLMPERF_RUNNER_STALE:-300}"
+  # Retained for configuration/API compatibility; Worker is now a Ray task handle.
   working_directory: "${LLMPERF_WORKING_DIRECTORY:-.}"
   worker_module: llmperf_backend.worker
   log_bytes_limit: "${LLMPERF_LOG_LIMIT:-1000000}"
+  # Empty starts one Backend-owned shared Ray runtime; otherwise connect externally.
+  ray_address: "${LLMPERF_RAY_ADDRESS:-}"
+  ray_num_cpus: "${LLMPERF_RAY_CPUS:-8}"
+  ray_actor_num_cpus: "${LLMPERF_RAY_ACTOR_CPUS:-1.0}"
+  ray_object_store_memory_bytes: "${LLMPERF_RAY_OBJECT_STORE_BYTES:-268435456}"
+  ray_health_interval_seconds: "${LLMPERF_RAY_HEALTH_INTERVAL:-5.0}"
+  ray_health_timeout_seconds: "${LLMPERF_RAY_HEALTH_TIMEOUT:-3.0}"
+  # Scheduler-side cache handoff must be local and bounded. Initial remote
+  # artifact resolution happens before a Runner is accepted.
+  artifact_resolution_timeout_seconds: "${LLMPERF_ARTIFACT_TIMEOUT:-60.0}"
+
+performance_guard:
+  enabled: "${LLMPERF_PERFORMANCE_GUARD_ENABLED:-true}"
+  max_runner_concurrency: "${LLMPERF_MAX_RUNNER_CONCURRENCY:-32}"
+  max_effective_concurrency: "${LLMPERF_MAX_EFFECTIVE_CONCURRENCY:-32}"
+  max_campaign_runners: "${LLMPERF_MAX_CAMPAIGN_RUNNERS:-1000}"
+  max_campaign_provider_requests: "${LLMPERF_MAX_CAMPAIGN_REQUESTS:-10000}"
+  max_campaign_token_budget: "${LLMPERF_MAX_CAMPAIGN_TOKENS:-100000000}"
+  warning_ratio: "${LLMPERF_PERFORMANCE_WARNING_RATIO:-0.8}"
+  max_host_memory_utilization: "${LLMPERF_MAX_HOST_MEMORY_UTILIZATION:-0.90}"
+  resume_host_memory_utilization: "${LLMPERF_RESUME_HOST_MEMORY_UTILIZATION:-0.80}"
+  min_ray_object_store_available_ratio: "${LLMPERF_MIN_RAY_OBJECT_STORE_AVAILABLE_RATIO:-0.10}"
+  resume_ray_object_store_available_ratio: "${LLMPERF_RESUME_RAY_OBJECT_STORE_AVAILABLE_RATIO:-0.20}"
+  sample_interval_seconds: "${LLMPERF_PERFORMANCE_SAMPLE_INTERVAL:-1.0}"
 
 planner:
   enabled: "${LLMPERF_PLANNER_ENABLED:-true}"

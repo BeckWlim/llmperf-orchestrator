@@ -1,3 +1,5 @@
+"""HTTP client command contracts and backward-compatible Worker rendering tests."""
+
 from argparse import Namespace
 from datetime import datetime, timezone
 from io import BytesIO
@@ -16,11 +18,13 @@ from llmperf_cli.__main__ import (
     _validate_runner_list,
     build_parser,
     execute,
+    print_health,
     print_campaign_status,
     print_campaign_table,
     print_runner_logs,
     print_runner_summary,
     print_runner_table,
+    project_health,
     render_result,
     start_campaign,
     summarize_runner,
@@ -29,6 +33,7 @@ from llmperf_cli.__main__ import (
 )
 from llmperf_cli.auth import discover_private_key_providers
 from llmperf_cli.client import ClientError, LLMPerfClient
+from llmperf_cli.compatibility import adapt_cli_response, registered_routes
 
 
 class FakeClient:
@@ -381,6 +386,13 @@ def test_command_help(arguments, expected, capsys):
 
 
 ARG_CASES = [
+    pytest.param(
+        {
+            "argv": ["health"],
+            "expected": {"json": False, "full": False},
+        },
+        id="health-defaults",
+    ),
     pytest.param(
         {
             "argv": ["provider", "models", "deepseek", "--refresh"],
@@ -758,9 +770,207 @@ def test_action_output(capsys):
         ["campaign", "start", "-f", "examples/example-campaign.yaml", "--wait"]
     )
 
-    render_result(arguments, {"campaign_id": "campaign-1", "large": [1, 2, 3]})
+    projection = adapt_cli_response(
+        arguments, {"campaign_id": "campaign-1", "large": [1, 2, 3]}
+    )
+    render_result(projection)
 
     assert capsys.readouterr().out == ""
+
+    with pytest.raises(ClientError, match="compatibility projections"):
+        render_result({"campaign_id": "campaign-1"})
+
+
+def test_health_projection(capsys):
+    raw = {
+        "status": "ok",
+        "database": "connected",
+        "planner": "running",
+        "providers": 3,
+        "auth": {
+            "enabled": True,
+            "generation": 9,
+            "active_key_id": "must-not-project",
+            "previous_key_active": True,
+            "reload_error": False,
+        },
+        "config_source": "/internal/backend/config.yaml",
+        "config_generation": 7,
+    }
+
+    projected = project_health(raw)
+    print_health(projected)
+    output = capsys.readouterr().out
+
+    assert projected == {
+        "status": "ok",
+        "database": "connected",
+        "planner": "running",
+        "providers": 3,
+        "auth": {
+            "status": "enabled",
+            "enabled": True,
+            "reload_error": False,
+        },
+    }
+    assert "Backend: ok" in output
+    assert "Auth: enabled" in output
+    assert "config_source" not in output
+    assert "must-not-project" not in str(projected)
+
+    class HealthClient:
+        def health(self):
+            return raw
+
+    arguments = build_parser().parse_args(["health", "--json"])
+    result = execute(HealthClient(), arguments)
+    render_result(adapt_cli_response(arguments, result))
+    assert json.loads(capsys.readouterr().out) == projected
+
+    arguments = build_parser().parse_args(["health", "--full"])
+    result = execute(HealthClient(), arguments)
+    render_result(adapt_cli_response(arguments, result))
+    assert json.loads(capsys.readouterr().out) == projected
+
+
+def test_status_projection(capsys):
+    raw = {
+        "runner_id": "runner-1",
+        "status": "running",
+        "benchmark": {"provider": "aliyun", "model": "deepseek-v4-pro"},
+        "summary": {"large": "must not reach the default projection"},
+        "stdout": "must not be rendered",
+    }
+
+    class RunnerClient:
+        def get_runner(self, runner_id):
+            assert runner_id == "runner-1"
+            return raw
+
+    arguments = build_parser().parse_args(["runner", "status", "runner-1"])
+    result = execute(RunnerClient(), arguments)
+    render_result(adapt_cli_response(arguments, result))
+    default_output = capsys.readouterr().out
+
+    assert result == summarize_runner(raw)
+    assert "Runner: runner-1  Status: running" in default_output
+    assert '"summary"' not in default_output
+
+    arguments = build_parser().parse_args(
+        ["runner", "status", "runner-1", "--json"]
+    )
+    result = execute(RunnerClient(), arguments)
+    render_result(adapt_cli_response(arguments, result))
+    json_output = json.loads(capsys.readouterr().out)
+
+    assert json_output == summarize_runner(raw)
+    assert "summary" not in json_output
+
+
+def test_adapter_route_registry():
+    assert set(registered_routes()) == {
+        "auth.add",
+        "auth.events",
+        "auth.list",
+        "auth.revoke",
+        "campaign.cancel",
+        "campaign.export",
+        "campaign.list",
+        "campaign.start",
+        "campaign.status",
+        "config.get",
+        "config.list",
+        "config.path",
+        "config.set",
+        "config.unset",
+        "health",
+        "planner.cancel",
+        "planner.create",
+        "planner.events",
+        "planner.list",
+        "planner.pause",
+        "planner.preview",
+        "planner.resume",
+        "planner.runtime",
+        "planner.status",
+        "provider.list",
+        "provider.models",
+        "runner.cancel",
+        "runner.export",
+        "runner.list",
+        "runner.logs",
+        "runner.start",
+        "runner.status",
+        "runner.wait",
+        "scheduler.status",
+    }
+
+    unknown = Namespace(command="unknown")
+    with pytest.raises(ClientError, match="No CLI response adapter"):
+        adapt_cli_response(unknown, {"secret": "must-not-render"})
+
+
+def test_adapter_redaction():
+    runner_arguments = build_parser().parse_args(
+        ["runner", "status", "runner-1", "--full"]
+    )
+    runner_projection = adapt_cli_response(
+        runner_arguments,
+        {
+            "runner_id": "runner-1",
+            "status": "failed",
+            "benchmark": {"provider": "aliyun", "model": "model-1"},
+            "summary": {"private": "raw summary"},
+            "metadata": {"token": "secret"},
+            "stdout": "raw stdout",
+            "stderr": "raw stderr",
+        },
+    )
+    assert runner_projection.renderer == "json"
+    assert "summary" not in runner_projection.payload
+    assert "metadata" not in runner_projection.payload
+    assert "stdout" not in runner_projection.payload
+
+    scheduler_arguments = build_parser().parse_args(["scheduler", "status"])
+    scheduler_projection = adapt_cli_response(
+        scheduler_arguments,
+        {
+            "scheduler_id": "scheduler-1",
+            "status": "running",
+            "ray_address": "ray://internal.example:10001",
+            "ray_runtime": {
+                "status": "healthy",
+                "claim_blocked": True,
+                "claim_block_reason": "ray_object_store_low",
+                "cluster_resources": {"CPU": 8, "node:private": 1},
+            },
+        },
+    )
+    assert scheduler_projection.payload["ray_runtime"] == {
+        "status": "healthy",
+        "claim_blocked": True,
+        "claim_block_reason": "ray_object_store_low",
+        "cluster_resources": {"CPU": 8},
+    }
+    assert "ray_address" not in scheduler_projection.payload
+
+    auth_arguments = build_parser().parse_args(["auth", "list"])
+    auth_projection = adapt_cli_response(
+        auth_arguments,
+        {
+            "items": [
+                {
+                    "username": "operator",
+                    "role": "operator",
+                    "keys": [{"key_id": "private-key-id"}],
+                    "public_key_pem": "must-not-render",
+                }
+            ]
+        },
+    )
+    assert auth_projection.payload == {
+        "items": [{"username": "operator", "role": "operator"}]
+    }
 
 
 def test_log_output(capsys):

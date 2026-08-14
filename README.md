@@ -22,14 +22,14 @@ and persisted before results are exported as JSON or professional HTML reports.
 |                                                                                  |
 | +-----------------------+  +---------------------+  +--------------------------+ |
 | | FastAPI control plane |  | Planner             |  | Scheduler (N slots)      | |
-| | auth/validate/status  |  | due plan -> Runner  |  | claim via PG + supervise | |
+| | auth/validate/status  |  | due plan -> Runner  |  | claim via DB + supervise | |
 | +-----------+-----------+  +----------+----------+  +-------------+------------+ |
 +-------------|-------------------------|---------------------------|--------------+
-              | atomic transactions     | materialize               | one process
+              | atomic transactions     | materialize               | Ray handle
               |                         |                           v
               |                         |               +-----------+----------+
               |                         |               | Worker (one/Runner)  |
-              |                         |               | LLMPerf + Ray Actors |
+              |                         |               | Ray task + Actors    |
               |                         |               +-----+------------+---+
               |                         |                     |            |
               |                         |            results  |            | API
@@ -51,6 +51,12 @@ and persisted before results are exported as JSON or professional HTML reports.
 - **Capacity-efficient scheduling** — RunnerPlans wait without occupying a
   Scheduler slot, Worker, Ray runtime, or Provider connection. PostgreSQL row
   locks and occurrence uniqueness support safe multi-Backend competition.
+- **Concurrent Campaign fairness** — claims prefer Campaigns with fewer running
+  Runners while Ray independently queues request Actors, so one Campaign does not
+  monopolize Scheduler slots or require all of its Actors to start together.
+- **Fail-closed performance guard** — every Runner uses isolated Ray actors on one
+  shared embedded or external runtime; workload admission bounds actor capacity,
+  Runner fan-out, Provider requests, token budget, and effective concurrency.
 - **Reproducible experiments** — Provider/model selections, benchmark parameters,
   and immutable tokenizer and dataset revisions are frozen into every Runner.
 - **Secret isolation** — endpoints and credentials live in Backend-owned Provider
@@ -171,6 +177,8 @@ Preview and submit the bounded two-round RunnerPlan example:
 
 ```bash
 llmperfctl planner preview -f examples/example-runner-plan.yaml
+.venv/bin/python .codex/skills/operate-llmperf/scripts/validate_workload.py \
+  examples/example-runner-plan.yaml --scheduler-slots 1
 llmperfctl campaign start -f examples/example-runner-plan.yaml
 ```
 
