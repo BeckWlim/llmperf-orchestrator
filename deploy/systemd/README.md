@@ -75,3 +75,40 @@ restart the service. Changes to Backend configuration also require a restart.
 ensures Scheduler-owned Worker and Ray subprocesses do not survive a service stop.
 The unit forces one Backend/Uvicorn process; benchmark state and results remain in
 PostgreSQL.
+
+## 5. Migrate Hugging Face caches safely
+
+Hugging Face snapshot directories contain relative symlinks into content-addressed
+`blobs/` directories. Some copy tools retain blobs and non-empty or partially populated
+snapshot directories but omit some links. The mapping from repository filenames to blob
+hashes cannot be inferred reliably from the remaining files or blob contents, so capture
+a manifest on the healthy source before transfer:
+
+```bash
+python deploy/huggingface_cache_links.py capture \
+  --cache-root ~/.cache/llmperf/tokenizers/downloads \
+  --manifest tokenizer-cache-links.json
+```
+
+Transfer the cache and manifest while no artifact download is active. Preserve symlinks
+with `rsync -a`, and exclude `.locks/`, `*.lock`, and `*.incomplete`. On the destination,
+audit first; this command is read-only:
+
+```bash
+python deploy/huggingface_cache_links.py audit \
+  --cache-root ~/.cache/llmperf/tokenizers/downloads \
+  --manifest tokenizer-cache-links.json
+```
+
+Repair only missing links whose referenced blobs are already present:
+
+```bash
+python deploy/huggingface_cache_links.py repair \
+  --cache-root ~/.cache/llmperf/tokenizers/downloads \
+  --manifest tokenizer-cache-links.json
+```
+
+The script never downloads artifacts and never overwrites existing files or conflicting
+links. Repeat the same workflow with the configured dataset cache root. A manifest must
+come from the same healthy source cache; an empty destination snapshot plus anonymous
+blob hashes is not sufficient to reconstruct the mapping safely.

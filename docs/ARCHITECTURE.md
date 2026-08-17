@@ -342,8 +342,10 @@ dataset 缓存目录默认为 `~/.cache/llmperf/datasets`，可以通过
 `revision` 只作为本地缓存选择键，不进行远端版本校验；本地 artifact/snapshot 未命中或
 不可加载时立即失败。若本地 alias 索引不可用，但对应仓库只有一个可用 snapshot，或只有
 一个 snapshot 已生成 tokenizer resolved artifact，offline resolver 会把它作为直接文件
-命中；存在多个同等候选时拒绝随机选择并报告本地歧义。两者的 offline 策略均由 Backend
-operator 配置，Runner YAML 不能改变服务端联网边界。
+命中。resolved artifact 是自包含目录，因此即使跨主机迁移后原始 Hub snapshot 的 blob
+符号链接失效，只要 snapshot revision 目录仍可用于计算 artifact key，也不要求重新加载
+原始 snapshot；存在多个同等候选时拒绝随机选择并报告本地歧义。两者的 offline 策略均由
+Backend operator 配置，Runner YAML 不能改变服务端联网边界。
 
 受限网络环境可以设置 `LLMPERF_HUGGINGFACE_PROXY=http://proxy:port`。backend 将该共享
 代理显式传给 tokenizer 和 dataset 的 Hugging Face HTTP/HTTPS 请求，因此不依赖桌面或

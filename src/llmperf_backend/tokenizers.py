@@ -512,14 +512,17 @@ class TokenizerCache:
         snapshots = repository / "snapshots"
         if not snapshots.is_dir():
             return None
-        candidates = []
+        snapshots_by_revision = []
+        loadable_snapshots = []
         for path in sorted(snapshots.iterdir()):
             revision = path.name
             if not path.is_dir() or not IMMUTABLE_HUGGINGFACE_REVISION.fullmatch(
                 revision
             ):
                 continue
-            if not any(
+            candidate = (path, revision)
+            snapshots_by_revision.append(candidate)
+            if any(
                 (path / filename).is_file()
                 for filename in (
                     "tokenizer_config.json",
@@ -527,23 +530,34 @@ class TokenizerCache:
                     "tokenizer.model",
                 )
             ):
-                continue
-            candidates.append((path, revision))
-        if not candidates:
+                loadable_snapshots.append(candidate)
+        if not snapshots_by_revision:
             return None
 
-        exact = [item for item in candidates if item[1] == requested_revision]
-        if len(exact) == 1:
-            return exact[0]
+        # A resolved artifact is self-contained. Prefer it even when the raw Hub
+        # snapshot contains dangling relative symlinks after a cross-host cache
+        # migration, because loading the source snapshot again is unnecessary.
         resolved = [
             item
-            for item in candidates
+            for item in snapshots_by_revision
             if (
                 self.resolved_directory
                 / self._artifact_key(tokenizer_id, item[1], use_fast)
             ).is_dir()
         ]
-        selectable = resolved or candidates
+        exact_resolved = [
+            item for item in resolved if item[1] == requested_revision
+        ]
+        if len(exact_resolved) == 1:
+            return exact_resolved[0]
+        exact_loadable = [
+            item for item in loadable_snapshots if item[1] == requested_revision
+        ]
+        if len(exact_loadable) == 1:
+            return exact_loadable[0]
+        selectable = resolved or loadable_snapshots
+        if not selectable:
+            return None
         if len(selectable) == 1:
             selected = selectable[0]
             LOGGER.info(

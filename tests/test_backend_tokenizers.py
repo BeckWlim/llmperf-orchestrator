@@ -206,7 +206,10 @@ def test_offline_fallback(tmp_path, monkeypatch):
         / SNAPSHOT_COMMIT
     )
     snapshot.mkdir(parents=True)
-    (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+    # A copied Hugging Face cache can retain the snapshot revision directory
+    # while losing the relative blob target. The resolved artifact remains
+    # self-contained and must still be directly usable offline.
+    (snapshot / "tokenizer.json").symlink_to("../../blobs/missing")
     downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
     loader = Mock(side_effect=AssertionError("unexpected tokenizer load"))
     monkeypatch.setattr(
@@ -232,6 +235,42 @@ def test_offline_fallback(tmp_path, monkeypatch):
     assert result.revision == SNAPSHOT_COMMIT
     assert result.path == target
     loader.assert_not_called()
+    downloader.assert_not_called()
+
+
+def test_offline_snapshot(tmp_path, monkeypatch):
+    snapshot = (
+        tmp_path
+        / "downloads"
+        / "models--cached--tokenizer"
+        / "snapshots"
+        / SNAPSHOT_COMMIT
+    )
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        lambda *args, **kwargs: None,
+    )
+    downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.snapshot_download", downloader
+    )
+    loader = Mock(return_value=FakeTokenizer())
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+    )
+    cache = TokenizerCache(cache_directory=tmp_path, local_files_only=True)
+
+    result = cache._resolve_sync("cached/tokenizer", "main", True)
+
+    assert result.revision == SNAPSHOT_COMMIT
+    loader.assert_called_once_with(
+        str(snapshot),
+        use_fast=True,
+        trust_remote_code=False,
+        local_files_only=True,
+    )
     downloader.assert_not_called()
 
 
