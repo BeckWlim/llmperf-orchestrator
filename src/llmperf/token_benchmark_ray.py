@@ -195,7 +195,7 @@ def _execute_cache_probe(
                     sampling_params=sampling_params,
                     llm_api=llm_api,
                     metadata=metadata,
-                    timeout_seconds=max(0.1, deadline - time.monotonic()),
+                    timeout_seconds=test_timeout_s,
                 )
                 launcher.launch_requests(config)
                 outputs = launcher.get_next_ready(block=True)
@@ -499,9 +499,6 @@ def get_token_throughput_latencies(
                     "max_tokens": num_output_tokens_list[request_index]
                 }
                 default_sampling_params.update(additional_sampling_params)
-                remaining_seconds = max(
-                    0.1, test_timeout_s - (time.monotonic() - start_time) - 1
-                )
                 request_config = RequestConfig(
                     model=model,
                     prompt=prompts[request_index],
@@ -532,7 +529,7 @@ def get_token_throughput_latencies(
                         if protocol_request
                         else None
                     ),
-                    timeout_seconds=remaining_seconds,
+                    timeout_seconds=test_timeout_s,
                 )
                 req_launcher.launch_requests(request_config)
 
@@ -578,7 +575,10 @@ def get_token_throughput_latencies(
         raise error.with_traceback(traceback)
 
     end_time = time.monotonic()
-    timed_out = end_time - start_time >= test_timeout_s
+    timed_out = (
+        end_time - start_time >= test_timeout_s
+        and num_completed_requests < max_num_completed_requests
+    )
     if timed_out:
         print("Test timed out before all requests could be completed.")
 

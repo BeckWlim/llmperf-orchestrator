@@ -58,9 +58,10 @@ Projector 默认过滤：凭据、Authorization、私钥路径、数据库 URL�
 不稳定的内部实现字段。需要诊断时通过授权 endpoint、扩展白名单 `--full`、专用 logs 或版本化导出
 显式取得；CLI 投影不是 Backend 授权和 API redaction 的替代品。
 
-错误默认输出简洁分类、HTTP/Provider code、首个可操作消息和 durable ID。完整 traceback
-保留在服务 journal 或 Worker logs，不在普通状态命令中倾倒。所有日志和导出继续执行
-secret redaction 与大小上限。
+错误默认输出 HTTP/Provider code、reason、请求方法与 API 路径、耗时、可用的 request ID、
+全部有界校验位置及首个可操作消息，避免只剩无法定位阶段的泛化摘要。请求 body/input、
+凭据字段和超出大小上限的内容必须过滤；完整 traceback 保留在服务 journal 或 Worker
+logs，不在普通状态命令中倾倒。所有日志和导出继续执行 secret redaction 与大小上限。
 
 ## 4. 命令模式矩阵
 

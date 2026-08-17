@@ -159,7 +159,16 @@ source .venv/bin/activate
 llmperfctl health
 llmperfctl provider list
 llmperfctl provider models aliyun
+llmperfctl provider models aliyun --json
 ```
+
+Provider 查询默认输出适合终端阅读的表格/摘要；只有显式传入 `--json` 才输出稳定的
+JSON 投影。`provider list` 会展示静态 Profile 按配置顺序选取的最多三个典型模型，且
+不会为动态目录额外发起远端发现请求。修改持久化的 `LLMPERF_PROVIDER_*` 配置后，可执行
+`llmperfctl provider reload` 原子热更新 Provider Profile，无需重启 Backend。
+热更新不会修改数据库、Scheduler、Planner、Ray、监听地址或通用 Backend 配置；正在
+运行的 Runner 保持已有连接快照，之后领取的 Runner 才使用新代次。候选配置校验失败时
+当前代次保持不变。
 
 The example YAML uses `deepseek-v4-pro`; if the catalog returns a different exact
 model ID, update the example before continuing.

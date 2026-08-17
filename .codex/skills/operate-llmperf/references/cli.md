@@ -30,6 +30,8 @@ llmperfctl scheduler status
 llmperfctl planner runtime
 llmperfctl provider list
 llmperfctl provider models aliyun
+llmperfctl provider models aliyun --json
+llmperfctl provider reload
 ```
 
 `scheduler status` 报告 `ray_mode=embedded|external` 和 `ray_runtime` 健康/资源快照。
@@ -40,6 +42,12 @@ driver；Worker 是 Ray task + ObjectRef 的执行句柄，不是子进程。调
 
 `provider models ... --refresh` 会主动访问供应商目录，需要 operator 权限。目录可见
 不保证推理调用成功；401 通常表示供应商 token 失效或不正确。
+
+Provider 查询默认输出终端表格/摘要，只有 `--json` 输出稳定 JSON 投影。`provider list`
+会同时展示静态 Profile 最多三个典型模型，但不为动态目录隐式发送远端请求；完整目录仍
+通过 `provider models PROVIDER_ID` 获取。
+`provider reload` 需要 operator 权限，只原子重载 `LLMPERF_PROVIDER_*` 并使模型缓存
+失效；不会更改其他 Backend 运行字段，也不会扰动已经运行的 Runner。
 
 Ubuntu 部署模板和指引统一放在仓库 `deploy/systemd/`，该目录不是 systemd 的运行加载
 目录。准备好 `.venv`、PostgreSQL schema 和运行用户的 Backend 配置后，把
@@ -165,6 +173,10 @@ Backend 内 Planner 和 Scheduler 默认各自每 1 秒轮询 PostgreSQL，与 C
 - stdout：JSON 或紧凑表格，便于重定向和脚本处理。
 - `runner logs`：Backend 持久化的 Worker stdout/stderr。
 - 任何日志均不得包含 Provider key、Bearer token 或私钥。
+
+CLI 的 HTTP 错误应保留 status/reason、方法、API 路径、耗时、request ID 和有界的服务端
+detail；FastAPI 多条校验错误逐项显示字段位置。不得显示请求 body/input、凭据或无限长
+响应，完整 traceback 仍通过 Backend journal 或 `runner logs` 查看。
 
 ## 6. 导出与结果定位
 

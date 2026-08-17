@@ -13,12 +13,90 @@ from urllib.request import Request, urlopen
 
 
 LOGGER = logging.getLogger("llmperfctl.http")
+ERROR_DETAIL_LIMIT = 8192
+SENSITIVE_ERROR_FIELDS = {
+    "api_key",
+    "authorization",
+    "body",
+    "database_url",
+    "input",
+    "password",
+    "payload",
+    "private_key",
+    "secret",
+    "token",
+}
 
 
 class ClientError(RuntimeError):
-    def __init__(self, message: str, status_code: Optional[int] = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        *,
+        method: Optional[str] = None,
+        path: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.method = method
+        self.path = path
+        self.request_id = request_id
+
+
+def _redact_error_value(value: Any, field: Optional[str] = None) -> Any:
+    normalized = str(field or "").lower()
+    if normalized in SENSITIVE_ERROR_FIELDS or any(
+        fragment in normalized
+        for fragment in (
+            "api_key",
+            "apikey",
+            "authorization",
+            "credential",
+            "password",
+            "private_key",
+            "secret",
+            "token",
+        )
+    ):
+        return "<redacted>"
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_error_value(item, str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_error_value(item) for item in value]
+    return value
+
+
+def _format_error_detail(value: Any) -> str:
+    if isinstance(value, str):
+        rendered = value.strip() or "<empty response>"
+    elif isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        lines = []
+        for item in value:
+            location = item.get("loc")
+            if isinstance(location, (list, tuple)):
+                location_label = ".".join(str(part) for part in location)
+            else:
+                location_label = str(location or "request")
+            message = str(item.get("msg") or "validation failed")
+            error_type = str(item.get("type") or "validation_error")
+            lines.append(f"- {location_label}: {message} [{error_type}]")
+        rendered = "\n".join(lines) or "<empty validation error list>"
+    else:
+        rendered = json.dumps(
+            _redact_error_value(value),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    if len(rendered) > ERROR_DETAIL_LIMIT:
+        omitted = len(rendered) - ERROR_DETAIL_LIMIT
+        rendered = f"{rendered[:ERROR_DETAIL_LIMIT]}\n... <{omitted} characters omitted>"
+    return rendered
 
 
 def _json_default(value: Any) -> Any:
@@ -115,7 +193,12 @@ class LLMPerfClient:
             except HTTPError as exc:
                 content = exc.read().decode("utf-8", errors="replace")
                 try:
-                    detail = json.loads(content).get("detail", content)
+                    document = json.loads(content)
+                    detail = (
+                        document.get("detail", document)
+                        if isinstance(document, dict)
+                        else document
+                    )
                 except json.JSONDecodeError:
                     detail = content
                 if exc.code == 401 and index + 1 < len(providers):
@@ -127,8 +210,23 @@ class LLMPerfClient:
                         monotonic() - started,
                     )
                     continue
+                elapsed = monotonic() - started
+                reason = str(exc.reason or "").strip()
+                request_id = (
+                    exc.headers.get("X-Request-ID") if exc.headers is not None else None
+                )
+                summary = f"HTTP {exc.code}"
+                if reason:
+                    summary += f" {reason}"
+                summary += f" for {method} {path} after {elapsed:.3f}s"
+                if request_id:
+                    summary += f" (request_id={request_id})"
                 raise ClientError(
-                    f"HTTP {exc.code}: {detail}", status_code=exc.code
+                    f"{summary}\nBackend detail:\n{_format_error_detail(detail)}",
+                    status_code=exc.code,
+                    method=method,
+                    path=path,
+                    request_id=request_id,
                 ) from exc
             except (TimeoutError, socket.timeout) as exc:
                 raise ClientError(
@@ -155,6 +253,9 @@ class LLMPerfClient:
 
     def list_providers(self) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/providers")
+
+    def reload_providers(self) -> Dict[str, Any]:
+        return self._request("POST", "/api/v1/providers/reload")
 
     def list_provider_models(
         self, provider_id: str, refresh: bool = False

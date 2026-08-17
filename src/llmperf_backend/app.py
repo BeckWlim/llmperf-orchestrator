@@ -13,6 +13,7 @@ from sqlalchemy.engine import make_url
 
 from llmperf_backend.auth import TokenVerifier, normalize_public_key
 from llmperf_backend.config import ConfigError, ConfigStore, ConfigSnapshot
+from llmperf_backend.environment import load_provider_environment
 from llmperf_backend.models import (
     BenchmarkCampaignCreate,
     BenchmarkCampaignStart,
@@ -89,7 +90,9 @@ def create_app(
     validated_config = store.current()
     db = database or Database(validated_config.database)
     repository = RunnerRepository(db)
-    providers = provider_registry or ProviderRegistry.from_environment()
+    providers = provider_registry or ProviderRegistry.from_environment(
+        load_provider_environment(), reload_loader=load_provider_environment
+    )
     discovery = model_discovery or ProviderModelDiscovery(providers)
     tokenizers = tokenizer_cache or TokenizerCache()
     datasets = dataset_cache or DatasetCache()
@@ -630,7 +633,20 @@ def create_app(
     @api.get("/providers", tags=["providers"])
     async def list_providers(request: Request) -> Dict[str, Any]:
         require_role(request, "viewer")
-        return {"items": request.app.state.provider_registry.list_public()}
+        return request.app.state.provider_registry.public_document()
+
+    @api.post("/providers/reload", tags=["providers"])
+    async def reload_providers(request: Request) -> Dict[str, Any]:
+        """Atomically reload only Provider Profiles from the Backend env file."""
+
+        require_role(request, "operator")
+        try:
+            document = request.app.state.provider_registry.reload()
+            request.app.state.model_discovery.invalidate()
+            return document
+        except ProviderConfigError as exc:
+            # Candidate validation happens before the active registry is changed.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @api.get("/providers/{provider_id}/models", tags=["providers"])
     async def list_provider_models(

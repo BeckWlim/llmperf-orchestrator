@@ -44,7 +44,8 @@ Profile ID，`model` 应使用该 Profile 可见的精确模型 ID。
 
 常用字段及作用：
 
-- `timeout_seconds`：每个模型 HTTP 请求的上限。
+- `timeout_seconds`：流式请求连续未产生 `content`/`reasoning_content` 文本的停顿上限；
+  有效文本持续到达时请求总时长可以超过该值，SSE 心跳和 metadata 不刷新计时。
 - `max_completed_requests`：Runner 目标完成请求数。
 - `concurrent_requests`：Runner 内同时在途的请求数；增大它改变并发压力，
   不代表增加 Runner 或 Scheduler slot。

@@ -14,6 +14,7 @@ from huggingface_hub.utils import HFValidationError, validate_repo_id
 from llmperf_backend.huggingface import (
     HUGGINGFACE_PROXY,
     HuggingFaceProxyError,
+    configure_huggingface_http,
     huggingface_proxy_label,
     resolve_huggingface_proxy,
 )
@@ -68,6 +69,7 @@ class DatasetCache:
             self.proxy_url = resolve_huggingface_proxy(proxy_url)
         except HuggingFaceProxyError as exc:
             raise DatasetResolutionError(str(exc)) from exc
+        configure_huggingface_http(self.proxy_url)
         self._entries: Dict[Tuple[str, str, str, str], DatasetResolution] = {}
         self._lock = threading.RLock()
         LOGGER.info(

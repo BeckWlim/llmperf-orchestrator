@@ -179,6 +179,46 @@ def _compact_timestamp(value: Any) -> str:
     return text.replace("T", " ")[:16]
 
 
+def print_provider_table(document: Dict[str, Any]) -> None:
+    print(
+        f"{'ID':<16} {'ADAPTER':<10} {'KEY':<5} {'DISCOVERY':<11} "
+        f"{'TYPICAL MODELS (UP TO 3)':<46} BASE URL"
+    )
+    for item in document.get("items", []):
+        discovery = item.get("model_discovery") or {}
+        typical_models = ", ".join(item.get("typical_models") or []) or "-"
+        print(
+            f"{_truncate(item.get('id'), 16):<16} "
+            f"{_truncate(item.get('adapter'), 10):<10} "
+            f"{('yes' if item.get('api_key_configured') else 'no'):<5} "
+            f"{_truncate(discovery.get('mode'), 11):<11} "
+            f"{_truncate(typical_models, 46):<46} "
+            f"{_table_value(item.get('base_url'))}"
+        )
+
+
+def print_provider_models(document: Dict[str, Any]) -> None:
+    cache_state = "cached" if document.get("cached") else "fresh"
+    print(
+        f"Provider: {_table_value(document.get('provider'))}  "
+        f"Source: {_table_value(document.get('source'))}  "
+        f"State: {cache_state}"
+    )
+    for model in document.get("models", []):
+        print(model)
+
+
+def print_provider_reload(document: Dict[str, Any]) -> None:
+    changes = document.get("changes") or {}
+    print(
+        f"Provider Profiles reloaded (generation "
+        f"{_table_value(document.get('generation'))})."
+    )
+    for field in ("added", "updated", "removed"):
+        values = changes.get(field) or []
+        print(f"{field.title()}: {', '.join(values) if values else '-'}")
+
+
 def _validate_runner_list(document: Any, full: bool) -> Dict[str, Any]:
     if not isinstance(document, dict) or document.get("full") is not full:
         raise ClientError(
@@ -517,6 +557,9 @@ def render_result(result: CLIProjection) -> None:
         "runner_table": print_runner_table,
         "runner_summary": print_runner_summary,
         "runner_logs": print_runner_logs,
+        "provider_table": print_provider_table,
+        "provider_models": print_provider_models,
+        "provider_reload": print_provider_reload,
         "json": print_json,
         "silent": lambda document: None,
     }
@@ -1185,6 +1228,8 @@ Examples:
   llmperfctl provider list
   llmperfctl provider models deepseek
   llmperfctl provider models deepseek --refresh
+  llmperfctl provider models deepseek --json
+  llmperfctl provider reload
 """,
     )
     provider_commands = provider.add_subparsers(
@@ -1193,7 +1238,7 @@ Examples:
         title="provider commands",
         metavar="COMMAND",
     )
-    _command_parser(
+    provider_list = _command_parser(
         provider_commands,
         "list",
         help="List configured Provider Profiles",
@@ -1201,6 +1246,11 @@ Examples:
             "List public Provider Profile configuration without exposing API keys."
         ),
         epilog="Example:\n  llmperfctl provider list",
+    )
+    provider_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Render the stable Provider projection as JSON",
     )
     provider_models = _command_parser(
         provider_commands,
@@ -1225,6 +1275,27 @@ Use "llmperfctl provider list" to find valid provider IDs.
         "--refresh",
         action="store_true",
         help="Bypass the backend model-list TTL cache (requires operator role)",
+    )
+    provider_models.add_argument(
+        "--json",
+        action="store_true",
+        help="Render the stable model projection as JSON",
+    )
+    provider_reload = _command_parser(
+        provider_commands,
+        "reload",
+        help="Reload Provider Profiles without restarting the Backend",
+        description=(
+            "Validate and atomically replace only LLMPERF_PROVIDER_* settings. "
+            "Running Runners keep their existing connection snapshot; newly "
+            "claimed Runners use the new generation. Requires operator role."
+        ),
+        epilog="Example:\n  llmperfctl provider reload",
+    )
+    provider_reload.add_argument(
+        "--json",
+        action="store_true",
+        help="Render the reload result as JSON",
     )
 
     auth = _command_parser(
@@ -1778,6 +1849,8 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
     if arguments.command == "provider":
         if arguments.provider_command == "list":
             return client.list_providers()
+        if arguments.provider_command == "reload":
+            return client.reload_providers()
         return client.list_provider_models(
             arguments.provider_id, refresh=arguments.refresh
         )

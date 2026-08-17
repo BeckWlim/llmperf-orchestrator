@@ -11,7 +11,11 @@ from llmperf.user_config import (
     read_environment_file,
 )
 from llmperf_backend.__main__ import build_parser, execute_config
-from llmperf_backend.environment import load_environment, resolve_environment_path
+from llmperf_backend.environment import (
+    load_environment,
+    load_provider_environment,
+    resolve_environment_path,
+)
 
 
 def _arguments(*values):
@@ -23,7 +27,7 @@ def test_config_crud(tmp_path, monkeypatch):
     path = backend_environment_path()
 
     configured = execute_config(_arguments("set", "LLMPERF_SERVER_HOST", "0.0.0.0"))
-    execute_config(
+    provider_configured = execute_config(
         _arguments(
             "set",
             "LLMPERF_PROVIDER_ALIYUN_KEY",
@@ -33,6 +37,8 @@ def test_config_crud(tmp_path, monkeypatch):
 
     assert configured["path"] == str(path)
     assert configured["restart_required"] is True
+    assert provider_configured["restart_required"] is False
+    assert provider_configured["provider_reload_required"] is True
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert read_environment_file(path) == {
@@ -49,6 +55,29 @@ def test_config_crud(tmp_path, monkeypatch):
     }
     assert execute_config(_arguments("unset", "LLMPERF_SERVER_HOST"))["removed"] is True
     assert "LLMPERF_SERVER_HOST" not in read_environment_file(path)
+
+
+def test_provider_scope(tmp_path):
+    path = tmp_path / "backend.env"
+    path.write_text(
+        "LLMPERF_PROVIDER_ZHIPU_URL=https://file.example/v1\n"
+        "DATABASE_URL=postgresql+asyncpg:///must-not-reload\n",
+        encoding="utf-8",
+    )
+
+    environment = load_provider_environment(
+        path,
+        process_environment={
+            "LLMPERF_PROVIDER_ZHIPU_URL": "https://process.example/v1",
+            "LLMPERF_PROVIDER_ZHIPU_KEY": "process-secret",
+            "LLMPERF_SERVER_PORT": "9000",
+        },
+    )
+
+    assert environment == {
+        "LLMPERF_PROVIDER_ZHIPU_URL": "https://process.example/v1",
+        "LLMPERF_PROVIDER_ZHIPU_KEY": "process-secret",
+    }
 
 
 def test_env_precedence(tmp_path, monkeypatch):

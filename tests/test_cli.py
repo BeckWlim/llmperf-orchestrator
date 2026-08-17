@@ -401,9 +401,21 @@ ARG_CASES = [
                 "provider_command": "models",
                 "provider_id": "deepseek",
                 "refresh": True,
+                "json": False,
             },
         },
         id="provider-models",
+    ),
+    pytest.param(
+        {
+            "argv": ["provider", "reload", "--json"],
+            "expected": {
+                "command": "provider",
+                "provider_command": "reload",
+                "json": True,
+            },
+        },
+        id="provider-reload",
     ),
     pytest.param(
         {
@@ -895,6 +907,7 @@ def test_adapter_route_registry():
         "planner.status",
         "provider.list",
         "provider.models",
+        "provider.reload",
         "runner.cancel",
         "runner.export",
         "runner.list",
@@ -1014,9 +1027,11 @@ def test_datetime_payload(monkeypatch):
 
 def test_provider_encoding(monkeypatch):
     requested_urls = []
+    requested_methods = []
 
     def fake_urlopen(request, timeout):
         requested_urls.append(request.full_url)
+        requested_methods.append(request.get_method())
         return _FakeResponse({"models": []})
 
     monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
@@ -1027,6 +1042,61 @@ def test_provider_encoding(monkeypatch):
     assert requested_urls == [
         "http://127.0.0.1:8000/api/v1/providers/team%2Fprovider/models?refresh=true"
     ]
+    assert requested_methods == ["GET"]
+
+    client.reload_providers()
+    assert requested_urls[-1] == "http://127.0.0.1:8000/api/v1/providers/reload"
+    assert requested_methods[-1] == "POST"
+
+
+def test_provider_output(capsys):
+    profiles = {
+        "generation": 2,
+        "loaded_at": "2026-08-14T09:46:10+00:00",
+        "items": [
+            {
+                "id": "zhipu",
+                "adapter": "openai",
+                "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                "api_key_configured": True,
+                "typical_models": ["glm-5.2", "glm-5.3", "glm-5.4"],
+                "model_discovery": {
+                    "mode": "static",
+                    "cache_ttl_seconds": 300,
+                    "static_model_count": 1,
+                },
+            }
+        ],
+    }
+    arguments = build_parser().parse_args(["provider", "list"])
+    render_result(adapt_cli_response(arguments, profiles))
+    output = capsys.readouterr().out
+    assert "ID" in output
+    assert "zhipu" in output
+    assert "TYPICAL MODELS" in output
+    assert "glm-5.2, glm-5.3, glm-5.4" in output
+    assert not output.lstrip().startswith("{")
+
+    models = {
+        "provider": "zhipu",
+        "source": "static",
+        "cached": False,
+        "fetched_at": "2026-08-14T09:46:10+00:00",
+        "expires_at": "2026-08-14T09:51:10+00:00",
+        "models": ["glm5.2"],
+    }
+    arguments = build_parser().parse_args(["provider", "models", "zhipu"])
+    render_result(adapt_cli_response(arguments, models))
+    output = capsys.readouterr().out
+    assert "Provider: zhipu" in output
+    assert "glm5.2" in output
+    assert not output.lstrip().startswith("{")
+
+    arguments = build_parser().parse_args(
+        ["provider", "models", "zhipu", "--json"]
+    )
+    render_result(adapt_cli_response(arguments, models))
+    assert json.loads(capsys.readouterr().out)["models"] == ["glm5.2"]
 
 
 def test_request_timeout(monkeypatch):
@@ -1043,6 +1113,52 @@ def test_request_timeout(monkeypatch):
     assert "timed out after 30 seconds" in message
     assert "backend may still be processing" in message
     assert "--request-timeout SECONDS" in message
+
+
+def test_http_detail(monkeypatch):
+    def fake_urlopen(request, timeout):
+        raise HTTPError(
+            request.full_url,
+            422,
+            "Unprocessable Entity",
+            {"X-Request-ID": "request-123"},
+            BytesIO(
+                json.dumps(
+                    {
+                        "detail": [
+                            {
+                                "loc": ["body", "benchmark", "tokenizer", "id"],
+                                "msg": "repository does not exist",
+                                "type": "value_error",
+                                "input": "sensitive request body",
+                            },
+                            {
+                                "loc": ["body", "benchmark", "model"],
+                                "msg": "unsupported model",
+                                "type": "value_error",
+                            },
+                        ]
+                    }
+                ).encode("utf-8")
+            ),
+        )
+
+    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    client = LLMPerfClient("http://127.0.0.1:8000")
+
+    with pytest.raises(ClientError) as error:
+        client.start_runner({"benchmark": {"model": "test"}})
+
+    message = str(error.value)
+    assert "HTTP 422 Unprocessable Entity" in message
+    assert "POST /api/v1/runners" in message
+    assert "request_id=request-123" in message
+    assert "body.benchmark.tokenizer.id" in message
+    assert "repository does not exist [value_error]" in message
+    assert "body.benchmark.model" in message
+    assert "sensitive request body" not in message
+    assert error.value.method == "POST"
+    assert error.value.path == "/api/v1/runners"
 
 
 def test_wait_summary(caplog):

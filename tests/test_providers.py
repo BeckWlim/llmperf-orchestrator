@@ -27,11 +27,14 @@ def test_public_profile():
 
     profiles = {item["id"]: item for item in registry.list_public()}
     assert set(profiles) == {"anthropic", "catalog", "deepseek", "glm"}
-    assert profiles["deepseek"]["has_api_key"] is True
+    assert profiles["deepseek"]["api_key_configured"] is True
     assert "api_key" not in profiles["deepseek"]
-    assert profiles["deepseek"]["llm_api"] == "openai"
-    assert profiles["deepseek"]["discovery"] == "openai"
-    assert profiles["catalog"]["discovery"] == "static"
+    assert profiles["deepseek"]["adapter"] == "openai"
+    assert profiles["deepseek"]["model_discovery"]["mode"] == "openai"
+    assert profiles["catalog"]["model_discovery"]["mode"] == "static"
+    assert profiles["catalog"]["typical_models"] == ["static-b", "static-a"]
+    assert profiles["anthropic"]["typical_models"] == ["claude-test"]
+    assert profiles["deepseek"]["typical_models"] == []
 
     anthropic = registry.require("anthropic")
     assert anthropic.api_key_env == "ANTHROPIC_API_KEY"
@@ -43,6 +46,24 @@ def test_public_profile():
     assert benchmark["provider"] == "deepseek"
     assert benchmark["model"] == "deepseek-reasoner"
     assert benchmark["llm_api"] == "openai"
+
+    static_benchmark = registry.resolve_benchmark(
+        {"provider": "catalog", "model": "static-a"}
+    )
+    assert static_benchmark["model"] == "static-a"
+    with pytest.raises(ProviderConfigError, match="configured models: static-b, static-a"):
+        registry.resolve_benchmark({"provider": "catalog", "model": "static-c"})
+
+
+def test_model_preview():
+    registry = ProviderRegistry.from_environment(
+        {"LLMPERF_PROVIDER_TEST_MODELS": "model-d,model-c,model-b,model-a"}
+    )
+
+    profile = registry.list_public()[0]
+
+    assert profile["typical_models"] == ["model-d", "model-c", "model-b"]
+    assert profile["model_discovery"]["static_model_count"] == 4
 
 
 def test_worker_credentials():
@@ -125,3 +146,54 @@ def test_static_discovery():
     assert first["models"] == ["static-a", "static-b"]
     assert first["cached"] is False
     assert second["cached"] is True
+
+
+def test_atomic_reload():
+    active = {
+        "LLMPERF_PROVIDER_TEST_URL": "https://old.example/v1",
+        "LLMPERF_PROVIDER_TEST_KEY": "old-secret",
+        "LLMPERF_PROVIDER_TEST_KEYVAR": "TEST_PROVIDER_KEY",
+    }
+    registry = ProviderRegistry.from_environment(
+        active, reload_loader=lambda: dict(active)
+    )
+
+    active.update(
+        {
+            "LLMPERF_PROVIDER_TEST_URL": "https://new.example/v1",
+            "LLMPERF_PROVIDER_TEST_KEY": "new-secret",
+            "LLMPERF_PROVIDER_EXTRA_MODELS": "model-b,model-a",
+        }
+    )
+    result = registry.reload()
+
+    assert result["generation"] == 1
+    assert result["changes"] == {
+        "added": ["extra"],
+        "updated": ["test"],
+        "removed": [],
+    }
+    assert "new-secret" not in json.dumps(result)
+    environment = registry.worker_environment("test", {})
+    assert environment["OPENAI_API_BASE"] == "https://new.example/v1"
+    assert environment["TEST_PROVIDER_KEY"] == "new-secret"
+
+    active["LLMPERF_PROVIDER_TEST_URL"] = "not-a-url"
+    with pytest.raises(ProviderConfigError):
+        registry.reload()
+    assert registry.generation == 1
+    assert registry.require("test").api_base == "https://new.example/v1"
+
+    for name in (
+        "LLMPERF_PROVIDER_TEST_URL",
+        "LLMPERF_PROVIDER_TEST_KEY",
+        "LLMPERF_PROVIDER_TEST_KEYVAR",
+    ):
+        active.pop(name, None)
+    removed = registry.reload()
+    assert removed["changes"]["removed"] == ["test"]
+    environment = registry.worker_environment(
+        "extra", {"TEST_PROVIDER_KEY": "must-not-leak", "KEEP": "yes"}
+    )
+    assert "TEST_PROVIDER_KEY" not in environment
+    assert environment["KEEP"] == "yes"

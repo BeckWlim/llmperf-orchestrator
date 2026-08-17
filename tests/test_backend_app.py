@@ -101,12 +101,20 @@ class ASGITestClient:
 
 
 def make_client(
-    tmp_path: Path, database_url: str, tokenizer_cache=None, dataset_cache=None
+    tmp_path: Path,
+    database_url: str,
+    tokenizer_cache=None,
+    dataset_cache=None,
+    provider_environment=None,
 ) -> ASGITestClient:
     config_path = tmp_path / "backend.yaml"
     config_path.write_text(CONFIG.format(database_url=database_url), encoding="utf-8")
+    provider_environment = provider_environment or {
+        "LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"
+    }
     providers = ProviderRegistry.from_environment(
-        {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
+        provider_environment,
+        reload_loader=lambda: dict(provider_environment),
     )
     if tokenizer_cache is None:
         tokenizer_directory = tmp_path / "tokenizer"
@@ -145,12 +153,15 @@ def clean_postgres(postgresql_url):
 
 @pytest.fixture
 def client_factory(tmp_path: Path, postgresql_url):
-    def factory(tokenizer_cache=None, dataset_cache=None):
+    def factory(
+        tokenizer_cache=None, dataset_cache=None, provider_environment=None
+    ):
         return make_client(
             tmp_path,
             postgresql_url,
             tokenizer_cache=tokenizer_cache,
             dataset_cache=dataset_cache,
+            provider_environment=provider_environment,
         )
 
     return factory
@@ -166,6 +177,45 @@ def test_health(client_factory):
         response = client.get("/api/v1/config")
         assert response.status_code == 200
         assert response.json()["config"]["benchmark"]["model"] == "test-model"
+
+
+def test_provider_reload(client_factory):
+    provider_environment = {
+        "LLMPERF_PROVIDER_TEST_URL": "http://old.example/v1",
+        "LLMPERF_PROVIDER_TEST_KEY": "old-secret",
+        "LLMPERF_PROVIDER_TEST_DISCOVERY": "static",
+        "LLMPERF_PROVIDER_TEST_MODELS": "glm-5.2",
+    }
+    with client_factory(provider_environment=provider_environment) as client:
+        listed = client.get("/api/v1/providers")
+        assert listed.status_code == 200
+        assert listed.json()["generation"] == 0
+        assert listed.json()["items"][0]["base_url"] == "http://old.example/v1"
+
+        provider_environment["LLMPERF_PROVIDER_TEST_URL"] = "http://new.example/v1"
+        provider_environment["LLMPERF_PROVIDER_TEST_KEY"] = "new-secret"
+        reloaded = client.post("/api/v1/providers/reload")
+
+        assert reloaded.status_code == 200
+        assert reloaded.json()["generation"] == 1
+        assert reloaded.json()["changes"]["updated"] == ["test"]
+        assert "new-secret" not in reloaded.text
+        assert client.app.state.scheduler.provider_registry.require(
+            "test"
+        ).api_base == "http://new.example/v1"
+
+        invalid_runner = client.post(
+            "/api/v1/runners",
+            json={"benchmark": {"provider": "test", "model": "glm5.2"}},
+        )
+        assert invalid_runner.status_code == 422
+        assert "configured models: glm-5.2" in invalid_runner.text
+        assert client.get("/api/v1/runners").json()["items"] == []
+
+        provider_environment["LLMPERF_PROVIDER_TEST_URL"] = "invalid"
+        rejected = client.post("/api/v1/providers/reload")
+        assert rejected.status_code == 422
+        assert client.get("/api/v1/providers").json()["generation"] == 1
 
 
 def test_config_validation(client_factory, postgresql_url):

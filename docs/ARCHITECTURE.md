@@ -349,7 +349,9 @@ Runner 未声明 tokenizer 时使用 backend 默认的
 stdout/stderr，`--full` 也只显示扩展白名单。每个 CLI 请求必须经过显式注册的兼容
 adapter 和资源 projector，renderer 拒绝原始 dict/list。失败或取消时 CLI 进程返回退出码 2，适合
 脚本和 CI 判断。`--timeout` 只终止本地等待，不取消已经持久化的任务；任务可继续用
-Runner ID 查询。Benchmark 的 `timeout_seconds` 会继续传递为模型 HTTP 请求时限。
+Runner ID 查询。Benchmark 的 `timeout_seconds` 会传递为模型流式请求的文本停顿时限；
+`content`/`reasoning_content` 持续到达时总请求时长可以超过该值，心跳和 metadata 不刷新
+计时。
 
 完整 Campaign 编排：
 
@@ -409,6 +411,8 @@ TTL 曲线合并。
 llmperfctl provider list
 llmperfctl provider models deepseek
 llmperfctl provider models deepseek --refresh
+llmperfctl provider models deepseek --json
+llmperfctl provider reload
 ```
 
 普通查询允许使用缓存；`--refresh` 强制向供应商重新探测，因此要求
@@ -506,9 +510,14 @@ Benchmark 参数；API key 与 API base 不进入任务、指标或 JSON 导出�
 启动 Worker 前清除全部 `LLMPERF_PROVIDER_*` 变量和其他 Profile 的目标凭据
 变量，再只注入当前任务所选 Profile 的 endpoint/key。
 
-Profile 在进程启动时从环境构建为只读注册表。修改 `.env` 中的 Profile、
-密钥或模型发现策略后必须重启后端；`POST /config/reload` 只重载 YAML，不会
-热更新凭据。
+Profile 在进程启动时从环境构建，并支持通过 `POST /providers/reload` 原子切换。
+该入口只重新读取 `LLMPERF_PROVIDER_*`：不会应用数据库、Scheduler、Planner、Ray、
+认证、监听地址、默认 workload 或其他 Backend 配置。完整候选 Profile 先在活动状态
+之外解析和校验，任一字段无效则拒绝请求且 generation 不变；成功后清空模型目录缓存。
+Scheduler 中已经运行的 Runner 保持领取时的 endpoint/key 快照，只有之后领取的新
+Runner 使用新 generation。`llmperf-backend config set/unset` 对 Provider 字段会返回
+`provider_reload_required=true`，随后运行 `llmperfctl provider reload` 即可；非 Provider
+运行配置仍需要相应的安全重启或专用控制面操作。
 
 ### 基于 API key 的模型发现
 
@@ -532,7 +541,8 @@ sequenceDiagram
 - `DISCOVERY=openai`：请求 Profile 的
   `<URL><PATH>`，解析 OpenAI-compatible `data[].id`。
 - `DISCOVERY=static`：对不提供兼容目录接口的供应商返回管理员配置的
-  `MODELS` 白名单。
+  `MODELS` 白名单，并在 Runner/Campaign 入队前要求精确 model ID 位于该白名单；不匹配
+  时返回 422，既不创建持久化 workload，也不自动改写 ID。
 - `DISCOVERY=disabled`：禁止该 Profile 的模型发现。
 - 结果按 Profile 的 TTL 缓存在单个 FastAPI 进程内；`refresh=true` 可绕过缓存。
 - 返回值绝不包含 API key，只报告模型 ID、来源以及缓存时间。
@@ -549,6 +559,7 @@ sequenceDiagram
 | `GET` | `/health` | 服务与数据库健康检查 |
 | `GET` | `/api/v1/scheduler/status` | 查询 Scheduler 状态与并发槽位 |
 | `GET` | `/api/v1/providers` | 查询已配置供应商（不返回密钥） |
+| `POST` | `/api/v1/providers/reload` | 原子重载 Provider-only 配置（operator） |
 | `GET` | `/api/v1/providers/{id}/models` | 查询或刷新 key 可见模型目录 |
 | `POST` | `/api/v1/campaigns` | 创建实验批次 |
 | `GET` | `/api/v1/campaigns` | 查询实验批次 |

@@ -7,7 +7,7 @@ import json
 import os
 import re
 import threading
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
@@ -99,28 +99,50 @@ class ProviderProfile:
     model_cache_ttl_seconds: int
 
     def public_dict(self) -> Dict[str, Any]:
+        discovery: Dict[str, Any] = {
+            "mode": self.discovery,
+            "cache_ttl_seconds": self.model_cache_ttl_seconds,
+            "static_model_count": len(self.static_models),
+        }
+        if self.discovery == "openai":
+            discovery["path"] = self.models_path
         return {
             "id": self.provider_id,
-            "llm_api": self.llm_api,
-            "api_base": self.api_base,
-            "has_api_key": bool(self.api_key),
-            "discovery": self.discovery,
-            "models_path": self.models_path if self.discovery == "openai" else None,
-            "static_model_count": len(self.static_models),
+            "adapter": self.llm_api,
+            "base_url": self.api_base or None,
+            "api_key_configured": bool(self.api_key),
+            "typical_models": list(self.static_models[:3]),
+            "model_discovery": discovery,
         }
 
 
 class ProviderRegistry:
-    """Immutable provider definitions parsed from the backend environment."""
+    """Atomically reloadable Provider definitions parsed from a narrow source."""
 
-    def __init__(self, profiles: Sequence[ProviderProfile]):
+    def __init__(
+        self,
+        profiles: Sequence[ProviderProfile],
+        reload_loader: Optional[Callable[[], Mapping[str, str]]] = None,
+    ):
         self._profiles = {profile.provider_id: profile for profile in profiles}
         if not self._profiles:
             raise ProviderConfigError("At least one provider profile is required")
+        self._reload_loader = reload_loader
+        self._lock = threading.RLock()
+        self._generation = 0
+        self._loaded_at = _utcnow()
+        self._credential_environment_names = {
+            name
+            for profile in self._profiles.values()
+            for name in (profile.api_base_env, profile.api_key_env)
+        }
 
     @classmethod
     def from_environment(
-        cls, environment: Optional[Mapping[str, str]] = None
+        cls,
+        environment: Optional[Mapping[str, str]] = None,
+        *,
+        reload_loader: Optional[Callable[[], Mapping[str, str]]] = None,
     ) -> "ProviderRegistry":
         values = dict(os.environ if environment is None else environment)
         grouped: Dict[str, Dict[str, str]] = {}
@@ -141,7 +163,8 @@ class ProviderRegistry:
             [
                 cls._profile_from_values(provider_id, profile_values)
                 for provider_id, profile_values in sorted(grouped.items())
-            ]
+            ],
+            reload_loader=reload_loader,
         )
 
     @staticmethod
@@ -219,7 +242,21 @@ class ProviderRegistry:
         )
 
     def get(self, provider_id: str) -> Optional[ProviderProfile]:
-        return self._profiles.get(_normalize_provider_id(provider_id))
+        with self._lock:
+            return self._profiles.get(_normalize_provider_id(provider_id))
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def profile_snapshot(self, provider_id: str) -> Tuple[ProviderProfile, int]:
+        normalized = _normalize_provider_id(provider_id)
+        with self._lock:
+            profile = self._profiles.get(normalized)
+            if profile is None:
+                raise ProviderConfigError(f"Unknown provider profile: {provider_id}")
+            return profile, self._generation
 
     def require(self, provider_id: str) -> ProviderProfile:
         profile = self.get(provider_id)
@@ -228,32 +265,106 @@ class ProviderRegistry:
         return profile
 
     def list_public(self) -> List[Dict[str, Any]]:
-        return [
-            self._profiles[provider_id].public_dict()
-            for provider_id in sorted(self._profiles)
-        ]
+        with self._lock:
+            return [
+                self._profiles[provider_id].public_dict()
+                for provider_id in sorted(self._profiles)
+            ]
+
+    def public_document(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "generation": self._generation,
+                "loaded_at": self._loaded_at.isoformat(),
+                "items": [
+                    self._profiles[provider_id].public_dict()
+                    for provider_id in sorted(self._profiles)
+                ],
+            }
+
+    def reload(self) -> Dict[str, Any]:
+        """Validate a Provider-only candidate before one atomic registry swap."""
+
+        if self._reload_loader is None:
+            raise ProviderConfigError(
+                "This Provider Registry has no reloadable configuration source"
+            )
+        try:
+            environment = self._reload_loader()
+            candidate = type(self).from_environment(environment)
+        except ProviderConfigError:
+            raise
+        except Exception as exc:
+            raise ProviderConfigError(
+                f"Unable to reload Provider Profiles: {exc}"
+            ) from exc
+
+        with self._lock:
+            previous = self._profiles
+            current = candidate._profiles
+            previous_ids = set(previous)
+            current_ids = set(current)
+            changed = sorted(
+                provider_id
+                for provider_id in previous_ids & current_ids
+                if previous[provider_id] != current[provider_id]
+            )
+            self._profiles = current
+            self._credential_environment_names.update(
+                name
+                for profile in current.values()
+                for name in (profile.api_base_env, profile.api_key_env)
+            )
+            self._generation += 1
+            self._loaded_at = _utcnow()
+            document = self.public_document()
+            document.update(
+                {
+                    "reloaded": True,
+                    "changes": {
+                        "added": sorted(current_ids - previous_ids),
+                        "updated": changed,
+                        "removed": sorted(previous_ids - current_ids),
+                    },
+                }
+            )
+            return document
 
     def resolve_benchmark(self, benchmark: Mapping[str, Any]) -> Dict[str, Any]:
         resolved = dict(benchmark)
         profile = self.require(str(resolved["provider"]))
         resolved["provider"] = profile.provider_id
         resolved["llm_api"] = profile.llm_api
-        if not resolved.get("model"):
+        model = str(resolved.get("model") or "")
+        if not model:
             raise ProviderConfigError("A benchmark model must be selected")
+        if profile.discovery == "static" and model not in profile.static_models:
+            visible_models = ", ".join(profile.static_models[:10])
+            if len(profile.static_models) > 10:
+                visible_models += f", ... ({len(profile.static_models)} total)"
+            raise ProviderConfigError(
+                f"Model {model!r} is not configured for static Provider "
+                f"{profile.provider_id!r}; configured models: {visible_models}"
+            )
         return resolved
 
     def worker_environment(
         self, provider_id: str, base_environment: Mapping[str, str]
     ) -> Dict[str, str]:
-        profile = self.require(provider_id)
+        with self._lock:
+            profile = self._profiles.get(_normalize_provider_id(provider_id))
+            if profile is None:
+                raise ProviderConfigError(f"Unknown provider profile: {provider_id}")
+            credential_environment_names = tuple(
+                self._credential_environment_names
+            )
         environment = {
             name: value
             for name, value in base_environment.items()
             if not name.startswith(PROVIDER_PREFIX)
         }
-        for configured_profile in self._profiles.values():
-            environment.pop(configured_profile.api_base_env, None)
-            environment.pop(configured_profile.api_key_env, None)
+        for environment_name in credential_environment_names:
+            environment.pop(environment_name, None)
         if profile.api_base:
             environment[profile.api_base_env] = profile.api_base
         if profile.api_key:
@@ -267,6 +378,7 @@ class _ModelCacheEntry:
     fetched_at: datetime
     expires_at: datetime
     source: str
+    registry_generation: int
 
 
 class ProviderModelDiscovery:
@@ -279,11 +391,16 @@ class ProviderModelDiscovery:
         self._lock = threading.RLock()
 
     async def models(self, provider_id: str, refresh: bool = False) -> Dict[str, Any]:
-        profile = self.registry.require(provider_id)
+        profile, registry_generation = self.registry.profile_snapshot(provider_id)
         now = _utcnow()
         with self._lock:
             cached = self._cache.get(profile.provider_id)
-            if cached is not None and not refresh and now < cached.expires_at:
+            if (
+                cached is not None
+                and cached.registry_generation == registry_generation
+                and not refresh
+                and now < cached.expires_at
+            ):
                 return self._response(profile, cached, cached=True)
 
         if profile.discovery == "disabled":
@@ -306,10 +423,15 @@ class ProviderModelDiscovery:
             fetched_at=fetched_at,
             expires_at=fetched_at + timedelta(seconds=profile.model_cache_ttl_seconds),
             source=source,
+            registry_generation=registry_generation,
         )
         with self._lock:
             self._cache[profile.provider_id] = entry
         return self._response(profile, entry, cached=False)
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._cache.clear()
 
     def _fetch_openai_models(self, profile: ProviderProfile) -> Tuple[str, ...]:
         if not profile.api_base:

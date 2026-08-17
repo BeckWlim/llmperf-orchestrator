@@ -16,6 +16,7 @@ from llmperf.logging import route_library_logs
 from llmperf_backend.huggingface import (
     HUGGINGFACE_PROXY,
     HuggingFaceProxyError,
+    configure_huggingface_http,
     huggingface_proxy_label,
     resolve_huggingface_proxy,
 )
@@ -25,7 +26,7 @@ from llmperf_backend.huggingface import (
 # before Transformers initializes its private logger.
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
-from huggingface_hub import try_to_load_from_cache
+from huggingface_hub import snapshot_download, try_to_load_from_cache
 from huggingface_hub.utils import HFValidationError, validate_repo_id
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
@@ -41,6 +42,19 @@ TOKENIZERS_BACKEND_CLASS_ERROR = (
     "Tokenizer class TokenizersBackend does not exist or is not currently imported"
 )
 IMMUTABLE_HUGGINGFACE_REVISION = re.compile(r"[0-9a-f]{40,64}\Z")
+TOKENIZER_SNAPSHOT_ALLOW_PATTERNS = (
+    "tokenizer*",
+    "vocab*",
+    "merges*",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "chat_template*",
+    "chat_templates/*",
+    "config.json",
+    "*.model",
+    "*.tiktoken",
+    "*.bpe",
+)
 
 
 class TokenizerResolutionError(RuntimeError):
@@ -99,9 +113,9 @@ class TokenizerResolution:
 class TokenizerCache:
     """Resolve remote tokenizer IDs into server-owned local directories.
 
-    Transformers performs the remote lookup. The resulting tokenizer artifacts are
-    copied into a small LLMPerf-managed cache so Workers can load them with
-    ``local_files_only=True`` and never perform their own network lookup.
+    Hugging Face downloads a bounded tokenizer-only snapshot. Transformers loads that
+    local snapshot without network access, and the resulting tokenizer artifacts are
+    copied into a small LLMPerf-managed cache so Workers never perform their own lookup.
     """
 
     def __init__(
@@ -128,6 +142,7 @@ class TokenizerCache:
             self.proxy_url = resolve_huggingface_proxy(proxy_url)
         except HuggingFaceProxyError as exc:
             raise TokenizerResolutionError(str(exc)) from exc
+        configure_huggingface_http(self.proxy_url)
         self._entries: Dict[Tuple[str, str, bool], TokenizerResolution] = {}
         self._key_locks: Dict[Tuple[str, str, bool], threading.Lock] = {}
         self._lock = threading.RLock()
@@ -261,48 +276,38 @@ class TokenizerCache:
                     self.local_files_only,
                     huggingface_proxy_label(self.proxy_url),
                 )
-                load_options: Dict[str, Any] = {
-                    "revision": revision,
-                    "use_fast": use_fast,
-                    "trust_remote_code": False,
-                    "cache_dir": str(self.download_directory),
-                    "local_files_only": self.local_files_only,
-                }
-                if self.proxy_url:
-                    load_options["proxies"] = {
-                        "http": self.proxy_url,
-                        "https": self.proxy_url,
-                    }
+                cached_snapshot = self._cached_snapshot(tokenizer_id, revision)
+                snapshot_path = cached_snapshot[0] if cached_snapshot else None
+                snapshot_revision = cached_snapshot[1] if cached_snapshot else None
                 try:
-                    tokenizer = AutoTokenizer.from_pretrained(
-                        tokenizer_id, **load_options
+                    if snapshot_path is None:
+                        raise FileNotFoundError("no cached tokenizer snapshot")
+                    tokenizer = self._load_local_tokenizer(
+                        tokenizer_id, revision, snapshot_path, use_fast
                     )
-                except ValueError as exc:
-                    if not use_fast or TOKENIZERS_BACKEND_CLASS_ERROR not in str(exc):
-                        raise
-                    # Transformers 5 renamed the generic tokenizer.json loader to
-                    # TokenizersBackend. Older releases cannot resolve that class
-                    # name from newer Hub metadata, although they can load the same
-                    # tokenizer.json through PreTrainedTokenizerFast.
-                    LOGGER.warning(
-                        "Tokenizer %s@%s requires the Transformers 5 "
-                        "TokenizersBackend class; using the compatible fast "
-                        "tokenizer loader",
+                    LOGGER.info(
+                        "Tokenizer snapshot-cache hit: %s requested=%s resolved=%s",
                         tokenizer_id,
                         revision,
+                        snapshot_revision,
                     )
-                    fallback_options = dict(load_options)
-                    fallback_options.pop("use_fast", None)
-                    # Transformers 5 accepts a list here. Transformers 4 treats
-                    # this field as a mapping of named token attributes and calls
-                    # .keys(), so override only that incompatible metadata field.
-                    # The actual special-token IDs remain embedded in the official
-                    # tokenizer.json artifact.
-                    fallback_options["extra_special_tokens"] = {}
-                    tokenizer = PreTrainedTokenizerFast.from_pretrained(
-                        tokenizer_id, **fallback_options
+                except Exception:
+                    if snapshot_path is not None:
+                        LOGGER.warning(
+                            "Cached tokenizer snapshot is incomplete or unusable: "
+                            "%s requested=%s path=%s; refreshing bounded artifacts",
+                            tokenizer_id,
+                            revision,
+                            snapshot_path,
+                        )
+                    snapshot_path = self._download_snapshot(tokenizer_id, revision)
+                    snapshot_revision = self._snapshot_revision(
+                        snapshot_path, revision
                     )
-                resolved_revision = self._resolved_revision(
+                    tokenizer = self._load_local_tokenizer(
+                        tokenizer_id, revision, snapshot_path, use_fast
+                    )
+                resolved_revision = snapshot_revision or self._resolved_revision(
                     tokenizer, tokenizer_id, revision
                 )
                 target = self.resolved_directory / self._artifact_key(
@@ -353,6 +358,60 @@ class TokenizerCache:
                 self._entries[resolved_key] = resolution
             return resolution
 
+    def _download_snapshot(self, tokenizer_id: str, revision: str) -> Path:
+        proxy = (
+            {"http": self.proxy_url, "https": self.proxy_url}
+            if self.proxy_url
+            else None
+        )
+        return Path(
+            snapshot_download(
+                repo_id=tokenizer_id,
+                revision=revision,
+                cache_dir=str(self.download_directory),
+                local_files_only=self.local_files_only,
+                proxies=proxy,
+                allow_patterns=list(TOKENIZER_SNAPSHOT_ALLOW_PATTERNS),
+            )
+        )
+
+    def _load_local_tokenizer(
+        self,
+        tokenizer_id: str,
+        revision: str,
+        snapshot_path: Path,
+        use_fast: bool,
+    ) -> Any:
+        load_options: Dict[str, Any] = {
+            "use_fast": use_fast,
+            "trust_remote_code": False,
+            "local_files_only": True,
+        }
+        try:
+            return AutoTokenizer.from_pretrained(str(snapshot_path), **load_options)
+        except ValueError as exc:
+            if not use_fast or TOKENIZERS_BACKEND_CLASS_ERROR not in str(exc):
+                raise
+            # Transformers 5 renamed the generic tokenizer.json loader to
+            # TokenizersBackend. Older releases cannot resolve that class name from
+            # newer metadata, although they can load the same local tokenizer.json
+            # through PreTrainedTokenizerFast.
+            LOGGER.warning(
+                "Tokenizer %s@%s requires the Transformers 5 TokenizersBackend "
+                "class; using the compatible local fast tokenizer loader",
+                tokenizer_id,
+                revision,
+            )
+            fallback_options = dict(load_options)
+            fallback_options.pop("use_fast", None)
+            # Transformers 5 accepts a list here. Transformers 4 treats this field
+            # as a mapping and calls .keys(), so override only that incompatible
+            # metadata field. Special-token IDs remain in tokenizer.json.
+            fallback_options["extra_special_tokens"] = {}
+            return PreTrainedTokenizerFast.from_pretrained(
+                str(snapshot_path), **fallback_options
+            )
+
     def _resolved_revision(
         self,
         tokenizer: Any,
@@ -374,6 +433,12 @@ class TokenizerCache:
     def _cached_revision(
         self, tokenizer_id: str, requested_revision: str
     ) -> Optional[str]:
+        snapshot = self._cached_snapshot(tokenizer_id, requested_revision)
+        return snapshot[1] if snapshot else None
+
+    def _cached_snapshot(
+        self, tokenizer_id: str, requested_revision: str
+    ) -> Optional[Tuple[Path, str]]:
         for filename in (
             "tokenizer_config.json",
             "tokenizer.json",
@@ -394,17 +459,23 @@ class TokenizerCache:
                     exc_info=True,
                 )
                 continue
-            if not isinstance(cached_path, str):
+            if not isinstance(cached_path, str) or not Path(cached_path).is_file():
                 continue
-            parts = Path(cached_path).parts
-            try:
-                snapshot_index = parts.index("snapshots")
-                revision = parts[snapshot_index + 1]
-            except (ValueError, IndexError):
-                continue
+            snapshot_path = Path(cached_path).parent
+            revision = self._snapshot_revision(snapshot_path, requested_revision)
             if IMMUTABLE_HUGGINGFACE_REVISION.fullmatch(revision):
-                return revision
+                return snapshot_path, revision
         return None
+
+    @staticmethod
+    def _snapshot_revision(path: Path, requested_revision: str) -> str:
+        parts = path.parts
+        try:
+            snapshot_index = parts.index("snapshots")
+            revision = parts[snapshot_index + 1]
+        except (ValueError, IndexError):
+            return requested_revision
+        return revision
 
     @staticmethod
     def _artifact_key(tokenizer_id: str, revision: str, use_fast: bool) -> str:

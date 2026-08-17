@@ -321,22 +321,63 @@ def _planner_runtime(document: Any, detailed: bool) -> Dict[str, Any]:
 
 
 def _provider(source: Mapping[str, Any]) -> Dict[str, Any]:
-    return _pick(
-        source,
-        (
-            "id",
-            "llm_api",
-            "api_base",
-            "has_api_key",
-            "discovery",
-            "models_path",
-            "static_model_count",
+    raw_discovery = source.get("model_discovery")
+    if isinstance(raw_discovery, Mapping):
+        discovery = _pick(
+            raw_discovery,
+            ("mode", "path", "cache_ttl_seconds", "static_model_count"),
+        )
+    else:
+        discovery = {
+            "mode": source.get("discovery"),
+            "cache_ttl_seconds": source.get("model_cache_ttl_seconds"),
+            "static_model_count": source.get("static_model_count"),
+        }
+        if source.get("models_path") is not None:
+            discovery["path"] = source.get("models_path")
+    typical_models = source.get("typical_models", [])
+    if not isinstance(typical_models, list) or not all(
+        isinstance(model, str) for model in typical_models
+    ):
+        raise ClientError("provider profile typical_models must be a string array")
+    return {
+        "id": source.get("id"),
+        "adapter": source.get("adapter", source.get("llm_api")),
+        "base_url": source.get("base_url", source.get("api_base")),
+        "api_key_configured": source.get(
+            "api_key_configured", source.get("has_api_key")
         ),
-    )
+        "typical_models": list(typical_models[:3]),
+        "model_discovery": discovery,
+    }
 
 
 def _provider_list(document: Any, detailed: bool) -> Dict[str, Any]:
-    return _items(document, "provider.list", _provider)
+    source = _object(document, "provider.list")
+    result = _items(source, "provider.list", _provider)
+    result.update(_pick(source, ("generation", "loaded_at")))
+    return result
+
+
+def _provider_reload(document: Any, detailed: bool) -> Dict[str, Any]:
+    source = _object(document, "provider.reload")
+    result = _provider_list(source, detailed)
+    result["reloaded"] = bool(source.get("reloaded"))
+    raw_changes = source.get("changes")
+    if not isinstance(raw_changes, Mapping):
+        raise ClientError("provider.reload response must contain a changes object")
+    changes: Dict[str, Any] = {}
+    for field in ("added", "updated", "removed"):
+        values = raw_changes.get(field)
+        if not isinstance(values, list) or not all(
+            isinstance(value, str) for value in values
+        ):
+            raise ClientError(
+                f"provider.reload changes.{field} must be a string array"
+            )
+        changes[field] = list(values)
+    result["changes"] = changes
+    return result
 
 
 def _provider_models(document: Any, detailed: bool) -> Dict[str, Any]:
@@ -453,6 +494,7 @@ _ADAPTERS: Dict[str, Projector] = {
     "planner.resume": _plan_one,
     "planner.cancel": _plan_one,
     "provider.list": _provider_list,
+    "provider.reload": _provider_reload,
     "provider.models": _provider_models,
     "auth.list": _auth_list,
     "auth.add": _auth_one,
@@ -502,6 +544,12 @@ def _renderer(route: str, arguments: Any) -> str:
         return "runner_summary"
     if route == "runner.logs":
         return "runner_logs"
+    if route == "provider.list" and not getattr(arguments, "json", False):
+        return "provider_table"
+    if route == "provider.models" and not getattr(arguments, "json", False):
+        return "provider_models"
+    if route == "provider.reload" and not getattr(arguments, "json", False):
+        return "provider_reload"
     if route in {
         "campaign.start",
         "campaign.cancel",

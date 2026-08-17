@@ -11,6 +11,8 @@ from llmperf import common_metrics
 from llmperf.models import RequestConfig
 from llmperf.ray_clients.openai_chat_completions_client import (
     OpenAIStreamError,
+    SSE_ITER_CHUNK_SIZE,
+    StreamInactivityTimeout,
     cache_metrics_from_usage,
     decode_sse_line,
 )
@@ -493,6 +495,110 @@ def test_client_observability(monkeypatch):
         metrics[common_metrics.STREAM_TIMING_SEMANTICS]["legacy_inter_token_latency"]
         == "deprecated_inter_chunk_average"
     )
+
+
+def test_client_inactivity(monkeypatch):
+    closed = False
+    observed_chunk_size = None
+
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+            return False
+
+        def close(self):
+            nonlocal closed
+            closed = True
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, chunk_size=None):
+            nonlocal observed_chunk_size
+            observed_chunk_size = chunk_size
+            while not closed:
+                time.sleep(0.005)
+                yield b": keepalive"
+
+    monkeypatch.setenv("OPENAI_API_BASE", "https://provider.invalid/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    monkeypatch.setattr(
+        "llmperf.ray_clients.openai_chat_completions_client.requests.post",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+    from llmperf.ray_clients.openai_chat_completions_client import (
+        OpenAIChatCompletionsClient,
+    )
+
+    started = time.monotonic()
+    metrics, text, _ = OpenAIChatCompletionsClient().llm_request(
+        RequestConfig(
+            model="model",
+            prompt=("prompt", 1),
+            timeout_seconds=0.03,
+        )
+    )
+
+    assert time.monotonic() - started < 0.5
+    assert closed is True
+    assert observed_chunk_size == SSE_ITER_CHUNK_SIZE
+    assert text == ""
+    assert metrics[common_metrics.ERROR_CODE] == -1
+    assert StreamInactivityTimeout.__name__ in metrics[common_metrics.ERROR_MSG]
+
+
+def test_client_progress(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def close(self):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, chunk_size=None):
+            for text in ("one", " two", " three"):
+                time.sleep(0.02)
+                yield _event({"choices": [{"delta": {"content": text}}]})
+            yield b"data: [DONE]"
+
+    monkeypatch.setenv("OPENAI_API_BASE", "https://provider.invalid/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    monkeypatch.setattr(
+        "llmperf.ray_clients.openai_chat_completions_client.requests.post",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+    from llmperf.ray_clients.openai_chat_completions_client import (
+        OpenAIChatCompletionsClient,
+    )
+
+    started = time.monotonic()
+    metrics, text, _ = OpenAIChatCompletionsClient().llm_request(
+        RequestConfig(
+            model="model",
+            prompt=("prompt", 1),
+            timeout_seconds=0.03,
+        )
+    )
+
+    assert time.monotonic() - started > 0.05
+    assert text == "one two three"
+    assert metrics[common_metrics.ERROR_CODE] is None
+    assert metrics[common_metrics.REQUEST_TIMING]["last_text_monotonic"] is not None
 
 
 def test_probe_execution_order(monkeypatch):

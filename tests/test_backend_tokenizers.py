@@ -2,9 +2,16 @@ import asyncio
 from pathlib import Path
 from unittest.mock import Mock
 
-from llmperf_backend.tokenizers import TokenizerCache, TokenizerResolution
+from llmperf_backend.tokenizers import (
+    TOKENIZER_SNAPSHOT_ALLOW_PATTERNS,
+    TokenizerCache,
+    TokenizerResolution,
+)
 from llmperf_backend.tokenizers import TokenizerResolutionError
 import pytest
+
+
+SNAPSHOT_COMMIT = "d" * 40
 
 
 class FakeTokenizer:
@@ -12,6 +19,26 @@ class FakeTokenizer:
 
     def save_pretrained(self, directory):
         Path(directory, "tokenizer.json").write_text("{}", encoding="utf-8")
+
+
+def _snapshot(tmp_path, commit=SNAPSHOT_COMMIT):
+    path = tmp_path / "downloads" / "models--test" / "snapshots" / commit
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+    return path
+
+
+def _mock_download(tmp_path, monkeypatch, commit=SNAPSHOT_COMMIT):
+    snapshot = _snapshot(tmp_path, commit)
+    downloader = Mock(return_value=str(snapshot))
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.snapshot_download", downloader
+    )
+    return snapshot, downloader
 
 
 def test_immutable_revision(tmp_path):
@@ -80,6 +107,7 @@ def test_legacy_artifact(tmp_path, monkeypatch):
 
 
 def test_cache(tmp_path, monkeypatch):
+    snapshot, downloader = _mock_download(tmp_path, monkeypatch)
     loader = Mock(return_value=FakeTokenizer())
     monkeypatch.setattr(
         "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
@@ -97,23 +125,30 @@ def test_cache(tmp_path, monkeypatch):
     first = cache._resolve_sync("organization/model-tokenizer", "release", True)
     second = cache._resolve_sync(first.tokenizer_id, first.revision, first.use_fast)
 
-    assert first.revision == "resolved-commit"
+    assert first.revision == SNAPSHOT_COMMIT
     assert first.cached is False
     assert first.path.is_dir()
     assert (first.path / "tokenizer.json").is_file()
     assert second.path == first.path
     assert second.cached is True
     loader.assert_called_once_with(
-        "organization/model-tokenizer",
-        revision="release",
+        str(snapshot),
         use_fast=True,
         trust_remote_code=False,
+        local_files_only=True,
+    )
+    downloader.assert_called_once_with(
+        repo_id="organization/model-tokenizer",
+        revision="release",
         cache_dir=str(tmp_path / "downloads"),
         local_files_only=False,
+        proxies=None,
+        allow_patterns=list(TOKENIZER_SNAPSHOT_ALLOW_PATTERNS),
     )
 
 
 def test_offline(tmp_path, monkeypatch):
+    _, downloader = _mock_download(tmp_path, monkeypatch)
     loader = Mock(return_value=FakeTokenizer())
     monkeypatch.setattr(
         "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
@@ -124,9 +159,11 @@ def test_offline(tmp_path, monkeypatch):
 
     assert loader.call_args.kwargs["local_files_only"] is True
     assert loader.call_args.kwargs["use_fast"] is False
+    assert downloader.call_args.kwargs["local_files_only"] is True
 
 
 def test_backend_compatibility(tmp_path, monkeypatch):
+    snapshot, _ = _mock_download(tmp_path, monkeypatch)
     auto_loader = Mock(
         side_effect=ValueError(
             "Tokenizer class TokenizersBackend does not exist or is not currently "
@@ -147,19 +184,18 @@ def test_backend_compatibility(tmp_path, monkeypatch):
 
     result = cache._resolve_sync("zai-org/GLM-5.2", "main", True)
 
-    assert result.revision == "resolved-commit"
+    assert result.revision == SNAPSHOT_COMMIT
     assert (result.path / "tokenizer.json").is_file()
     fast_loader.assert_called_once_with(
-        "zai-org/GLM-5.2",
-        revision="main",
+        str(snapshot),
         trust_remote_code=False,
-        cache_dir=str(tmp_path / "downloads"),
-        local_files_only=False,
+        local_files_only=True,
         extra_special_tokens={},
     )
 
 
 def test_proxy(tmp_path, monkeypatch):
+    _, downloader = _mock_download(tmp_path, monkeypatch)
     loader = Mock(return_value=FakeTokenizer())
     monkeypatch.setattr(
         "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
@@ -172,10 +208,66 @@ def test_proxy(tmp_path, monkeypatch):
 
     cache._resolve_sync("organization/tokenizer", "main", True)
 
-    assert loader.call_args.kwargs["proxies"] == {
+    assert downloader.call_args.kwargs["proxies"] == {
         "http": "http://proxy.internal:3128",
         "https": "http://proxy.internal:3128",
     }
+    assert "proxies" not in loader.call_args.kwargs
+
+
+def test_snapshot_local(tmp_path, monkeypatch):
+    snapshot = _snapshot(tmp_path)
+    downloader = Mock(side_effect=AssertionError("unexpected Hub download"))
+    loader = Mock(return_value=FakeTokenizer())
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        lambda *args, **kwargs: str(snapshot / "tokenizer_config.json"),
+    )
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.snapshot_download", downloader
+    )
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+    )
+    cache = TokenizerCache(
+        cache_directory=tmp_path, local_files_only=False, proxy_url=""
+    )
+
+    result = cache._resolve_sync("XiaomiMiMo/MiMo-V2.5", "main", True)
+
+    assert result.revision == SNAPSHOT_COMMIT
+    loader.assert_called_once_with(
+        str(snapshot),
+        use_fast=True,
+        trust_remote_code=False,
+        local_files_only=True,
+    )
+    downloader.assert_not_called()
+
+
+def test_snapshot_refresh(tmp_path, monkeypatch):
+    snapshot = _snapshot(tmp_path)
+    loader = Mock(side_effect=[OSError("missing merges"), FakeTokenizer()])
+    downloader = Mock(return_value=str(snapshot))
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        lambda *args, **kwargs: str(snapshot / "tokenizer_config.json"),
+    )
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.snapshot_download", downloader
+    )
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+    )
+    cache = TokenizerCache(
+        cache_directory=tmp_path, local_files_only=False, proxy_url=""
+    )
+
+    result = cache._resolve_sync("organization/tokenizer", "main", True)
+
+    assert result.revision == SNAPSHOT_COMMIT
+    assert loader.call_count == 2
+    downloader.assert_called_once()
 
 
 def test_shared_proxy_env(tmp_path, monkeypatch):

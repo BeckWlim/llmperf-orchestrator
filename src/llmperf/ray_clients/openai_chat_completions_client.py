@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -16,6 +17,16 @@ class OpenAIStreamError(RuntimeError):
     def __init__(self, message: str, code: Any = -1):
         super().__init__(message)
         self.code = code
+
+
+class StreamInactivityTimeout(TimeoutError):
+    """Raised when a stream produces no text for the configured interval."""
+
+
+# ``requests`` may wait for the requested byte count on non-chunked responses.
+# One-byte reads ensure a complete SSE line is yielded as soon as its newline arrives,
+# so the text-progress timer is based on application data rather than buffer filling.
+SSE_ITER_CHUNK_SIZE = 1
 
 
 def decode_sse_line(chunk: bytes) -> Dict[str, Any]:
@@ -158,23 +169,66 @@ class OpenAIChatCompletionsClient(LLMClient):
         if not address.endswith("/"):
             address = address + "/"
         address += "chat/completions"
-        request_timeout = request_config.timeout_seconds or 180
+        stream_idle_timeout = float(request_config.timeout_seconds or 180)
+        transport_read_timeout = stream_idle_timeout + max(
+            1.0, stream_idle_timeout * 0.1
+        )
+        inactivity_expired = threading.Event()
+        request_finished = threading.Event()
+        progress_changed = threading.Event()
+        progress_lock = threading.Lock()
+        last_progress_time = [start_time]
+        response_holder = [None]
+
+        def watch_stream_progress() -> None:
+            while not request_finished.is_set():
+                progress_changed.clear()
+                with progress_lock:
+                    remaining = stream_idle_timeout - (
+                        time.monotonic() - last_progress_time[0]
+                    )
+                if remaining <= 0:
+                    inactivity_expired.set()
+                    with progress_lock:
+                        response = response_holder[0]
+                    if response is not None:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+                    return
+                progress_changed.wait(remaining)
+
+        progress_watcher = threading.Thread(target=watch_stream_progress, daemon=True)
+        progress_watcher.start()
         try:
             with requests.post(
                 address,
                 json=body,
                 stream=True,
-                timeout=request_timeout,
+                timeout=(stream_idle_timeout, transport_read_timeout),
                 headers=headers,
             ) as response:
+                with progress_lock:
+                    response_holder[0] = response
+                if inactivity_expired.is_set():
+                    raise StreamInactivityTimeout(
+                        "stream produced no text for "
+                        f"{stream_idle_timeout:g} seconds"
+                    )
                 response_headers_time = time.monotonic()
                 response_headers = _safe_response_headers(response.headers)
                 if response.status_code != 200:
                     error_msg = response.text
                     error_response_code = response.status_code
                     response.raise_for_status()
-                for chunk in response.iter_lines(chunk_size=None):
+                for chunk in response.iter_lines(chunk_size=SSE_ITER_CHUNK_SIZE):
                     received_at = time.monotonic()
+                    if inactivity_expired.is_set():
+                        raise StreamInactivityTimeout(
+                            "stream produced no text for "
+                            f"{stream_idle_timeout:g} seconds"
+                        )
                     if chunk and first_sse_time is None:
                         first_sse_time = received_at
                     event = decode_sse_line(chunk)
@@ -187,6 +241,9 @@ class OpenAIChatCompletionsClient(LLMClient):
                         break
                     text = event["text"]
                     tokens_received += 1
+                    with progress_lock:
+                        last_progress_time[0] = received_at
+                    progress_changed.set()
                     if first_text_time is None:
                         first_text_time = received_at
                         ttft = first_text_time - start_time
@@ -194,6 +251,12 @@ class OpenAIChatCompletionsClient(LLMClient):
                         inter_chunk_latencies.append(received_at - last_text_time)
                     last_text_time = received_at
                     generated_text += text
+
+            if inactivity_expired.is_set():
+                raise StreamInactivityTimeout(
+                    "stream produced no text for "
+                    f"{stream_idle_timeout:g} seconds"
+                )
 
             if not generated_text:
                 raise ValueError("Stream completed without text content")
@@ -207,6 +270,13 @@ class OpenAIChatCompletionsClient(LLMClient):
             print(f"Warning Or Error: {exc}")
             print(error_response_code)
         except Exception as exc:
+            if inactivity_expired.is_set() and not isinstance(
+                exc, StreamInactivityTimeout
+            ):
+                exc = StreamInactivityTimeout(
+                    "stream produced no text for "
+                    f"{stream_idle_timeout:g} seconds"
+                )
             if not error_msg:
                 error_msg = f"{type(exc).__name__}: {exc}"
             metrics[common_metrics.ERROR_MSG] = error_msg
@@ -214,6 +284,11 @@ class OpenAIChatCompletionsClient(LLMClient):
             print(f"Warning Or Error: {error_msg}")
             print(error_response_code)
         finally:
+            request_finished.set()
+            progress_changed.set()
+            with progress_lock:
+                response_holder[0] = None
+            progress_watcher.join(timeout=0.1)
             completion_time = time.monotonic()
             completed_utc = datetime.now(timezone.utc).isoformat()
             total_request_time = completion_time - start_time
@@ -248,6 +323,7 @@ class OpenAIChatCompletionsClient(LLMClient):
             "response_headers_monotonic": response_headers_time,
             "first_sse_monotonic": first_sse_time,
             "first_text_monotonic": first_text_time,
+            "last_text_monotonic": last_text_time,
             "completed_monotonic": completion_time,
             "client_start_utc": start_utc,
             "completed_utc": completed_utc,
@@ -256,6 +332,7 @@ class OpenAIChatCompletionsClient(LLMClient):
             "legacy_inter_token_latency": "deprecated_inter_chunk_average",
             "inter_sse_chunk_latency": "time_between_text-bearing_sse_events",
             "ttft_in_decode_intervals": False,
+            "timeout": "maximum_seconds_without_text-bearing_sse_event",
         }
         if usage:
             normalized_usage = normalize_usage(usage)
