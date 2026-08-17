@@ -281,6 +281,12 @@ class TokenizerCache:
                 snapshot_revision = cached_snapshot[1] if cached_snapshot else None
                 try:
                     if snapshot_path is None:
+                        if self.local_files_only:
+                            raise TokenizerResolutionError(
+                                f"Tokenizer {tokenizer_id!r} at revision "
+                                f"{revision!r} is not present in local cache "
+                                f"{self.cache_directory}"
+                            )
                         raise FileNotFoundError("no cached tokenizer snapshot")
                     tokenizer = self._load_local_tokenizer(
                         tokenizer_id, revision, snapshot_path, use_fast
@@ -291,7 +297,15 @@ class TokenizerCache:
                         revision,
                         snapshot_revision,
                     )
-                except Exception:
+                except TokenizerResolutionError:
+                    raise
+                except Exception as cached_exc:
+                    if self.local_files_only:
+                        raise TokenizerResolutionError(
+                            f"Cached tokenizer {tokenizer_id!r} at revision "
+                            f"{revision!r} is unusable at {snapshot_path}: "
+                            f"{cached_exc}"
+                        ) from cached_exc
                     if snapshot_path is not None:
                         LOGGER.warning(
                             "Cached tokenizer snapshot is incomplete or unusable: "

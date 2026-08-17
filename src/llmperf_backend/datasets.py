@@ -21,6 +21,7 @@ from llmperf_backend.huggingface import (
 
 
 DATASET_CACHE_DIRECTORY = "LLMPERF_DATASET_CACHE"
+DATASET_OFFLINE = "LLMPERF_DATASET_OFFLINE"
 WORKER_DATASET_PATH = "LLMPERF_DATASET_PATH"
 DEFAULT_DATASET_CACHE_DIRECTORY = Path("~/.cache/llmperf/datasets")
 LOGGER = logging.getLogger(__name__)
@@ -28,6 +29,20 @@ LOGGER = logging.getLogger(__name__)
 
 class DatasetResolutionError(RuntimeError):
     """Raised when a submitted dataset cannot be resolved by the backend."""
+
+
+def _environment_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise DatasetResolutionError(
+        f"{name} must be one of true/false, yes/no, on/off, or 1/0"
+    )
 
 
 @dataclass(frozen=True)
@@ -56,6 +71,7 @@ class DatasetCache:
     def __init__(
         self,
         cache_directory: Optional[Path] = None,
+        local_files_only: Optional[bool] = None,
         proxy_url: Optional[str] = None,
     ):
         configured_directory = os.environ.get(DATASET_CACHE_DIRECTORY)
@@ -65,6 +81,11 @@ class DatasetCache:
             else cache_directory or DEFAULT_DATASET_CACHE_DIRECTORY
         )
         self.cache_directory = selected_directory.expanduser().resolve()
+        self.local_files_only = (
+            _environment_flag(DATASET_OFFLINE)
+            if local_files_only is None
+            else local_files_only
+        )
         try:
             self.proxy_url = resolve_huggingface_proxy(proxy_url)
         except HuggingFaceProxyError as exc:
@@ -73,8 +94,9 @@ class DatasetCache:
         self._entries: Dict[Tuple[str, str, str, str], DatasetResolution] = {}
         self._lock = threading.RLock()
         LOGGER.info(
-            "Dataset cache ready: directory=%s proxy=%s",
+            "Dataset cache ready: directory=%s offline=%s proxy=%s",
             self.cache_directory,
+            self.local_files_only,
             huggingface_proxy_label(self.proxy_url),
         )
 
@@ -128,6 +150,34 @@ class DatasetCache:
             revision=revision,
             repo_type="dataset",
         )
+        if isinstance(cached_path, str) and Path(cached_path).is_file():
+            resolved_path = Path(cached_path).resolve()
+            resolution = DatasetResolution(
+                source="huggingface",
+                dataset_id=dataset_id,
+                filename=filename,
+                revision=self._resolved_revision(resolved_path, revision),
+                format=dataset_format,
+                path=resolved_path,
+                cached=True,
+            )
+            self._remember(key, resolution)
+            LOGGER.info(
+                "Dataset artifact-cache hit: %s file=%s requested=%s resolved=%s",
+                dataset_id,
+                filename,
+                revision,
+                resolution.revision,
+            )
+            return resolution
+
+        if self.local_files_only:
+            raise DatasetResolutionError(
+                f"Dataset {dataset_id!r}, file {filename!r}, at revision "
+                f"{revision!r} is not present in local cache "
+                f"{self.cache_directory}"
+            )
+
         try:
             resolved_path = Path(
                 hf_hub_download(
@@ -144,11 +194,12 @@ class DatasetCache:
                 )
             ).resolve()
         except Exception as exc:
+            mode = "local cache" if self.local_files_only else "Hugging Face"
             raise DatasetResolutionError(
                 f"Unable to resolve dataset {dataset_id!r}, file {filename!r}, "
-                f"at revision {revision!r}: {exc}. Check Hugging Face network "
-                f"settings, {HUGGINGFACE_PROXY}, or preload "
-                f"{self.cache_directory}."
+                f"at revision {revision!r} from {mode}: {exc}. Check Hugging Face "
+                f"network settings, {HUGGINGFACE_PROXY}, or preload "
+                f"{self.cache_directory} and enable {DATASET_OFFLINE}."
             ) from exc
 
         resolution = DatasetResolution(
@@ -158,14 +209,26 @@ class DatasetCache:
             revision=self._resolved_revision(resolved_path, revision),
             format=dataset_format,
             path=resolved_path,
-            cached=isinstance(cached_path, str),
+            cached=False,
         )
+        self._remember(key, resolution)
+        return resolution
+
+    def _remember(
+        self,
+        key: Tuple[str, str, str, str],
+        resolution: DatasetResolution,
+    ) -> None:
         with self._lock:
             self._entries[key] = resolution
             self._entries[
-                (dataset_id, filename, resolution.revision, dataset_format)
+                (
+                    resolution.dataset_id,
+                    resolution.filename,
+                    resolution.revision,
+                    resolution.format,
+                )
             ] = resolution
-        return resolution
 
     @staticmethod
     def _validate_filename(filename: str) -> str:

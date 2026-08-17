@@ -335,6 +335,14 @@ tokenizer。远程 tokenizer code 固定为不信任，避免 operator 提交 YA
 Worker 中执行仓库代码。多个并发请求在进程内按 tokenizer key 合并查找，磁盘 artifact
 通过临时目录原子发布。
 
+dataset 缓存目录默认为 `~/.cache/llmperf/datasets`，可以通过
+`LLMPERF_DATASET_CACHE` 修改。解析优先直接返回本地 Hugging Face artifact，不为已缓存
+文件执行联网 revision 校验；设置 `LLMPERF_DATASET_OFFLINE=true` 后，缓存缺失也不会
+调用 Hub download API 或访问网络，而是立即拒绝提交。Tokenizer offline 使用相同语义：
+`revision` 只作为本地缓存选择键，不进行远端版本校验；本地 artifact/snapshot 未命中或
+不可加载时立即失败。两者的 offline 策略均由 Backend operator 配置，Runner YAML 不能
+改变服务端联网边界。
+
 受限网络环境可以设置 `LLMPERF_HUGGINGFACE_PROXY=http://proxy:port`。backend 将该共享
 代理显式传给 tokenizer 和 dataset 的 Hugging Face HTTP/HTTPS 请求，因此不依赖桌面或
 systemd service 是否继承系统代理设置；进程级 `HTTP_PROXY`、`HTTPS_PROXY` 和
@@ -427,6 +435,7 @@ llmperfctl provider reload
 llmperf-backend config set LLMPERF_SERVER_HOST 0.0.0.0
 llmperf-backend config set DATABASE_URL postgresql+asyncpg:///llmperf
 llmperf-backend config set LLMPERF_DATASET_CACHE /var/cache/llmperf/datasets
+llmperf-backend config set LLMPERF_DATASET_OFFLINE true
 printf '%s' "$ALIYUN_API_KEY" | \
   llmperf-backend config set LLMPERF_PROVIDER_ALIYUN_KEY --stdin
 llmperf-backend

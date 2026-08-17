@@ -148,18 +148,53 @@ def test_cache(tmp_path, monkeypatch):
 
 
 def test_offline(tmp_path, monkeypatch):
-    _, downloader = _mock_download(tmp_path, monkeypatch)
-    loader = Mock(return_value=FakeTokenizer())
+    downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.snapshot_download", downloader
+    )
+    loader = Mock(side_effect=AssertionError("unexpected tokenizer load"))
     monkeypatch.setattr(
         "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
     )
     cache = TokenizerCache(cache_directory=tmp_path, local_files_only=True)
 
-    cache._resolve_sync("cached/tokenizer", "main", False)
+    with pytest.raises(TokenizerResolutionError, match="not present in local cache"):
+        cache._resolve_sync("cached/tokenizer", "main", False)
 
-    assert loader.call_args.kwargs["local_files_only"] is True
-    assert loader.call_args.kwargs["use_fast"] is False
-    assert downloader.call_args.kwargs["local_files_only"] is True
+    loader.assert_not_called()
+    downloader.assert_not_called()
+
+
+def test_offline_hit(tmp_path, monkeypatch):
+    snapshot = _snapshot(tmp_path)
+    downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
+    loader = Mock(return_value=FakeTokenizer())
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        lambda *args, **kwargs: str(snapshot / "tokenizer_config.json"),
+    )
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.snapshot_download", downloader
+    )
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+    )
+    cache = TokenizerCache(cache_directory=tmp_path, local_files_only=True)
+
+    result = cache._resolve_sync("cached/tokenizer", "main", False)
+
+    assert result.revision == SNAPSHOT_COMMIT
+    loader.assert_called_once_with(
+        str(snapshot),
+        use_fast=False,
+        trust_remote_code=False,
+        local_files_only=True,
+    )
+    downloader.assert_not_called()
 
 
 def test_backend_compatibility(tmp_path, monkeypatch):
