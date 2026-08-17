@@ -132,6 +132,41 @@ def test_offline_miss(tmp_path, monkeypatch):
     downloader.assert_not_called()
 
 
+def test_offline_fallback(tmp_path, monkeypatch):
+    artifact = (
+        tmp_path
+        / "datasets--organization--sharegpt"
+        / "snapshots"
+        / "cached-commit"
+        / "data"
+        / "sharegpt.json"
+    )
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("[]", encoding="utf-8")
+    downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
+    monkeypatch.setattr(
+        "llmperf_backend.datasets.try_to_load_from_cache", Mock(return_value=None)
+    )
+    monkeypatch.setattr("llmperf_backend.datasets.hf_hub_download", downloader)
+    cache = DatasetCache(
+        cache_directory=tmp_path,
+        local_files_only=True,
+        proxy_url="",
+    )
+
+    result = cache._resolve_sync(
+        DATASET_SPEC["id"],
+        DATASET_SPEC["filename"],
+        DATASET_SPEC["revision"],
+        DATASET_SPEC["format"],
+    )
+
+    assert result.cached is True
+    assert result.revision == "cached-commit"
+    assert result.path == artifact
+    downloader.assert_not_called()
+
+
 def test_offline_flag(tmp_path, monkeypatch):
     monkeypatch.setenv("LLMPERF_DATASET_OFFLINE", "true")
     assert DatasetCache(cache_directory=tmp_path).local_files_only is True

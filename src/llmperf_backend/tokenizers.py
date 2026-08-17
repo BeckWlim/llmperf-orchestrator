@@ -225,6 +225,7 @@ class TokenizerCache:
                         path=cached.path,
                         cached=True,
                     )
+            cached_snapshot: Optional[Tuple[Path, str]] = None
             resolved_revision = self._resolved_revision(None, tokenizer_id, revision)
             existing_target = self.resolved_directory / self._artifact_key(
                 tokenizer_id, resolved_revision, use_fast
@@ -240,6 +241,17 @@ class TokenizerCache:
                     if legacy_target.is_dir():
                         existing_target = legacy_target
                         break
+            if not existing_target.is_dir() and self.local_files_only:
+                cached_snapshot = self._cached_snapshot(tokenizer_id, revision)
+                if cached_snapshot is None:
+                    cached_snapshot = self._offline_snapshot(
+                        tokenizer_id, revision, use_fast
+                    )
+                if cached_snapshot is not None:
+                    resolved_revision = cached_snapshot[1]
+                    existing_target = self.resolved_directory / self._artifact_key(
+                        tokenizer_id, resolved_revision, use_fast
+                    )
             if existing_target.is_dir():
                 LOGGER.info(
                     "Tokenizer artifact-cache hit: %s requested=%s resolved=%s "
@@ -276,7 +288,12 @@ class TokenizerCache:
                     self.local_files_only,
                     huggingface_proxy_label(self.proxy_url),
                 )
-                cached_snapshot = self._cached_snapshot(tokenizer_id, revision)
+                if cached_snapshot is None:
+                    cached_snapshot = self._cached_snapshot(tokenizer_id, revision)
+                if cached_snapshot is None and self.local_files_only:
+                    cached_snapshot = self._offline_snapshot(
+                        tokenizer_id, revision, use_fast
+                    )
                 snapshot_path = cached_snapshot[0] if cached_snapshot else None
                 snapshot_revision = cached_snapshot[1] if cached_snapshot else None
                 try:
@@ -480,6 +497,70 @@ class TokenizerCache:
             if IMMUTABLE_HUGGINGFACE_REVISION.fullmatch(revision):
                 return snapshot_path, revision
         return None
+
+    def _offline_snapshot(
+        self,
+        tokenizer_id: str,
+        requested_revision: str,
+        use_fast: bool,
+    ) -> Optional[Tuple[Path, str]]:
+        """Select an unambiguous local snapshot without consulting Hub metadata."""
+
+        repository = self.download_directory / (
+            "models--" + tokenizer_id.replace("/", "--")
+        )
+        snapshots = repository / "snapshots"
+        if not snapshots.is_dir():
+            return None
+        candidates = []
+        for path in sorted(snapshots.iterdir()):
+            revision = path.name
+            if not path.is_dir() or not IMMUTABLE_HUGGINGFACE_REVISION.fullmatch(
+                revision
+            ):
+                continue
+            if not any(
+                (path / filename).is_file()
+                for filename in (
+                    "tokenizer_config.json",
+                    "tokenizer.json",
+                    "tokenizer.model",
+                )
+            ):
+                continue
+            candidates.append((path, revision))
+        if not candidates:
+            return None
+
+        exact = [item for item in candidates if item[1] == requested_revision]
+        if len(exact) == 1:
+            return exact[0]
+        resolved = [
+            item
+            for item in candidates
+            if (
+                self.resolved_directory
+                / self._artifact_key(tokenizer_id, item[1], use_fast)
+            ).is_dir()
+        ]
+        selectable = resolved or candidates
+        if len(selectable) == 1:
+            selected = selectable[0]
+            LOGGER.info(
+                "Tokenizer offline direct-cache fallback: %s requested=%s "
+                "resolved=%s path=%s",
+                tokenizer_id,
+                requested_revision,
+                selected[1],
+                selected[0],
+            )
+            return selected
+        revisions = ", ".join(item[1] for item in selectable)
+        raise TokenizerResolutionError(
+            f"Tokenizer {tokenizer_id!r} revision {requested_revision!r} has no "
+            f"exact local cache reference and multiple usable local snapshots "
+            f"exist: {revisions}"
+        )
 
     @staticmethod
     def _snapshot_revision(path: Path, requested_revision: str) -> str:

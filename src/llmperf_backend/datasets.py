@@ -143,15 +143,22 @@ class DatasetCache:
             if existing is not None and existing.path.is_file():
                 return DatasetResolution(**{**existing.__dict__, "cached": True})
 
-        cached_path = try_to_load_from_cache(
+        raw_cached_path = try_to_load_from_cache(
             dataset_id,
             filename,
             cache_dir=self.cache_directory,
             revision=revision,
             repo_type="dataset",
         )
-        if isinstance(cached_path, str) and Path(cached_path).is_file():
-            resolved_path = Path(cached_path).resolve()
+        cached_path = (
+            Path(raw_cached_path)
+            if isinstance(raw_cached_path, str) and Path(raw_cached_path).is_file()
+            else None
+        )
+        if cached_path is None and self.local_files_only:
+            cached_path = self._offline_artifact(dataset_id, filename, revision)
+        if cached_path is not None:
+            resolved_path = cached_path.resolve()
             resolution = DatasetResolution(
                 source="huggingface",
                 dataset_id=dataset_id,
@@ -213,6 +220,52 @@ class DatasetCache:
         )
         self._remember(key, resolution)
         return resolution
+
+    def _offline_artifact(
+        self,
+        dataset_id: str,
+        filename: str,
+        requested_revision: str,
+    ) -> Optional[Path]:
+        """Select one local dataset artifact without consulting Hub metadata."""
+
+        repository = self.cache_directory / (
+            "datasets--" + dataset_id.replace("/", "--")
+        )
+        snapshots = repository / "snapshots"
+        if not snapshots.is_dir():
+            return None
+        candidates = []
+        relative_path = PurePosixPath(filename)
+        for snapshot in sorted(snapshots.iterdir()):
+            if not snapshot.is_dir():
+                continue
+            artifact = snapshot.joinpath(*relative_path.parts)
+            if artifact.is_file():
+                candidates.append((artifact, snapshot.name))
+        exact = [item for item in candidates if item[1] == requested_revision]
+        if len(exact) == 1:
+            return exact[0][0]
+        if len(candidates) == 1:
+            selected = candidates[0]
+            LOGGER.info(
+                "Dataset offline direct-cache fallback: %s file=%s requested=%s "
+                "resolved=%s path=%s",
+                dataset_id,
+                filename,
+                requested_revision,
+                selected[1],
+                selected[0],
+            )
+            return selected[0]
+        if len(candidates) > 1:
+            revisions = ", ".join(item[1] for item in candidates)
+            raise DatasetResolutionError(
+                f"Dataset {dataset_id!r}, file {filename!r}, revision "
+                f"{requested_revision!r} has no exact local cache reference and "
+                f"multiple usable local snapshots exist: {revisions}"
+            )
+        return None
 
     def _remember(
         self,

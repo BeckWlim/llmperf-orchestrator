@@ -197,6 +197,60 @@ def test_offline_hit(tmp_path, monkeypatch):
     downloader.assert_not_called()
 
 
+def test_offline_fallback(tmp_path, monkeypatch):
+    snapshot = (
+        tmp_path
+        / "downloads"
+        / "models--cached--tokenizer"
+        / "snapshots"
+        / SNAPSHOT_COMMIT
+    )
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+    downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
+    loader = Mock(side_effect=AssertionError("unexpected tokenizer load"))
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.snapshot_download", downloader
+    )
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+    )
+    cache = TokenizerCache(cache_directory=tmp_path, local_files_only=True)
+    target = cache.resolved_directory / cache._artifact_key(
+        "cached/tokenizer", SNAPSHOT_COMMIT, True
+    )
+    target.mkdir(parents=True)
+    (target / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    result = cache._resolve_sync("cached/tokenizer", "main", True)
+
+    assert result.cached is True
+    assert result.revision == SNAPSHOT_COMMIT
+    assert result.path == target
+    loader.assert_not_called()
+    downloader.assert_not_called()
+
+
+def test_offline_ambiguity(tmp_path, monkeypatch):
+    repository = tmp_path / "downloads" / "models--cached--tokenizer" / "snapshots"
+    for revision in ("a" * 40, "b" * 40):
+        snapshot = repository / revision
+        snapshot.mkdir(parents=True)
+        (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        lambda *args, **kwargs: None,
+    )
+    cache = TokenizerCache(cache_directory=tmp_path, local_files_only=True)
+
+    with pytest.raises(TokenizerResolutionError, match="multiple usable local"):
+        cache._resolve_sync("cached/tokenizer", "main", True)
+
+
 def test_backend_compatibility(tmp_path, monkeypatch):
     snapshot, _ = _mock_download(tmp_path, monkeypatch)
     auto_loader = Mock(
