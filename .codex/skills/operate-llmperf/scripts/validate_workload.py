@@ -79,15 +79,15 @@ def validate_document(
         runner = item.pop("runner")
         item.pop("name", None)
         plans.append({"plan": item, "runner_template": runner})
-    protocols = []
-    for definition in campaign.protocol_definitions:
+    tasks = []
+    for definition in campaign.task_definitions:
         item = dump_model(definition)
         runner = item.pop("runner")
-        protocols.append({"definition": item, "runner_template": runner})
+        tasks.append({"definition": item, "runner_template": runner})
     assessment = assess_workload(
         runners,
         plans,
-        protocols,
+        tasks,
         PerformanceGuardConfig(),
         scheduler_slots,
         ray_actor_capacity,
@@ -96,7 +96,7 @@ def validate_document(
         "valid campaign workload: "
         f"runners={len(campaign.runners)} "
         f"runner_plans={len(campaign.runner_plans)} "
-        f"protocol_definitions={len(campaign.protocol_definitions)} "
+        f"task_definitions={len(campaign.task_definitions)} "
         f"{_safety_summary(assessment)}"
     )
 

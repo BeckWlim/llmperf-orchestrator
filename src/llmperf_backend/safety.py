@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from llmperf_backend.models import PerformanceGuardConfig
 from llmperf_backend.planner import preview_fires
+from llmperf_backend.task_compiler import estimate_task_definition
 
 
 UTC = timezone.utc
@@ -174,7 +175,7 @@ def _add_cost(total: Dict[str, int], cost: Mapping[str, int], multiplier: int) -
 def assess_workload(
     runners: Sequence[Mapping[str, Any]],
     runner_plans: Sequence[Mapping[str, Any]],
-    protocol_definitions: Sequence[Mapping[str, Any]],
+    task_definitions: Sequence[Mapping[str, Any]],
     guard: PerformanceGuardConfig,
     scheduler_slots: int,
     ray_actor_capacity: Optional[int] = None,
@@ -202,42 +203,13 @@ def assess_workload(
             _plan_occurrences(plan, assessed_at),
         )
 
-    for item in protocol_definitions:
+    for item in task_definitions:
         definition = item.get("definition", item)
         template = item.get("runner_template", definition.get("runner", {}))
         benchmark = template.get("benchmark")
-        protocol = definition["protocol"]
-        if protocol == "cache-retention/v1":
-            points = len(definition["delay_seconds"]) * int(
-                definition["trials_per_delay"]
-            )
-            phases = 2 + int(bool(definition.get("cold_control", True)))
-            requests = points * phases
-            runners_count = requests
-        else:
-            schedule = definition["schedule"]
-            observations = (
-                len(schedule["offsets_seconds"])
-                if schedule["kind"] == "relative"
-                else int(definition.get("observation_count", 0))
-            )
-            if observations == 0:
-                from llmperf_backend.protocol_schedules import (
-                    expand_geographic_schedule,
-                )
-
-                observations = len(
-                    expand_geographic_schedule(
-                        schedule["timezone"],
-                        _as_datetime(schedule["starts_at"]),
-                        int(schedule["every_seconds"]),
-                        int(schedule["duration_days"]),
-                    )
-                )
-            chains = int(definition["chains"])
-            controls = int(bool(definition.get("cold_control", True)))
-            requests = chains * observations * (2 + controls)
-            runners_count = chains * (1 + observations * (1 + controls))
+        expansion = estimate_task_definition(definition)
+        requests = expansion["nodes"]
+        runners_count = requests
         tokens_per_request = (
             int(benchmark["mean_input_tokens"]) + int(benchmark["mean_output_tokens"])
             if benchmark is not None

@@ -253,14 +253,14 @@ def create_app(
         request: Request,
         runners: Any = (),
         runner_plans: Any = (),
-        protocol_definitions: Any = (),
+        task_definitions: Any = (),
     ) -> Dict[str, Any]:
         config = request.app.state.config_store.current()
         try:
             assessment = assess_workload(
                 runners,
                 runner_plans,
-                protocol_definitions,
+                task_definitions,
                 config.performance_guard,
                 request.app.state.scheduler.config.max_concurrent_runners,
                 int(
@@ -400,39 +400,39 @@ def create_app(
             await resolve_plan(request, runner_plan, default_benchmark)
             for runner_plan in payload.runner_plans
         ]
-        protocol_definitions = []
-        for definition in payload.protocol_definitions:
+        task_definitions = []
+        for definition in payload.task_definitions:
             runner = await resolve_runner(request, definition.runner, default_benchmark)
             benchmark = runner["benchmark"]
             if benchmark.get("cache_probe") is not None:
                 raise HTTPException(
                     status_code=422,
-                    detail="cache protocol runner cannot define cache_probe",
+                    detail="compiled task runner cannot define cache_probe",
                 )
-            if benchmark.get("protocol_request") is not None:
+            if benchmark.get("task_request") is not None:
                 raise HTTPException(
                     status_code=422,
-                    detail="protocol_request is backend-owned and cannot be submitted",
+                    detail="task_request is compiler-owned and cannot be submitted",
                 )
             if benchmark.get("dataset") is not None:
                 raise HTTPException(
                     status_code=422,
-                    detail="cache protocols require generated deterministic prompts",
+                    detail="compiled tasks require generated deterministic prompts",
                 )
             if benchmark.get("llm_api") != "openai":
                 raise HTTPException(
                     status_code=422,
-                    detail="cache protocols currently require llm_api=openai",
+                    detail="compiled tasks currently require llm_api=openai",
                 )
             if int(benchmark.get("stddev_input_tokens", 0)) != 0:
                 raise HTTPException(
                     status_code=422,
-                    detail="cache protocols require stddev_input_tokens=0",
+                    detail="compiled tasks require stddev_input_tokens=0",
                 )
             if int(benchmark.get("stddev_output_tokens", 0)) != 0:
                 raise HTTPException(
                     status_code=422,
-                    detail="cache protocols require stddev_output_tokens=0",
+                    detail="compiled tasks require stddev_output_tokens=0",
                 )
             tokenizer = benchmark.get("tokenizer") or {}
             if (
@@ -442,11 +442,11 @@ def create_app(
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "cache protocol requires an explicit/model-bound "
+                        "compiled tasks require an explicit/model-bound "
                         "tokenizer at an immutable Hugging Face revision"
                     ),
                 )
-            protocol_definitions.append(
+            task_definitions.append(
                 {
                     "definition": dump_model(definition),
                     "runner_template": runner,
@@ -456,7 +456,7 @@ def create_app(
             request,
             runners=runners,
             runner_plans=runner_plans,
-            protocol_definitions=protocol_definitions,
+            task_definitions=task_definitions,
         )
         workload = await request.app.state.runner_repository.create_campaign_workload(
             payload.campaign.name,
@@ -464,16 +464,16 @@ def create_app(
             payload.campaign.tags,
             runners,
             runner_plans,
-            protocol_definitions,
+            task_definitions,
             actor,
         )
         campaign_id = workload["campaign"]["campaign_id"]
         LOGGER.info(
-            "Campaign %s workload accepted: runners=%d runner_plans=%d protocol_definitions=%d",
+            "Campaign %s workload accepted: runners=%d runner_plans=%d task_definitions=%d",
             campaign_id,
             len(workload["items"]),
             len(workload["runner_plans"]),
-            len(workload["protocol_definitions"]),
+            len(workload["task_definitions"]),
         )
         for runner_plan in workload["runner_plans"]:
             LOGGER.info(

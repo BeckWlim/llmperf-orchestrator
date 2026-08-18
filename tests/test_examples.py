@@ -30,10 +30,7 @@ def test_examples_contract():
             assert plan["max_occurrences"] <= 2
             assert plan["recurrence"]["every_seconds"] <= 2
 
-        for definition in document.get("protocol_definitions", []):
-            if definition["protocol"] == "cache-retention/v1":
-                assert max(definition["delay_seconds"]) <= 2
-                assert definition["trials_per_delay"] == 1
-            if definition["protocol"] == "cache-residency/v1":
-                assert definition["schedule"]["kind"] == "relative"
-                assert max(definition["schedule"]["offsets_seconds"]) <= 2
+        for definition in document.get("task_definitions", []):
+            assert definition["trials"] == 1
+            for values in definition.get("matrix", {}).values():
+                assert max(values) <= 2

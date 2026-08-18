@@ -34,10 +34,12 @@ def test_workload_costs():
     }
     retention = {
         "definition": {
-            "protocol": "cache-retention/v1",
-            "delay_seconds": [0, 60],
-            "trials_per_delay": 2,
-            "cold_control": True,
+            "matrix": {"delay": [0, 60]},
+            "trials": 2,
+            "sequence": [
+                {"kind": "invoke"},
+                {"kind": "parallel", "invokes": [{}, {}]},
+            ],
         },
         "runner_template": {"benchmark": BENCHMARK},
     }
@@ -56,6 +58,38 @@ def test_workload_costs():
     assert result["metrics"]["provider_requests"] == 52
     assert result["metrics"]["token_budget"] == 6_240
     assert result["metrics"]["effective_concurrency"] == 8
+
+
+def test_promotion_costs():
+    promotion = {
+        "definition": {
+            "matrix": {"warmups": [0, 2, 4], "quiet": [60, 300]},
+            "trials": 2,
+            "sequence": [
+                {"kind": "invoke"},
+                {
+                    "kind": "repeat",
+                    "count": {"dimension": "warmups"},
+                },
+                {"kind": "parallel", "invokes": [{}, {}]},
+            ],
+        },
+        "runner_template": {"benchmark": BENCHMARK},
+    }
+
+    result = assess_workload(
+        [],
+        [],
+        [promotion],
+        PerformanceGuardConfig(),
+        scheduler_slots=4,
+        now=NOW,
+    )
+
+    # For each quiet/trial block: (Prime + Probe + Control) * 3 cells + 0+2+4 Warmups.
+    assert result["metrics"]["planned_runners"] == 60
+    assert result["metrics"]["provider_requests"] == 60
+    assert result["metrics"]["token_budget"] == 7_200
 
 
 def test_workload_rejection():

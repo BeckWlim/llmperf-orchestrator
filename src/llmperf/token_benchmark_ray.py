@@ -321,7 +321,7 @@ def get_token_throughput_latencies(
     llm_api="openai",
     cache_probe: Optional[Dict[str, Any]] = None,
     tokenizer_provenance: Optional[Dict[str, Any]] = None,
-    protocol_request: Optional[Dict[str, Any]] = None,
+    task_request: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Get the token throughput and latencies for the given model.
 
@@ -348,23 +348,10 @@ def get_token_throughput_latencies(
         (e.g. throughput, latencies, etc.)
         The individual metrics for each request.
     """
-    protocol_prompt_seeds = (
-        list(protocol_request.get("prompt_seeds") or []) if protocol_request else []
-    )
-    if (
-        protocol_request
-        and not protocol_prompt_seeds
-        and protocol_request.get("prompt_seed") is not None
-    ):
-        protocol_prompt_seeds = [int(protocol_request["prompt_seed"])]
-    initial_protocol_seed = (
-        protocol_request.get("prompt_seed") if protocol_request else None
-    )
-    if initial_protocol_seed is None and protocol_prompt_seeds:
-        initial_protocol_seed = protocol_prompt_seeds[0]
+    task_payload_seed = task_request.get("payload_seed") if task_request else None
     random.seed(
-        int(initial_protocol_seed)
-        if initial_protocol_seed is not None
+        int(task_payload_seed)
+        if task_payload_seed is not None
         else (dataset_seed if cache_probe else 11111)
     )
 
@@ -405,8 +392,8 @@ def get_token_throughput_latencies(
     base_prompt_count = (
         int(cache_probe["trials"]) if cache_probe else max_num_completed_requests
     )
-    if protocol_prompt_seeds and len(protocol_prompt_seeds) != base_prompt_count:
-        raise ValueError("protocol prompt_seeds must match max_completed_requests")
+    if task_request and base_prompt_count != 1:
+        raise ValueError("compiled task nodes must contain exactly one request")
     num_output_tokens_list = [
         sample_random_positive_int(mean_output_tokens, stddev_output_tokens)
         for _ in range(probe_request_count)
@@ -436,8 +423,8 @@ def get_token_throughput_latencies(
                 tokenizer=tokenizer,
             )
         for i in range(base_prompt_count):
-            if protocol_prompt_seeds:
-                random.seed(int(protocol_prompt_seeds[i]))
+            if task_payload_seed is not None:
+                random.seed(int(task_payload_seed))
             suffix = randomly_sample_sonnet_lines_prompt(
                 prompt_tokens_mean=mean_input_tokens - shared_prefix_tokens,
                 prompt_tokens_stddev=stddev_input_tokens,
@@ -506,27 +493,14 @@ def get_token_throughput_latencies(
                     llm_api=llm_api,
                     metadata=(
                         {
-                            **dict(protocol_request),
-                            **(
-                                {
-                                    "mapping_key": protocol_request["mapping_keys"][
-                                        request_index
-                                    ]
-                                }
-                                if protocol_request.get("mapping_keys")
-                                else (
-                                    {"mapping_key": protocol_request["mapping_key"]}
-                                    if protocol_request.get("mapping_key") is not None
-                                    else {}
-                                )
-                            ),
+                            **dict(task_request),
                             "prompt_hash": "sha256:"
                             + hashlib.sha256(
                                 prompts[request_index][0].encode("utf-8")
                             ).hexdigest(),
                             "local_input_tokens": prompts[request_index][1],
                         }
-                        if protocol_request
+                        if task_request
                         else None
                     ),
                     timeout_seconds=test_timeout_s,
@@ -607,7 +581,7 @@ def get_token_throughput_latencies(
                 "warning": "Tokenizer was not explicitly selected for this model",
             }
         ),
-        "protocol_request": dict(protocol_request or {}),
+        "task_request": dict(task_request or {}),
         "timed_out": timed_out,
     }
 

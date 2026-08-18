@@ -1,33 +1,36 @@
 campaign:
-  name: example-task-retention
-  description: Independent Prime/Warm replay families across a delay matrix.
+  name: example-task-promotion
+  description: Repeated deterministic hits followed by a bounded quiet probe.
   tags:
-    experiment: task-retention
+    experiment: task-promotion
 
 wait: true
 
 task_definitions:
-  - name: retention-surface
+  - name: repeated-hit-surface
     matrix:
-      delay_seconds: [0, 1]
+      warmup_count: [0, 2]
+      quiet_seconds: [1, 2]
     trials: 1
-    seed: 11111
+    seed: 33333
     payloads:
       replay: {seed_namespace: replay}
       cold: {seed_namespace: cold-control}
     sequence:
-      - kind: invoke
-        id: prime
-        role: prime
-        payload: replay
+      - {kind: invoke, id: prime, role: prime, payload: replay}
+      - kind: repeat
+        id: warmups
+        count: {dimension: warmup_count}
+        interval_seconds: 0
+        invoke: {kind: invoke, id: warmup, role: warmup, payload: replay}
       - kind: parallel
-        after_seconds: {dimension: delay_seconds}
+        after_seconds: {dimension: quiet_seconds}
         invokes:
-          - {kind: invoke, id: warm, role: warm, payload: replay}
+          - {kind: invoke, id: probe, role: probe, payload: replay}
           - {kind: invoke, id: cold, role: cold_control, payload: cold}
     runner:
-      label: retention-surface
-      metadata: {purpose: cache-retention}
+      label: repeated-hit-surface
+      metadata: {purpose: repeated-cache-hit}
       benchmark:
         provider: aliyun
         model: deepseek-v4-pro

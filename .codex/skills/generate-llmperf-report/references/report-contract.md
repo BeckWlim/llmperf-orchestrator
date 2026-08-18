@@ -1,132 +1,117 @@
-# LLMPerf HTML report contract
+# LLMPerf report data contract
 
-## Contents
+## Pipeline boundary
 
-1. Supported exports
-2. Metric mapping
-3. KV-cache interpretation
-4. Quality and comparison rules
-5. Report presentation contract
+`prepare_report_data.py` owns deterministic extraction and normalization. The reporting
+Agent owns interpretation, chart selection, layout, and HTML assembly. Do not move fixed
+experiment dashboards back into the pipeline.
 
-## 1. Supported exports
+Accepted inputs:
 
-### Campaign export version 5
+- Runner export version 1;
+- Campaign export version 6.
 
-Create with:
+Campaign v6 includes `task_definitions`, `task_instances`, `dispatches`, `task_analyses`,
+and `runners`. It deliberately has no protocol-specific analysis collection.
 
-```bash
-llmperfctl campaign export CAMPAIGN_ID -o campaign.json
+The normalized document has:
+
+- `overview`: counts, lifecycle, failures, completed requests;
+- `cohorts`: comparable Provider/model/token/concurrency groups;
+- `task_definitions`: submitted compile-time recipes;
+- `evidence.task_graphs`: instance dimensions, trial, payload hashes, topology, timing, and
+  joined Runner metrics;
+- `evidence.runner_cache_probes`: within-Runner paired cache-probe evidence;
+- `runners`: flat normalized detail.
+
+Missing values remain JSON null or absent. Never coerce missing counters to zero.
+
+## Generic task semantics
+
+One Task Instance represents one matrix coordinate and trial. Each node is one atomic
+request Runner. Interpret fields as follows:
+
+- `role`: author-provided semantic label, not runtime behavior;
+- `payload_id`: logical generated input family;
+- `payload_seed`: deterministic materialization seed;
+- `payload_hashes`: runtime proof that repeated payload references were identical;
+- `dependencies`: causal predecessor Dispatch IDs;
+- `planned_after_seconds`: requested delay after all predecessors completed;
+- actual timestamps: observed request start/completion anchors;
+- `dimensions` and `trial_index`: experiment comparison coordinates.
+
+Do not branch on Provider names, compiler labels, or a fixed list of roles. Infer meaningful
+comparisons from the graph and explain that inference in the report.
+
+## Cache and latency semantics
+
+Provider cache counters and latency answer different questions:
+
+- token hit ratio describes Provider-reported cache accounting;
+- request hit probability describes the fraction of requests satisfying an explicit hit
+  rule;
+- TTFT delta or control/target TTFT ratio describes observed latency improvement;
+- a hit counter alone does not prove speedup;
+- speedup above 1× means the target node had lower TTFT than its control.
+
+For pooled token hit ratio, use complete counters only:
+
+```text
+sum(hit_tokens) / (sum(hit_tokens) + sum(miss_tokens))
 ```
 
-The root contains `campaign`, `aggregate`, `runner_plans`, `runners`,
-`protocol_definitions`, `protocol_instances`, `dispatches`, and
-`protocol_analyses`. Cache-retention curves are protocol analyses rather than
-specialized Campaign fields. `cache-residency/v1` curves are access-conditioned;
-render their geographic scheduled time, planned offset, and actual Prime-to-Warm
-delay separately, and never label them as passive TTL.
-`aggregate.status` is lifecycle state; `aggregate.outcome` is aggregate execution
-result. Each Runner stores benchmark configuration under `benchmark`, aggregate
-benchmark output under `summary`, and optional request records under `requests`.
+Report counter coverage and sample size. Do not average percentages when token denominators
+differ.
 
-The default export omits `requests` but retains `summary.results` and
-`summary.cache_probe_analysis`. Add `--include-requests` only when the report
-requires request distributions, outlier inspection, or paired request evidence.
+For a cross-Runner comparison, pair nodes only when Provider, model, token shape,
+concurrency, tokenizer, matrix coordinates, and intended control relationship are
+compatible. A contemporaneous Cold Control can support:
 
-### Runner export version 1
-
-Create with:
-
-```bash
-llmperfctl runner export RUNNER_ID -o runner.json
+```text
+acceleration = Cold Control TTFT / Warm-or-Probe TTFT
 ```
 
-The root contains `runner` metadata and `results`. The benchmark summary is
-`results.summary`; individual metrics are `results.requests`. Runner export is
-available only when a succeeded or failed Runner has a persisted summary.
+Show a labeled 1× reference. A Prime separated by a retention interval is not a valid
+contemporaneous speed control.
 
-## 2. Metric mapping
+Repeated access changes the state being measured. If Warmups precede a Probe, describe the
+result as access-conditioned or repeat-conditioned retention, not passive TTL. Preserve
+each repeated node and the actual inter-node intervals.
 
-Use these summary paths. Missing values remain unavailable rather than zero.
+## Chart-neutral evidence rules
 
-| Report concept | Summary path |
-|---|---|
-| Started requests | `results.num_requests_started` |
-| Completed requests | `results.num_completed_requests` |
-| Request errors | `results.number_errors` |
-| Error rate | `results.error_rate` |
-| TTFT | `results.ttft_s` |
-| End-to-end latency | `results.end_to_end_latency_s` |
-| Request output throughput | `results.request_output_throughput_token_per_s` |
-| Overall output throughput | `results.mean_output_throughput_token_per_s` |
-| Inter-token latency | `results.inter_token_latency_s` |
-| KV-cache aggregate | `results.kv_cache` |
-| Paired cache evidence | `cache_probe_analysis` |
-| Timeout flag | `timed_out` and `cache_probe_analysis.quality_flags.timed_out` |
+Before rendering, inspect cardinality, missingness, uncertainty, and compatible dimensions.
+Choose the smallest visual set that supports the conclusions. Lines, bars, intervals,
+heatmaps, small multiples, aligned panels, and mixed encodings are options, not mandatory
+templates.
 
-Latency distribution objects expose `min`, `max`, `mean`, `stddev`, and
-`quantiles.p25/p50/p75/p90/p95/p99`. Multi-round charts should graph per-Runner
-summary values rather than pool incompatible quantiles. Label cross-round
-statistics as medians or ranges across Runners, not request-level percentiles.
+A bar-line combination is acceptable when both measures share the same experimental grain
+and the joint view materially clarifies their relationship—for example TTFT improvement and
+cache hit ratio at the same delay points. Avoid mixed charts that merely stack available
+metrics, hide nulls, or imply correlation through arbitrary dual-axis scaling.
 
-For reliability, sum started/completed/error counts across comparable Runners.
-The Campaign export field `aggregate.completed_request_count` is the number of
-persisted request records in the current implementation; do not present it as
-the count of successful model responses.
+For multiple Providers, preserve separate series on compatible axes. Resolve styles once
+per report by sorting normalized identities and assigning slots from
+`assets/provider-palette.json`; never match literal Provider names. Use marker/dash
+redundancy when needed.
 
-## 3. KV-cache interpretation
+Quantitative guardrails:
 
-Prefer paired warm-request cache evidence from `summary.cache_probe_analysis`.
-Use:
+- hit-rate axes are bounded to 0–100%;
+- acceleration charts include 1×;
+- connecting curves must be shape-preserving and cannot invent extrema;
+- observed points remain visible and null gaps remain gaps;
+- “Warm acceleration” or “Warm TTFT improvement” is preferred over “Warm is faster”;
+- numeric table columns and titles align consistently;
+- important conclusion charts receive greater visual area;
+- Runner detail is collapsed with `<details>` by default, while failures stay visible.
 
-- `cache.weighted_token_hit_ratio` for the warm token hit ratio;
-- `cache.counter_coverage` to disclose measurement coverage;
-- `speedup.p50` for median `prime_ttft / warm_ttft`;
-- `paired_ttft_delta_s.p50` for median `prime_ttft - warm_ttft`;
-- `paired_ttft_delta_s.confidence_interval` for latency evidence;
-- `quality_flags` and `paired_samples` for evidence quality.
+## Reliability and claims
 
-Verdict meanings:
+Always surface failed/cancelled Runners, request errors, timeouts, pending nodes, payload hash
+failures, and counter gaps. Small samples support directional language unless confidence
+intervals or an equivalent statistical test are available.
 
-| Verdict | Allowed conclusion |
-|---|---|
-| `confirmed_external` | Cache hits and statistically positive paired latency improvement were observed. |
-| `accounting_confirmed` | Provider cache counters confirm reuse; paired latency improvement is not established. |
-| `latency_inferred` | Latency evidence is positive but provider counters are unavailable. |
-| `not_observed` | Adequate counters were present but no cache hit was observed. |
-| `inconclusive` | Evidence coverage or sample quality is insufficient. |
-
-Compute a Campaign-wide warm hit ratio only by summing complete warm hit and miss
-tokens, then dividing hit tokens by their sum. Do not average per-Runner ratios.
-
-## 4. Quality and comparison rules
-
-- Keep lifecycle and outcome distinct. `completed` does not imply `succeeded`.
-- A succeeded Runner may contain request errors or a degraded outcome.
-- Surface all failed/cancelled Runners, request errors, timed-out summaries,
-  skipped dependent cache requests, tokenizer mismatches, and invalid counters.
-- Report cache coverage next to cache hit ratio. A high ratio with low coverage is
-  weak evidence.
-- Do not compare Runners as one series when provider, model, concurrency, input or
-  output token targets, tokenizer provenance, cache-probe mode, or sampling
-  parameters differ. Split into cohorts or disclose the mismatch.
-- Do not infer provider performance from infrastructure failures such as Ray OOM,
-  scheduler cancellation, artifact resolution, proxy errors, or local timeouts.
-- Bound diagnostic messages and HTML-escape them. Never render raw stdout/stderr,
-  prompt text, credentials, Authorization headers, or private endpoints.
-
-## 5. Report presentation contract
-
-A professional report contains:
-
-1. Title, experiment ID, provider/model scope, generation time, and export schema.
-2. Executive findings written with evidence strength and caveats.
-3. KPI cards for Runner outcome, request reliability, latency, throughput, and
-   KV-cache behavior when those metrics exist.
-4. Accessible inline SVG charts with units, legends, null gaps, and point values.
-5. A chronological Runner table that links round, status, request counts, latency,
-   throughput, cache evidence, and verdict.
-6. Data-quality and failure diagnostics separated from model-performance claims.
-7. Methodology/provenance notes sufficient to reproduce the export.
-
-Generate one self-contained UTF-8 HTML file. Do not require a web server, CDN,
-remote font, external stylesheet, or JavaScript library.
+Do not expose prompts, credentials, Authorization headers, private endpoints, raw stdout,
+or unbounded stderr. Final HTML must be self-contained, printable, and traceable to the
+source export and normalized analysis artifact.

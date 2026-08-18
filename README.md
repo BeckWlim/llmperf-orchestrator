@@ -22,7 +22,7 @@ and persisted before results are exported as JSON or professional HTML reports.
 |                                                                                  |
 | +-----------------------+  +---------------------+  +--------------------------+ |
 | | FastAPI control plane |  | Planner             |  | Scheduler (N slots)      | |
-| | auth/validate/status  |  | due plan -> Runner  |  | claim via DB + supervise | |
+| | auth/validate/compile |  | due work -> Runner  |  | claim via DB + supervise | |
 | +-----------+-----------+  +----------+----------+  +-------------+------------+ |
 +-------------|-------------------------|---------------------------|--------------+
               | atomic transactions     | materialize               | Ray handle
@@ -59,14 +59,17 @@ and persisted before results are exported as JSON or professional HTML reports.
   Runner fan-out, Provider requests, token budget, and effective concurrency.
 - **Reproducible experiments** — Provider/model selections, benchmark parameters,
   and immutable tokenizer and dataset revisions are frozen into every Runner.
+- **Composable workload input** — a bounded Workload Compiler expands matrix,
+  sequence, repeat, and parallel YAML into atomic invoke DAGs. It is an input-layer
+  component; Planner remains responsible for durable due-work materialization.
 - **Secret isolation** — endpoints and credentials live in Backend-owned Provider
   Profiles and never need to appear in workload YAML or exported reports.
 - **KV-cache evidence, not guesses** — deterministic prime/warm pairs, normalized
   Provider cache counters, timing phases, bootstrap confidence intervals, and
   explicit evidence verdicts distinguish cache accounting from proven speedup.
-- **Durable retention curves** — Campaign protocol instances exchange immutable
-  checkpoints through PostgreSQL; the Planner emits long-delay warm/control Runners
-  without holding a Worker while TTL time elapses.
+- **Durable retention curves** — compiled task instances preserve dependencies,
+  deterministic payload identity, and timing checkpoints in PostgreSQL; the Planner
+  emits long-delay warm/control Runners without holding a Worker while TTL time elapses.
 - **Audit-ready reporting** — aggregate and per-request metrics are persisted in
   PostgreSQL; lightweight status views, JSON exports, and self-contained HTML
   reports are derived from the same durable records.
@@ -106,6 +109,9 @@ Initialize a local database:
 createdb llmperf
 psql -v ON_ERROR_STOP=1 -d llmperf -f sql/postgresql/init.sql
 ```
+
+The task-graph schema is a compatibility break: existing `benchmark_protocol_*`
+tables are not migrated. Recreate the schema when upgrading from that design.
 
 ### 2. Configure a Provider and start the Backend
 
@@ -162,13 +168,15 @@ llmperfctl provider models aliyun
 llmperfctl provider models aliyun --json
 ```
 
-Provider 查询默认输出适合终端阅读的表格/摘要；只有显式传入 `--json` 才输出稳定的
-JSON 投影。`provider list` 会展示静态 Profile 按配置顺序选取的最多三个典型模型，且
-不会为动态目录额外发起远端发现请求。修改持久化的 `LLMPERF_PROVIDER_*` 配置后，可执行
-`llmperfctl provider reload` 原子热更新 Provider Profile，无需重启 Backend。
-热更新不会修改数据库、Scheduler、Planner、Ray、监听地址或通用 Backend 配置；正在
-运行的 Runner 保持已有连接快照，之后领取的 Runner 才使用新代次。候选配置校验失败时
-当前代次保持不变。
+Provider queries default to terminal-friendly tables and summaries; pass `--json`
+explicitly for the stable JSON projection. `provider list` shows at most three
+representative models for static Profiles in configuration order and does not trigger
+remote discovery for dynamic catalogs. After changing persisted `LLMPERF_PROVIDER_*`
+settings, run `llmperfctl provider reload` to atomically refresh Provider Profiles without
+restarting the Backend. Reload does not change PostgreSQL, Scheduler, Planner, Ray, listen
+addresses, or general Backend configuration. Running Runners retain their connection
+snapshot; newly claimed Runners use the new generation. A rejected candidate leaves the
+current generation unchanged.
 
 The example YAML uses `deepseek-v4-pro`; if the catalog returns a different exact
 model ID, update the example before continuing.
@@ -203,14 +211,14 @@ state remain durable in PostgreSQL. Mutation and wait commands write operational
 state changes to stderr and do not dump response JSON to stdout by default.
 Use `status`, `list`, `logs`, or an explicit export command when output is needed.
 
-### 4. Export results and generate an HTML report
+### 4. Export results and prepare an HTML report
 
 ```bash
 llmperfctl campaign export CAMPAIGN_ID -o campaign-report.json
 
-python .codex/skills/generate-llmperf-report/scripts/generate_report.py \
+python .codex/skills/generate-llmperf-report/scripts/prepare_report_data.py \
   --input campaign-report.json \
-  --output reports/campaign-report.html
+  --output /tmp/campaign-analysis.json
 ```
 
 From Codex, the same workflow can be requested with:
@@ -220,22 +228,31 @@ Use $generate-llmperf-report to generate a professional HTML report for
 Campaign CAMPAIGN_ID.
 ```
 
-The report is a self-contained HTML file with inline SVG charts, Runner-level
-metrics, data-quality warnings, and failure diagnostics. Add
-`campaign export --include-requests` only when request-level records are needed.
+The deterministic pipeline produces chart-neutral evidence. The reporting Agent
+chooses the HTML structure and charts after inspecting that evidence, while shared
+theme and palette assets keep style stable. Add `campaign export --include-requests`
+only when request-level distributions or outliers are needed.
 
 ## Included examples
 
 | File | Purpose |
 |---|---|
 | [`examples/example-smoke.yaml`](examples/example-smoke.yaml) | Minimal 1x1 Provider and persistence check |
-| [`examples/example-campaign.yaml`](examples/example-campaign.yaml) | Two small Runner configurations in one durable Campaign |
+| [`examples/example-campaign.yaml`](examples/example-campaign.yaml) | Immediate Runners plus a compiled deterministic replay task |
 | [`examples/example-runner-plan.yaml`](examples/example-runner-plan.yaml) | Two bounded Runners materialized one second apart |
-| [`examples/example-cache-retention.yaml`](examples/example-cache-retention.yaml) | Short independent-pair retention sweep with cold controls |
-| [`examples/example-cache-residency.yaml`](examples/example-cache-residency.yaml) | Bundled Prime with two mapped Warm observations |
+| [`examples/example-cache-retention.yaml`](examples/example-cache-retention.yaml) | Delay matrix with deterministic Prime/Warm replay and cold controls |
+| [`examples/example-cache-residency.yaml`](examples/example-cache-residency.yaml) | Fixed-interval repeated payload observations |
+| [`examples/example-cache-promotion.yaml`](examples/example-cache-promotion.yaml) | Repeated-hit count × quiet-window task matrix |
 
 Workload YAML selects stable Provider and model IDs only. Provider URLs, keys,
 artifact caches, and service settings belong to the Backend configuration.
+
+`task_definitions` is compile-time composition, not a second scheduler. The compiler
+expands a finite `matrix`/`sequence`/`repeat`/`parallel` recipe into single-request
+`invoke` nodes. Reusing one logical payload produces deterministic random input from
+the task seed, matrix coordinates, trial index, and payload namespace; runtime
+`prompt_hash` validation proves Prime/Warm replay identity. Planner sees only generic
+dependencies and due times and never branches on role or experiment names.
 
 ## Operational essentials
 

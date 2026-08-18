@@ -99,7 +99,7 @@ def _calculate(
         additional_sampling_params=benchmark["additional_sampling_params"],
         cache_probe=benchmark.get("cache_probe"),
         tokenizer_provenance=benchmark.get("tokenizer"),
-        protocol_request=benchmark.get("protocol_request"),
+        task_request=benchmark.get("task_request"),
     )
     runtime = dict(execution_runtime or {})
     runtime.setdefault("backend", "ray")

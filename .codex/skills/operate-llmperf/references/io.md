@@ -1,92 +1,86 @@
-# LLMPerf 输入输出管理契约
+# LLMPerf Input and Output Contract
 
-## 1. 输入管线
+## Input pipeline
 
-所有外部输入统一经过以下阶段，不得在命令或 endpoint 中旁路：
+All external input follows one path:
 
 ```text
 CLI/YAML/JSON/environment
   -> decode
-  -> strict validate
+  -> strict validation
   -> resolve Backend-owned references
-  -> safety assess
-  -> atomic persist
+  -> safety assessment
+  -> atomic persistence
 ```
 
-- YAML 只用安全解析器读取，并要求顶层 mapping；未知字段由严格 Pydantic 模型拒绝。
-- CLI 只负责文件、参数和 HTTP 边界，不直接访问 PostgreSQL，也不自行展开调度语义。
-- Provider URL、API key、数据库凭据和私钥只进入 Backend/CLI 配置；workload 只携带稳定 ID。
-- Secret 值只通过 `--stdin`、权限受控配置文件或进程环境输入，不进入参数、日志、YAML、
-  metadata、summary 或导出。
-- Tokenizer/Dataset 等远端引用在入队前解析为 Backend-owned 本地 artifact 和不可变版本；
-  Worker 只接收已选择 Provider 的最小环境及本地路径。
-- 在一个数据库事务中创建完整 Campaign/RunnerPlan/Dispatch 图；任一解析或安全检查失败
-  时不保留部分工作负载。
-- 为文件大小、请求数、token、并发、超时、计划 occurrence 和 artifact 解析设置显式边界。
+- Parse YAML safely and require a top-level mapping. Strict Pydantic models reject unknown
+  fields.
+- The CLI owns file, argument, and HTTP boundaries. It never accesses PostgreSQL or expands
+  scheduling semantics.
+- Provider URLs, API keys, database credentials, and private keys belong only to Backend or
+  CLI configuration. Workloads carry stable IDs.
+- Accept secrets through `--stdin`, permission-controlled configuration, or environment
+  variables. Never place them in arguments, logs, YAML, metadata, summaries, or exports.
+- Resolve tokenizer/dataset references to Backend-owned local artifacts and immutable
+  revisions before queueing.
+- Persist a complete Campaign, RunnerPlan, and compiled Dispatch graph in one transaction.
+  Resolution or admission failure must leave no partial workload.
+- Bound file size, requests, tokens, concurrency, timeout, occurrences, graph expansion,
+  and artifact resolution.
 
-## 2. 输出管线
-
-所有查询输出统一经过：
+## Output pipeline
 
 ```text
 PostgreSQL/API authoritative record
-  -> command compatibility adapter
+  -> command adapter
   -> resource projector
   -> CLIProjection
   -> centralized renderer or versioned export
 ```
 
-- `execute`/HTTP client 只返回结构化数据，不直接打印。
-- CLI 的每个 `command.subcommand` 都必须在兼容层显式注册 adapter；adapter 负责旧/新字段
-  别名、缺省值和报文形状检查，再调用资源 projector。禁止 identity adapter、通用 raw
-  fallback 或未注册路由继续执行。
-- 每种资源维护一个 projector，白名单选择稳定、可操作字段；不得先复制完整记录再删除
-  少数字段。renderer 只接受 `CLIProjection`，传入 `dict`/`list` 原始响应必须失败。
-- 默认 `status/list/health` 输出人类可读的轻量投影，不输出原始 JSON。
-- 显式 `--json` 序列化同一轻量投影，字段语义与默认文本一致。
-- `--full` 只扩大到显式登记的详细兼容投影，仍禁止输出完整 API 记录；完整且大型结果只通过
-  带版本的 export 文件取得。
-- Worker stdout/stderr 只由专用 `logs` 命令或显式完整导出显示。
-- `start/cancel/export` 默认不向 stdout 倾倒响应；进度、durable ID 和操作信息写入 stderr。
-- `render_result` 是 CLI 唯一展示策略入口；禁止命令分支调用
-  `print_json(raw_response)` 或自行拼接另一套投影。
+- HTTP execution returns structured data and never prints directly.
+- Register every command route explicitly. Adapters validate response shape before calling
+  a projector; do not add identity adapters or raw fallbacks.
+- Projectors allow-list stable fields. Do not clone a full record and remove a few keys.
+- Default status/list/health output is lightweight and human-readable. `--json` serializes
+  the same projection. `--full` remains an explicit expanded allow-list.
+- Large complete records are available only through versioned export files.
+- Worker stdout/stderr appears only through `logs` or explicit full export.
+- Start, cancel, and export actions write progress and durable IDs to stderr and do not dump
+  raw responses to stdout.
+- `render_result` is the only CLI rendering-policy entry point; it must reject raw dict/list
+  responses.
 
-## 3. 数据最小化与安全
+## Data minimization
 
-Projector 默认过滤：凭据、Authorization、私钥路径、数据库 URL、内部配置绝对路径、
-密钥 ID/轮换细节、完整 Worker 流、原始请求正文、Prompt 文本、大型嵌套 summary，以及
-不稳定的内部实现字段。需要诊断时通过授权 endpoint、扩展白名单 `--full`、专用 logs 或版本化导出
-显式取得；CLI 投影不是 Backend 授权和 API redaction 的替代品。
+Default projectors remove credentials, Authorization data, private-key paths, database
+URLs, internal absolute paths, key rotation details, complete Worker streams, request
+bodies, prompts, large summaries, and unstable implementation fields. Authorized logs,
+expanded allow-lists, or versioned exports are explicit diagnostic paths; projection is not
+a substitute for Backend authorization and redaction.
 
-错误默认输出 HTTP/Provider code、reason、请求方法与 API 路径、耗时、可用的 request ID、
-全部有界校验位置及首个可操作消息，避免只剩无法定位阶段的泛化摘要。请求 body/input、
-凭据字段和超出大小上限的内容必须过滤；完整 traceback 保留在服务 journal 或 Worker
-logs，不在普通状态命令中倾倒。所有日志和导出继续执行 secret redaction 与大小上限。
+Errors should include bounded HTTP/Provider codes, reason, method, API path, elapsed time,
+request ID, validation locations, and the first actionable message. Filter input bodies,
+credential fields, oversized values, and normal-command tracebacks.
 
-## 4. 命令模式矩阵
+## Command modes
 
-| 模式 | stdout | stderr | 数据范围 |
+| Mode | stdout | stderr | Scope |
 |---|---|---|---|
-| 默认查询 | 稳定文本投影 | 操作日志 | 白名单字段 |
-| `--json` | 同一投影 JSON | 操作日志 | 白名单字段 |
-| `--full` | 详细兼容投影 | 操作日志 | 扩展白名单诊断字段 |
-| `logs` | 明确分隔的 Worker 流 | 操作日志 | 有界 stdout/stderr |
-| `export -o` | 默认静默 | 文件位置/结果 | 版本化导出文件 |
-| start/cancel | 默认静默 | ID、状态变化 | 操作摘要 |
+| default query | stable text projection | operation logs | allow-listed fields |
+| `--json` | same projection as JSON | operation logs | allow-listed fields |
+| `--full` | detailed projection | operation logs | expanded allow-list |
+| `logs` | bounded Worker streams | operation logs | stdout/stderr |
+| `export -o` | silent by default | file/result status | versioned export |
+| start/cancel | silent by default | IDs and transitions | operation summary |
 
-`health` 默认只投影 Backend、Database、Planner、Provider 数量和 Auth 健康状态；过滤
-`config_source`、配置代次、active key ID 和轮换内部状态。`health --json` 输出同一投影，
-`health --full` 仍输出兼容投影，不得包含完整健康响应或内部配置字段。
+## Change checklist
 
-## 5. 变更检查清单
-
-修改输入或输出时同时完成：
-
-1. 更新严格模型或输入 decoder，并增加无效、未知、越界输入测试；
-2. 更新资源 projector，确认默认结果不包含 raw record、secret、日志或大型嵌套字段；
-3. 为每个新增命令注册 adapter；只在集中 renderer 接入默认、`--json`、`--full` 和 action
-   策略，且没有通用回退；
-4. 更新 CLI help、Skill 参考和必要的 API/export 版本说明；
-5. 测试文本投影与 JSON 投影语义一致，`--full` 仍经白名单，raw payload 被 renderer 拒绝，
-   stderr/stdout 不串流；
-6. 对真实响应样本执行敏感字段和体积审计，再运行聚焦与全量测试。
+1. Update strict models/decoders and invalid, unknown, and boundary tests.
+2. Update the resource projector and verify secrets and large nested records remain absent.
+3. Register new command adapters and route all display modes through the central renderer.
+4. Update help, skill references, and API/export version documentation.
+5. Test semantic parity between text and JSON projections, allow-listed `--full`, raw-payload
+   rejection, and stdout/stderr separation.
+6. Audit representative real responses for sensitive fields and size, then run focused and
+   complete tests.

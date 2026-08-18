@@ -1,6 +1,6 @@
 campaign:
   name: example-campaign
-  description: Run two small benchmark configurations in one durable Campaign.
+  description: Combine immediate benchmarks with one compiled replay task.
   tags:
     provider: aliyun
     model: deepseek-v4-pro
@@ -39,3 +39,33 @@ runners:
       stddev_output_tokens: 0
       additional_sampling_params:
         temperature: 0
+
+task_definitions:
+  - name: example-replay-task
+    trials: 1
+    seed: 11111
+    payloads:
+      replay: {seed_namespace: replay}
+    sequence:
+      - {kind: invoke, id: prime, role: prime, payload: replay}
+      - {kind: invoke, id: warm, role: warm, payload: replay, after_seconds: 1}
+    runner:
+      label: example-replay-task
+      metadata:
+        purpose: deterministic-replay
+      benchmark:
+        provider: aliyun
+        model: deepseek-v4-pro
+        llm_api: openai
+        tokenizer:
+          id: deepseek-ai/DeepSeek-V3
+          revision: main
+          use_fast: true
+        timeout_seconds: 60
+        concurrent_requests: 1
+        mean_input_tokens: 128
+        stddev_input_tokens: 0
+        mean_output_tokens: 16
+        stddev_output_tokens: 0
+        additional_sampling_params:
+          temperature: 0

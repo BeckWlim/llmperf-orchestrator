@@ -1,4 +1,4 @@
 interface:
   display_name: "Generate LLMPerf Report"
-  short_description: "Generate professional HTML reports from LLMPerf"
-  default_prompt: "Use $generate-llmperf-report to turn an LLMPerf Campaign into a professional self-contained HTML analysis report."
+  short_description: "Prepare auditable data and flexible LLMPerf reports"
+  default_prompt: "Use $generate-llmperf-report to prepare an auditable analysis model and render an evidence-led LLMPerf report."

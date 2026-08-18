@@ -179,7 +179,7 @@ def test_immediate_grace():
 
 def test_campaign_runtime():
     planned = RunnerRepository._campaign_runtime({}, {"active": 1})
-    waiting_protocol = RunnerRepository._campaign_runtime(
+    waiting_task = RunnerRepository._campaign_runtime(
         {"succeeded": 1}, {}, {"active": 1}
     )
     queued = RunnerRepository._campaign_runtime(
@@ -191,7 +191,7 @@ def test_campaign_runtime():
         {"succeeded": 7, "failed": 1}, {"completed": 1}
     )
     failed = RunnerRepository._campaign_runtime({"failed": 8}, {"completed": 1})
-    protocol_failed = RunnerRepository._campaign_runtime(
+    task_failed = RunnerRepository._campaign_runtime(
         {"succeeded": 3}, {}, {"failed": 1}
     )
     cancelled = RunnerRepository._campaign_runtime({"cancelled": 8}, {"cancelled": 1})
@@ -199,8 +199,8 @@ def test_campaign_runtime():
     assert planned["status"] == "planned"
     assert planned["outcome"] == "pending"
     assert planned["runner_plan_count"] == 1
-    assert waiting_protocol["status"] == "planned"
-    assert waiting_protocol["protocol_instance_status_counts"]["active"] == 1
+    assert waiting_task["status"] == "planned"
+    assert waiting_task["task_instance_status_counts"]["active"] == 1
     assert queued["status"] == "queued"
     assert queued["outcome"] == "pending"
     assert queued["runner_count"] == 100_002
@@ -214,8 +214,8 @@ def test_campaign_runtime():
     assert partial["has_failures"] is True
     assert failed["status"] == "completed"
     assert failed["outcome"] == "failed"
-    assert protocol_failed["outcome"] == "failed"
-    assert protocol_failed["has_failures"] is True
+    assert task_failed["outcome"] == "failed"
+    assert task_failed["has_failures"] is True
     assert cancelled["status"] == "cancelled"
     assert cancelled["outcome"] == "cancelled"
 

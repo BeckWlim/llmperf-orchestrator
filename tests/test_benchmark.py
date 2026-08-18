@@ -679,7 +679,7 @@ def test_probe_execution_order(monkeypatch):
     }
 
 
-def test_protocol_bundle_mapping(monkeypatch):
+def test_task_payload_replay(monkeypatch):
     launched = []
 
     class FakeLauncher:
@@ -693,7 +693,6 @@ def test_protocol_bundle_mapping(monkeypatch):
         def get_next_ready(self, block=False):
             if self.config is None:
                 return []
-            metadata = self.config.metadata
             metrics = {
                 common_metrics.INTER_TOKEN_LAT: 0.1,
                 common_metrics.TTFT: 0.2,
@@ -703,7 +702,7 @@ def test_protocol_bundle_mapping(monkeypatch):
                 common_metrics.NUM_OUTPUT_TOKENS: 1,
                 common_metrics.ERROR_CODE: None,
                 common_metrics.ERROR_MSG: "",
-                common_metrics.REQUEST_METADATA: metadata,
+                common_metrics.REQUEST_METADATA: self.config.metadata,
             }
             return [(metrics, "x", self.config)]
 
@@ -725,30 +724,26 @@ def test_protocol_bundle_mapping(monkeypatch):
         "mean_output_tokens": 1,
         "stddev_output_tokens": 0,
         "num_concurrent_requests": 1,
+        "max_num_completed_requests": 1,
         "test_timeout_s": 10,
     }
+    context = {
+        "definition_id": "definition",
+        "instance_id": "instance",
+        "payload_id": "replay",
+        "payload_seed": 22,
+        "trial_index": 0,
+        "dimensions": {},
+    }
     benchmark_module.get_token_throughput_latencies(
-        **base,
-        max_num_completed_requests=2,
-        protocol_request={
-            "protocol": "cache-residency/v1",
-            "role": "prime",
-            "prompt_seeds": [11, 22],
-            "mapping_keys": ["first", "second"],
-        },
+        **base, task_request={**context, "node_id": "prime", "role": "prime"}
     )
-    prime_prompts = {item.metadata["mapping_key"]: item.prompt[0] for item in launched}
+    prime_prompt = launched[0].prompt[0]
     launched.clear()
-    benchmark_module.get_token_throughput_latencies(
-        **base,
-        max_num_completed_requests=1,
-        protocol_request={
-            "protocol": "cache-residency/v1",
-            "role": "warm",
-            "prompt_seed": 22,
-            "mapping_key": "second",
-        },
+    summary, _ = benchmark_module.get_token_throughput_latencies(
+        **base, task_request={**context, "node_id": "warm", "role": "warm"}
     )
 
-    assert launched[0].prompt[0] == prime_prompts["second"]
-    assert launched[0].metadata["mapping_key"] == "second"
+    assert launched[0].prompt[0] == prime_prompt
+    assert launched[0].metadata["payload_id"] == "replay"
+    assert summary["task_request"]["node_id"] == "warm"

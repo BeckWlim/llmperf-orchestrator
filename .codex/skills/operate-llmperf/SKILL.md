@@ -27,7 +27,7 @@ answer it, prove the Provider with a smoke request, then scale deliberately.
 Apply these invariants:
 
 1. Treat a Campaign as the durable workload boundary. It may contain immediate
-   Runners, bounded RunnerPlans, or both.
+   Runners, bounded RunnerPlans, compiled task definitions, or any combination.
 2. Treat a RunnerPlan as a template. The Planner materializes due occurrences as
    ordinary queued Runners; it never occupies a Scheduler slot while waiting.
 3. Treat the Scheduler as the queue consumer and Worker owner. A Worker is a
@@ -42,7 +42,10 @@ Apply these invariants:
    fallback behavior or in-memory authoritative state.
 6. Keep Provider endpoints and credentials in Backend-owned profiles. Put only
    the stable provider ID and model ID in workload YAML.
-7. Distinguish Campaign lifecycle `status` from aggregate execution `outcome`.
+7. Treat an atomic single-request Runner as the only compiled-task execution primitive.
+   The Workload Compiler owns matrix/repeat/parallel expansion; the Planner only handles
+   dependencies and due times and must not interpret role names.
+8. Distinguish Campaign lifecycle `status` from aggregate execution `outcome`.
    Never infer that `completed` means every Runner succeeded.
 
 ## Run the performance safety gate
@@ -62,7 +65,7 @@ and warnings. In addition:
   Runner must use Ray, but no Runner may create its own runtime;
 - verify concurrent Campaigns receive fair claims while Ray independently queues their
   actors; do not require all actors of one Runner to become ready simultaneously;
-- account for all RunnerPlan occurrences and protocol phases, not only YAML item count;
+- account for all RunnerPlan occurrences and compiled invoke nodes, not only YAML item count;
 - inspect host CPU/memory, PostgreSQL latency, Ray worker churn, and queue growth before
   increasing slots; a 1x1 Runner can still be expensive when its runtime is heavyweight;
 - treat `scheduler status.performance_guard.tripped=true` as a runtime circuit breaker:
@@ -74,8 +77,8 @@ and warnings. In addition:
 
 Do not add blanket Provider retries to performance or cache probes. Retry only a bounded,
 explicit set of transient failures with exponential backoff and jitter. Never retry 4xx
-authentication/model/parameter errors. For cache protocols, do not retry a phase in the
-same prompt family after an ambiguous send: mark the instance failed and, if repetition is
+authentication/model/parameter errors. For compiled cache tasks, do not retry a node in the
+same payload family after an ambiguous send: mark the instance failed and, if repetition is
 required, create a new independent instance/seed so the retry cannot warm or refresh the
 cache being measured. For load/reliability measurements, keep retries disabled by default
 because retries hide the error rate and increase offered load.
@@ -101,8 +104,13 @@ Select the durable shape:
 - Use Campaign `runners` to compare several immediate configurations.
 - Use a bounded RunnerPlan for repeated wall-clock or interval measurements.
 - Use `cache_probe` for within-Runner exact-repeat or prefix/mutation comparisons.
-- Use `cache-retention/v1` for independent-family passive delay/TTL sweeps.
-- Use `cache-residency/v1` for one Prime bundle followed by mapped repeated access.
+- Use `task_definitions` for cross-Runner causal experiments. Compose only the atomic
+  `invoke` node with bounded `matrix`, `sequence`, `repeat`, and `parallel` syntax.
+- Express passive retention as independent delay-matrix instances; express access-
+  conditioned residency as a repeat chain; express repeated-hit behavior as a
+  `warmup_count × quiet_seconds` matrix. Role strings are analysis tags only.
+- Use the same payload ID for exact Prime/Warm/Probe replay and a different payload
+  namespace for controls. Random sampling must be deterministic and hash-verified.
 
 ## Follow the end-to-end workflow
 
@@ -114,7 +122,7 @@ Select the durable shape:
 4. Create a short, bounded smoke YAML first. Estimate its Provider request count and run it
    before any longer or more expensive workload when execution is in scope.
 5. Create the requested YAML from the proven smoke configuration. Keep stochastic fields
-   fixed when the experiment requires reproducibility and bound every plan/protocol.
+   fixed when the experiment requires reproducibility and bound every plan/task expansion.
 6. Validate YAML locally with the performance safety command above using the active
    Scheduler slot count and shared Ray address (if configured).
    Preview RunnerPlan occurrences. Remember submission may resolve Provider, tokenizer, and

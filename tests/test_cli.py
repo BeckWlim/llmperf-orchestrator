@@ -1,4 +1,4 @@
-"""HTTP client command contracts and backward-compatible Worker rendering tests."""
+"""HTTP client command contracts and stable Worker rendering tests."""
 
 from argparse import Namespace
 from datetime import datetime, timezone
@@ -58,7 +58,7 @@ class FakeClient:
         return {"items": payloads}
 
     def start_campaign(
-        self, campaign, runners, runner_plans, protocol_definitions=None
+        self, campaign, runners, runner_plans, task_definitions=None
     ):
         assert campaign["name"] == "glm-study"
         payloads = []
@@ -80,7 +80,7 @@ class FakeClient:
             "campaign": {"campaign_id": "campaign-1"},
             "items": payloads,
             "runner_plans": plans,
-            "protocol_definitions": protocol_definitions or [],
+            "task_definitions": task_definitions or [],
         }
 
 
@@ -157,30 +157,26 @@ def test_sweep_campaign(tmp_path):
         """
 campaign:
   name: glm-study
-protocol_definitions:
+task_definitions:
   - name: retention
-    protocol: cache-retention/v1
-    delay_seconds: [0, 60, 300]
-    trials_per_delay: 2
+    matrix: {delay: [0, 60, 300]}
+    trials: 2
+    payloads: {replay: {seed_namespace: replay}}
+    sequence:
+      - {kind: invoke, id: prime, role: prime, payload: replay}
+      - {kind: invoke, id: warm, role: warm, payload: replay, after_seconds: {dimension: delay}}
     runner:
-      benchmark:
-        model: glm-test
+      benchmark: {model: glm-test}
 """,
         encoding="utf-8",
     )
     arguments = Namespace(
-        file=str(plan),
-        wait=False,
-        poll_interval=0.01,
-        timeout=None,
-        output=None,
-        include_requests=False,
+        file=str(plan), wait=False, poll_interval=0.01, timeout=None,
+        output=None, include_requests=False,
     )
-    client = FakeClient()
+    result = start_campaign(FakeClient(), arguments)
 
-    result = start_campaign(client, arguments)
-
-    assert result["protocol_definitions"][0]["delay_seconds"] == [0, 60, 300]
+    assert result["task_definitions"][0]["matrix"]["delay"] == [0, 60, 300]
 
 
 def test_residency_campaign(tmp_path):
@@ -189,39 +185,67 @@ def test_residency_campaign(tmp_path):
         """
 campaign:
   name: glm-study
-protocol_definitions:
-  - name: daily-residency
-    protocol: cache-residency/v1
-    schedule:
-      kind: geographic
-      timezone: Asia/Shanghai
-      starts_at: 2026-08-15T00:00:00+08:00
-      every_seconds: 3600
-      duration_days: 1
-    mapping: one_to_one
+task_definitions:
+  - name: residency
+    matrix: {observations: [24]}
+    payloads: {replay: {seed_namespace: replay}}
+    sequence:
+      - {kind: invoke, id: prime, role: prime, payload: replay}
+      - kind: repeat
+        id: observations
+        count: {dimension: observations}
+        interval_seconds: 3600
+        invoke: {kind: invoke, id: warm, role: warm, payload: replay}
     runner:
-      benchmark:
-        model: glm-test
+      benchmark: {model: glm-test}
 """,
         encoding="utf-8",
     )
     arguments = Namespace(
-        file=str(plan),
-        wait=False,
-        poll_interval=0.01,
-        timeout=None,
-        output=None,
-        include_requests=False,
+        file=str(plan), wait=False, poll_interval=0.01, timeout=None,
+        output=None, include_requests=False,
     )
-    client = FakeClient()
+    result = start_campaign(FakeClient(), arguments)
 
-    result = start_campaign(client, arguments)
-
-    definition = result["protocol_definitions"][0]
-    assert definition["protocol"] == "cache-residency/v1"
-    assert definition["schedule"]["timezone"] == "Asia/Shanghai"
+    definition = result["task_definitions"][0]
+    assert definition["sequence"][1]["kind"] == "repeat"
+    assert definition["matrix"]["observations"] == [24]
 
 
+def test_promotion_campaign(tmp_path):
+    plan = tmp_path / "promotion.yaml"
+    plan.write_text(
+        """
+campaign:
+  name: glm-study
+task_definitions:
+  - name: repeat-dose
+    matrix:
+      warmup_count: [0, 1, 2, 4]
+      quiet_seconds: [0, 120, 600, 3600, 21600]
+    trials: 5
+    payloads: {replay: {seed_namespace: replay}}
+    sequence:
+      - {kind: invoke, id: prime, role: prime, payload: replay}
+      - kind: repeat
+        id: warmups
+        count: {dimension: warmup_count}
+        invoke: {kind: invoke, id: warmup, role: warmup, payload: replay}
+      - {kind: invoke, id: probe, role: probe, payload: replay, after_seconds: {dimension: quiet_seconds}}
+    runner:
+      benchmark: {model: glm-test}
+""",
+        encoding="utf-8",
+    )
+    arguments = Namespace(
+        file=str(plan), wait=False, poll_interval=0.01, timeout=None,
+        output=None, include_requests=False,
+    )
+    result = start_campaign(FakeClient(), arguments)
+
+    definition = result["task_definitions"][0]
+    assert definition["matrix"]["warmup_count"] == [0, 1, 2, 4]
+    assert definition["matrix"]["quiet_seconds"][-1] == 21600
 def test_campaign_export_status():
     class CampaignClient:
         def export_campaign(self, campaign_id, include_requests=False):

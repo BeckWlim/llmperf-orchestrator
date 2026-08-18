@@ -364,7 +364,7 @@ def print_campaign_status(document: Dict[str, Any]) -> None:
         f"Outcome: {_table_value(campaign.get('outcome'))}  "
         f"Runners: {_table_value(campaign.get('runner_count'), '0')}  "
         f"RunnerPlans: {_table_value(campaign.get('runner_plan_count'), '0')}  "
-        f"ProtocolInstances: {_table_value(campaign.get('protocol_instance_count'), '0')}  "
+        f"TaskInstances: {_table_value(campaign.get('task_instance_count'), '0')}  "
         f"Dispatches: {_table_value(campaign.get('dispatch_count'), '0')}"
     )
     print(
@@ -382,12 +382,12 @@ def print_campaign_status(document: Dict[str, Any]) -> None:
                 for status in ("active", "paused", "completed", "cancelled")
             )
         )
-    if campaign.get("protocol_instance_count"):
-        protocol_counts = campaign.get("protocol_instance_status_counts") or {}
+    if campaign.get("task_instance_count"):
+        task_counts = campaign.get("task_instance_status_counts") or {}
         print(
-            "Protocol instance states: "
+            "Task instance states: "
             + "  ".join(
-                f"{state}={_table_value(protocol_counts.get(state), '0')}"
+                f"{state}={_table_value(task_counts.get(state), '0')}"
                 for state in ("planned", "active", "completed", "failed", "cancelled")
             )
         )
@@ -862,16 +862,16 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
         raise ClientError("campaign.start file must define campaign.name")
     runners = plan.get("runners", [])
     runner_plans = plan.get("runner_plans", [])
-    protocol_definitions = plan.get("protocol_definitions", [])
+    task_definitions = plan.get("task_definitions", [])
     if not isinstance(runners, list):
         raise ClientError("campaign.start runners must be a list")
     if not isinstance(runner_plans, list):
         raise ClientError("campaign.start runner_plans must be a list")
-    if not isinstance(protocol_definitions, list):
-        raise ClientError("campaign.start protocol_definitions must be a list")
-    if not runners and not runner_plans and not protocol_definitions:
+    if not isinstance(task_definitions, list):
+        raise ClientError("campaign.start task_definitions must be a list")
+    if not runners and not runner_plans and not task_definitions:
         raise ClientError(
-            "campaign.start requires runners, runner_plans, or protocol_definitions"
+            "campaign.start requires runners, runner_plans, or task_definitions"
         )
     prepared_runners = []
     for index, runner in enumerate(runners):
@@ -884,9 +884,9 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
             raise ClientError(f"plan.runner_plans[{index}] must be a mapping")
         prepared_plans.append(dict(runner_plan))
     prepared_definitions = []
-    for index, definition in enumerate(protocol_definitions):
+    for index, definition in enumerate(task_definitions):
         if not isinstance(definition, dict):
-            raise ClientError(f"plan.protocol_definitions[{index}] must be a mapping")
+            raise ClientError(f"plan.task_definitions[{index}] must be a mapping")
         prepared_definitions.append(dict(definition))
     batch = submit_with_artifact_progress(
         lambda: client.start_campaign(
@@ -897,7 +897,7 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
     LOGGER.info("Campaign created: %s", campaign_id)
     created = batch["items"]
     created_plans = batch["runner_plans"]
-    created_definitions = batch.get("protocol_definitions", [])
+    created_definitions = batch.get("task_definitions", [])
     LOGGER.info("Submitted %d Runner(s) to Campaign %s", len(created), campaign_id)
     for runner in created:
         _log_runner_state(runner, 0)
@@ -909,7 +909,7 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
     for runner_plan in created_plans:
         _log_plan_state(runner_plan, "registered")
     LOGGER.info(
-        "Registered %d protocol definition(s) in Campaign %s",
+        "Registered %d task definition(s) in Campaign %s",
         len(created_definitions),
         campaign_id,
     )
@@ -917,7 +917,7 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
         "campaign_id": campaign_id,
         "runners": created,
         "runner_plans": created_plans,
-        "protocol_definitions": created_definitions,
+        "task_definitions": created_definitions,
     }
     should_wait = arguments.wait or bool(plan.get("wait"))
     if should_wait:

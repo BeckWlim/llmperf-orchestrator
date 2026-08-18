@@ -303,7 +303,7 @@ class LLMPerfClient:
         campaign: Dict[str, Any],
         runners: List[Dict[str, Any]],
         runner_plans: List[Dict[str, Any]],
-        protocol_definitions: Optional[List[Dict[str, Any]]] = None,
+        task_definitions: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         return self._request(
             "POST",
@@ -312,7 +312,7 @@ class LLMPerfClient:
                 "campaign": campaign,
                 "runners": runners,
                 "runner_plans": runner_plans,
-                "protocol_definitions": protocol_definitions or [],
+                "task_definitions": task_definitions or [],
             },
         )
 
