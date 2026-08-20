@@ -9,8 +9,9 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from llmperf import common_metrics
 from llmperf.common import RAY_ACTOR_CPUS_ENV
 from llmperf.utils import TOKENIZER_FAST, TOKENIZER_PATH
-from llmperf_backend.datasets import WORKER_DATASET_PATH
 from llmperf_backend.persistence import FAILED, SUCCEEDED
+
+WORKER_DATASET_PATH = "LLMPERF_DATASET_PATH"
 
 
 class _TailBuffer:
@@ -82,7 +83,7 @@ def _calculate(
                 f"{WORKER_DATASET_PATH} is required for dataset workloads"
             )
         prompt_dataset_source = PromptDatasetSource.external(
-            dataset["adapter"], dataset_path
+            dataset["adapter"], dataset_path, filename=dataset["filename"]
         )
     summary, requests = get_token_throughput_latencies(
         model=benchmark["model"],

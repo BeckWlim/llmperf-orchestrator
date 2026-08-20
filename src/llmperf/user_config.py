@@ -13,7 +13,8 @@ CONFIG_DIRECTORY_NAME = "llmperf"
 BACKEND_ENV_FILENAME = "backend.env"
 CLI_ENV_FILENAME = "cli.env"
 _NAME_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-_SENSITIVE_FRAGMENTS = ("KEY", "PASSWORD", "SECRET", "TOKEN")
+_SENSITIVE_FRAGMENTS = ("KEY", "PASSWORD", "PROXY", "SECRET", "TOKEN")
+_SENSITIVE_URL_NAMES = {"DATABASE_URL"}
 
 
 class UserConfigError(ValueError):
@@ -68,7 +69,7 @@ def display_environment_value(name: str, value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     upper_name = name.upper()
-    if upper_name == "DATABASE_URL" or any(
+    if upper_name in _SENSITIVE_URL_NAMES or any(
         fragment in upper_name for fragment in _SENSITIVE_FRAGMENTS
     ):
         return "<redacted>"

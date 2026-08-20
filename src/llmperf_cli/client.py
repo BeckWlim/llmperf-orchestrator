@@ -132,7 +132,10 @@ class LLMPerfClient:
         path: str,
         payload: Optional[Dict[str, Any]] = None,
         query: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+        timeout_option: str = "--request-timeout SECONDS",
     ) -> Any:
+        request_timeout_seconds = self.timeout if timeout is None else timeout
         url = f"{self.base_url}{path}"
         if query:
             filtered = {key: value for key, value in query.items() if value is not None}
@@ -172,7 +175,7 @@ class LLMPerfClient:
                 len(providers),
             )
             try:
-                with urlopen(request, timeout=self.timeout) as response:
+                with urlopen(request, timeout=request_timeout_seconds) as response:
                     content = response.read()
                     LOGGER.debug(
                         "HTTP request completed: method=%s path=%s status=%s "
@@ -232,10 +235,149 @@ class LLMPerfClient:
                 ) from exc
             except (TimeoutError, socket.timeout) as exc:
                 raise ClientError(
-                    f"Backend request timed out after {self.timeout:g} seconds "
+                    f"Backend request timed out after {request_timeout_seconds:g} "
+                    "seconds "
                     f"while waiting for {method} {path}. The backend may still be "
                     "processing it; inspect current state before retrying. Increase "
-                    "the limit with 'llmperfctl --request-timeout SECONDS ...'."
+                    f"the limit with {timeout_option}."
+                ) from exc
+            except URLError as exc:
+                raise ClientError(
+                    f"Unable to reach {self.base_url}: {exc.reason}"
+                ) from exc
+
+        raise ClientError("No authentication candidate completed the request")
+
+    def _stream_request(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        *,
+        timeout: float,
+        progress_callback: Callable[[Dict[str, Any]], None],
+    ) -> Dict[str, Any]:
+        """Consume one authenticated NDJSON operation with progress events."""
+
+        url = f"{self.base_url}{path}"
+        body = json.dumps(payload, default=_json_default).encode("utf-8")
+        headers = {
+            "Accept": "application/x-ndjson",
+            "Content-Type": "application/json",
+        }
+        providers: List[Optional[Callable[[], str]]]
+        if self.token_provider is not None:
+            providers = [self.token_provider]
+        elif self.token is not None:
+            providers = [lambda: self.token or ""]
+        elif self.token_providers:
+            providers = list(self.token_providers)
+        else:
+            providers = [None]
+
+        for index, provider in enumerate(providers):
+            attempt_headers = dict(headers)
+            token = provider() if provider is not None else None
+            if token:
+                attempt_headers["Authorization"] = f"Bearer {token}"
+            request = Request(url, data=body, headers=attempt_headers, method="POST")
+            started_at = monotonic()
+            try:
+                with urlopen(request, timeout=timeout) as response:
+                    for raw_line in response:
+                        if not isinstance(raw_line, bytes):
+                            raise ClientError(
+                                "Backend progress stream returned text data"
+                            )
+                        encoded_line = raw_line.strip()
+                        if not encoded_line:
+                            continue
+                        try:
+                            event = json.loads(encoded_line)
+                        except json.JSONDecodeError as exc:
+                            raise ClientError(
+                                "Backend progress stream returned invalid JSON"
+                            ) from exc
+                        if not isinstance(event, dict):
+                            raise ClientError(
+                                "Backend progress stream event must be an object"
+                            )
+                        event_name = event.get("event")
+                        if event_name == "heartbeat":
+                            progress_callback({"phase": "waiting"})
+                            continue
+                        if event_name == "progress":
+                            progress = event.get("progress")
+                            if not isinstance(progress, dict):
+                                raise ClientError(
+                                    "Backend progress event must contain an object"
+                                )
+                            progress_callback(progress)
+                            continue
+                        if event_name == "error":
+                            status_code = int(event.get("status_code") or 500)
+                            detail = event.get("detail", "Internal Server Error")
+                            raise ClientError(
+                                f"HTTP {status_code} for POST {path} after "
+                                f"{monotonic() - started_at:.3f}s\nBackend detail:\n"
+                                f"{_format_error_detail(detail)}",
+                                status_code=status_code,
+                                method="POST",
+                                path=path,
+                            )
+                        if event_name == "result":
+                            result = event.get("result")
+                            if not isinstance(result, dict):
+                                raise ClientError(
+                                    "Backend progress result must be an object"
+                                )
+                            if (
+                                self.token_provider is None
+                                and self.token is None
+                                and provider is not None
+                                and index > 0
+                            ):
+                                self.token_providers.remove(provider)
+                                self.token_providers.insert(0, provider)
+                            LOGGER.debug(
+                                "HTTP progress stream completed: path=%s elapsed=%.3fs",
+                                path,
+                                monotonic() - started_at,
+                            )
+                            return result
+                        raise ClientError(
+                            f"Backend progress stream returned unknown event: "
+                            f"{event_name!r}"
+                        )
+                    raise ClientError(
+                        "Backend progress stream ended without a result event"
+                    )
+            except HTTPError as exc:
+                content = exc.read().decode("utf-8", errors="replace")
+                try:
+                    error_document = json.loads(content)
+                    detail = (
+                        error_document.get("detail", error_document)
+                        if isinstance(error_document, dict)
+                        else error_document
+                    )
+                except json.JSONDecodeError:
+                    detail = content
+                if exc.code == 401 and index + 1 < len(providers):
+                    continue
+                raise ClientError(
+                    f"HTTP {exc.code} for POST {path} after "
+                    f"{monotonic() - started_at:.3f}s\nBackend detail:\n"
+                    f"{_format_error_detail(detail)}",
+                    status_code=exc.code,
+                    method="POST",
+                    path=path,
+                ) from exc
+            except (TimeoutError, socket.timeout) as exc:
+                raise ClientError(
+                    f"Backend request timed out after {timeout:g} seconds while "
+                    f"waiting for POST {path}. The backend may still be processing "
+                    "it; inspect current state before retrying. Increase the limit "
+                    "with --artifact-timeout SECONDS."
                 ) from exc
             except URLError as exc:
                 raise ClientError(
@@ -316,6 +458,66 @@ class LLMPerfClient:
                 "runners": runners,
                 "runner_plans": runner_plans,
                 "task_definitions": task_definitions or [],
+            },
+        )
+
+    def validate_campaign_artifacts(
+        self,
+        campaign: Dict[str, Any],
+        runners: List[Dict[str, Any]],
+        runner_plans: List[Dict[str, Any]],
+        task_definitions: Optional[List[Dict[str, Any]]] = None,
+        *,
+        timeout: float,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        payload = {
+            "version": PROTOCOL_VERSION,
+            "campaign": campaign,
+            "runners": runners,
+            "runner_plans": runner_plans,
+            "task_definitions": task_definitions or [],
+        }
+        if progress_callback is not None:
+            return self._stream_request(
+                "/api/v1/campaigns/validate-artifacts/stream",
+                payload,
+                timeout=timeout,
+                progress_callback=progress_callback,
+            )
+        return self._request(
+            "POST",
+            "/api/v1/campaigns/validate-artifacts",
+            payload,
+            timeout=timeout,
+            timeout_option="--artifact-timeout SECONDS",
+        )
+
+    def preview_campaign_tasks(
+        self,
+        campaign: Dict[str, Any],
+        runners: List[Dict[str, Any]],
+        runner_plans: List[Dict[str, Any]],
+        task_definitions: Optional[List[Dict[str, Any]]] = None,
+        *,
+        limit: int,
+        node_limit: int,
+        debug: bool,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v1/campaigns/preview",
+            {
+                "version": PROTOCOL_VERSION,
+                "campaign": campaign,
+                "runners": runners,
+                "runner_plans": runner_plans,
+                "task_definitions": task_definitions or [],
+            },
+            query={
+                "limit": limit,
+                "node_limit": node_limit,
+                "debug": str(debug).lower(),
             },
         )
 

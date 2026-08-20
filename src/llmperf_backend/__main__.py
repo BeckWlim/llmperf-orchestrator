@@ -6,8 +6,6 @@ import os
 import sys
 from typing import Any, Dict
 
-import uvicorn
-
 from llmperf.logging import configure_logging
 from llmperf.user_config import (
     UserConfigError,
@@ -18,6 +16,10 @@ from llmperf.user_config import (
     unset_environment_value,
 )
 from llmperf_backend.config import load_config
+from llmperf_backend.outbound import (
+    normalize_outbound_environment,
+    configure_ray_direct,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -115,6 +117,10 @@ def serve() -> None:
     """Load persistent settings and run the API service."""
 
     config = load_config()
+    normalize_outbound_environment(os.environ)
+    configure_ray_direct(os.environ)
+    import uvicorn
+
     configure_logging(
         config.server.log_level,
         color=os.environ.get("LLMPERF_LOG_COLOR", "auto").lower(),

@@ -10,23 +10,29 @@ wait: true
 
 task_definitions:
   - name: retention-surface
-    matrix:
-      delay_seconds: [0, 1]
-    trials: 1
-    seed: 11111
+    instances:
+      matrix:
+        delay_seconds: [0, 1]
+      trials: 1
+      seed: 11111
     payloads:
       replay: {seed_namespace: replay}
       cold: {seed_namespace: cold-control}
-    sequence:
-      - kind: invoke
-        id: prime
-        role: prime
-        payload: replay
-      - kind: parallel
-        after_seconds: {dimension: delay_seconds}
-        invokes:
-          - {kind: invoke, id: warm, role: warm, payload: replay}
-          - {kind: invoke, id: cold, role: cold_control, payload: cold}
+    workflow:
+      - invoke:
+          name: prime
+          payload: replay
+      - parallel:
+          name: observation
+          after_seconds: $delay_seconds
+          branches:
+            - invoke:
+                name: warm
+                payload: replay
+            - invoke:
+                name: cold
+                role: cold_control
+                payload: cold
     runner:
       label: retention-surface
       metadata: {purpose: cache-retention}

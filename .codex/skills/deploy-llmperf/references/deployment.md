@@ -64,6 +64,29 @@ Store Provider keys through `--stdin`; do not place secrets in the unit. Client
 `llmperfctl config` does not replace Backend configuration. Restart after non-Provider
 configuration changes and verify the loaded config path.
 
+Use `LLMPERF_PROXY` for a Backend-wide outbound proxy only when that proxy has complete
+Provider and artifact reachability and sufficient benchmark performance. Before importing
+HTTP clients, LLMPerf fills missing uppercase and lowercase `HTTP_PROXY`, `HTTPS_PROXY`,
+and `ALL_PROXY` aliases from this value, which covers Python clients and native `hf-xet`.
+`LLMPERF_NO_PROXY` similarly fills `NO_PROXY` and `no_proxy`. Explicit standard variables
+retain precedence. Backend-to-Ray gRPC is always direct: LLMPerf disables Ray's HTTP-proxy
+option before importing Ray, while Workers retain standard proxy variables for Provider
+traffic. The removed Hugging Face-only proxy field is not supported. Startup cache logs
+report Xet proxy mode without exposing proxy credentials.
+
+Before submitting a Campaign that references a large uncached dataset, materialize and
+verify it independently:
+
+```bash
+llmperfctl campaign validate -f campaign.yaml --artifact-timeout 3600
+```
+
+This performs a full on-disk read and SHA-256 validation without creating benchmark work;
+for datasets it also materializes the selected adapter's normalized Arrow index and reports
+the usable record count. Set `HF_DATASETS_CACHE` to a persistent writable directory shared
+by the Backend service user and local Ray Workers. Submit the Campaign only after validation
+reports `valid=true`.
+
 ## Foreground acceptance
 
 Before systemd installation, start from the repository root and verify health from another

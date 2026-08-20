@@ -140,6 +140,10 @@ def test_worker_environment():
     runtime = runtime_environment(
         {
             "OPENAI_API_KEY": "provider-key",
+            "HTTPS_PROXY": "http://proxy-user:proxy-password@proxy.internal:3128",
+            "NO_PROXY": "127.0.0.1,localhost",
+            "RAY_grpc_enable_http_proxy": "0",
+            "LLMPERF_PROXY": "must-not-propagate",
             "LLMPERF_PRIVATE_KEY": "must-not-propagate",
             "DATABASE_URL": "must-not-propagate",
             "LLMPERF_WORKER_RAY_ACTOR_CPUS": "0.5",
@@ -147,7 +151,13 @@ def test_worker_environment():
     )
 
     assert runtime["OPENAI_API_KEY"] == "provider-key"
+    assert runtime["HTTPS_PROXY"] == (
+        "http://proxy-user:proxy-password@proxy.internal:3128"
+    )
+    assert runtime["NO_PROXY"] == "127.0.0.1,localhost"
+    assert runtime["RAY_grpc_enable_http_proxy"] == "0"
     assert runtime["LLMPERF_WORKER_RAY_ACTOR_CPUS"] == "0.5"
+    assert "LLMPERF_PROXY" not in runtime
     assert "LLMPERF_PRIVATE_KEY" not in runtime
     assert "DATABASE_URL" not in runtime
 

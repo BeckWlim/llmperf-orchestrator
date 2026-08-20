@@ -20,6 +20,8 @@ def test_operation_skill():
         ".codex/skills/operate-llmperf/SKILL.md",
         ".codex/skills/operate-llmperf/references/yaml.md",
         ".codex/skills/operate-llmperf/references/engineering.md",
+        ".codex/skills/operate-llmperf/references/io.md",
+        ".codex/skills/operate-llmperf/references/cli.md",
     )
 
     assert "task_definitions" in text
@@ -27,6 +29,11 @@ def test_operation_skill():
     assert "single-request Runner" in text
     assert "Planner only handles" in text
     assert "prompt_hash" in text
+    assert "CLIProjection" in text
+    assert "whitelist projector" in text
+    assert "completed_bytes/total_bytes" in text
+    assert "without a progress bar" in text
+    assert "tqdm bar" not in text
     assert not any(name in text for name in OLD_RUNTIME_NAMES)
 
 

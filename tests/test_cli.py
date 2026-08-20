@@ -2,7 +2,8 @@
 
 from argparse import Namespace
 from datetime import datetime, timezone
-from io import BytesIO
+from email.message import Message
+from io import BytesIO, StringIO
 import json
 import logging
 import socket
@@ -13,6 +14,7 @@ import pytest
 from urllib.error import HTTPError
 
 from llmperf_cli.__main__ import (
+    ArtifactDownloadRenderer,
     _has_unsuccessful_runner,
     _validate_campaign_list,
     _validate_runner_list,
@@ -24,10 +26,12 @@ from llmperf_cli.__main__ import (
     print_runner_logs,
     print_runner_summary,
     print_runner_table,
+    preview_campaign_tasks,
     project_health,
     render_result,
     start_campaign,
     summarize_runner,
+    validate_campaign_artifacts,
     wait_for_campaign,
     wait_for_runners,
 )
@@ -36,10 +40,19 @@ from llmperf_cli.client import ClientError, LLMPerfClient
 from llmperf_cli.projections import adapt_cli_response, registered_routes
 
 
-class FakeClient:
+class StubClient(LLMPerfClient):
+    """Concrete no-I/O base whose inherited methods satisfy the CLI boundary."""
+
+    def __init__(self) -> None:
+        pass
+
+
+class FakeClient(StubClient):
     def __init__(self):
         self.payloads = []
         self.plan_payloads = []
+        self.artifact_timeout = None
+        self.preview_request = None
 
     def start_runner(self, payload):
         self.payloads.append(payload)
@@ -76,9 +89,139 @@ class FakeClient:
             )
         return {
             "campaign": {"campaign_id": "campaign-1"},
+            "summary": {
+                "immediate_runners": len(payloads),
+                "runner_plans": len(plans),
+                "task_definitions": len(task_definitions or []),
+                "task_instances": 0,
+                "task_nodes": 0,
+            },
             "items": payloads,
             "runner_plans": plans,
             "task_definitions": task_definitions or [],
+        }
+
+    def validate_campaign_artifacts(
+        self,
+        campaign,
+        runners,
+        runner_plans,
+        task_definitions=None,
+        *,
+        timeout,
+        progress_callback=None,
+    ):
+        self.artifact_timeout = timeout
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "kind": "dataset",
+                    "repository_id": "organization/sharegpt",
+                    "filename": "sharegpt.json",
+                    "phase": "download",
+                    "completed_bytes": 512,
+                    "total_bytes": 1024,
+                }
+            )
+        return {
+            "version": "1.0.0",
+            "valid": True,
+            "campaign": campaign["name"],
+            "workload": {
+                "immediate_runners": len(runners),
+                "runner_plans": len(runner_plans),
+                "task_definitions": len(task_definitions or []),
+                "task_instances": 2,
+                "task_nodes": 4,
+            },
+            "artifacts": [
+                {
+                    "kind": "dataset",
+                    "repository_id": "organization/sharegpt",
+                    "filename": "sharegpt.json",
+                    "revision": "a" * 40,
+                    "immutable_revision": True,
+                    "cache_hit": True,
+                    "file_count": 1,
+                    "size_bytes": 1024,
+                    "sha256": "b" * 64,
+                    "adapter": "sharegpt-user",
+                    "record_count": 58820,
+                    "path": "/must/not/render",
+                }
+            ],
+        }
+
+    def preview_campaign_tasks(
+        self,
+        campaign,
+        runners,
+        runner_plans,
+        task_definitions=None,
+        *,
+        limit,
+        node_limit,
+        debug,
+    ):
+        self.preview_request = {
+            "campaign": campaign,
+            "runners": runners,
+            "runner_plans": runner_plans,
+            "task_definitions": task_definitions or [],
+            "limit": limit,
+            "node_limit": node_limit,
+            "debug": debug,
+        }
+        return {
+            "version": "1.0.0",
+            "valid": True,
+            "campaign": campaign["name"],
+            "debug": debug,
+            "summary": {
+                "immediate_runners": len(runners),
+                "runner_plans": len(runner_plans),
+                "task_definitions": len(task_definitions or []),
+                "task_instances": 2,
+                "task_nodes": 4,
+                "previewed_instances": 1,
+            },
+            "task_definitions": [
+                {
+                    "name": "cache-window",
+                    "instance_count": 2,
+                    "node_count": 4,
+                    "shown_instance_count": 1,
+                    "truncated_instance_count": 1,
+                    "instances": [
+                        {
+                            "instance_key": "delay=5;trial=0",
+                            "dimensions": {"delay": 5},
+                            "trial_index": 0,
+                            "node_count": 2,
+                            "shown_node_count": 2,
+                            "truncated_node_count": 0,
+                            "nodes": [
+                                {
+                                    "node_id": "prime",
+                                    "dependencies": [],
+                                    "after_seconds": 0,
+                                    "role": "prime",
+                                    "payload_id": "prompt",
+                                    "payload_seed": 123,
+                                },
+                                {
+                                    "node_id": "probe",
+                                    "dependencies": ["prime"],
+                                    "after_seconds": 5,
+                                    "role": "probe",
+                                    "payload_id": "prompt",
+                                    "payload_seed": 123,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
         }
 
 
@@ -109,8 +252,204 @@ runners:
     result = start_campaign(client, arguments)
 
     assert result["campaign_id"] == "campaign-1"
+    assert result["summary"]["immediate_runners"] == 1
     assert result["runners"][0]["runner_id"] == "runner-1"
     assert client.payloads[0]["campaign_id"] == "campaign-1"
+
+
+def test_task_start_counts(tmp_path, caplog):
+    class ExpandedTaskClient(FakeClient):
+        def start_campaign(
+            self, campaign, runners, runner_plans, task_definitions=None
+        ):
+            response = super().start_campaign(
+                campaign, runners, runner_plans, task_definitions
+            )
+            response["summary"] = {
+                "immediate_runners": 0,
+                "runner_plans": 0,
+                "task_definitions": 1,
+                "task_instances": 135,
+                "task_nodes": 405,
+            }
+            return response
+
+    plan = tmp_path / "task.yaml"
+    plan.write_text(
+        """
+version: "1.0.0"
+campaign:
+  name: glm-study
+task_definitions:
+  - name: retention
+    instances:
+      trials: 1
+    payloads:
+      replay: {seed_namespace: replay}
+    workflow:
+      - invoke: {name: prime, payload: replay}
+    runner: {}
+""",
+        encoding="utf-8",
+    )
+    arguments = Namespace(
+        file=str(plan),
+        wait=False,
+        poll_interval=0.01,
+        timeout=None,
+        output=None,
+        include_requests=False,
+    )
+    caplog.set_level(logging.INFO, logger="llmperfctl")
+
+    result = start_campaign(ExpandedTaskClient(), arguments)
+
+    assert result["summary"] == {
+        "immediate_runners": 0,
+        "runner_plans": 0,
+        "task_definitions": 1,
+        "task_instances": 135,
+        "task_nodes": 405,
+    }
+    assert (
+        "Campaign workload registered: immediate_runners=0 runner_plans=0 "
+        "task_definitions=1 task_instances=135 task_nodes=405" in caplog.messages
+    )
+    assert not any("Submitted 0 Runner(s)" in message for message in caplog.messages)
+
+
+def test_campaign_validate(tmp_path, capsys, caplog):
+    plan = tmp_path / "plan.yaml"
+    plan.write_text(
+        """
+version: "1.0.0"
+campaign:
+  name: artifact-study
+runners:
+  - benchmark:
+      model: glm-test
+""",
+        encoding="utf-8",
+    )
+    arguments = build_parser().parse_args(
+        [
+            "campaign",
+            "validate",
+            "-f",
+            str(plan),
+            "--artifact-timeout",
+            "900",
+        ]
+    )
+    client = FakeClient()
+    caplog.set_level(logging.INFO, logger="llmperfctl")
+
+    result = validate_campaign_artifacts(client, arguments)
+    render_result(adapt_cli_response(arguments, result))
+    captured = capsys.readouterr()
+    output = captured.out
+
+    assert client.artifact_timeout == 900
+    assert result["valid"] is True
+    assert "Campaign: artifact-study  Valid: True  Artifacts: 1" in output
+    assert (
+        "Workload: immediate_runners=1 plans=0 definitions=0 "
+        "instances=2 nodes=4" in output
+    )
+    assert "organization/sharegpt/sharegpt.json" in output
+    assert "cache_hit=True" in output
+    assert "adapter=sharegpt-user" in output
+    assert "records=58820" in output
+    assert "/must/not/render" not in output
+    assert (
+        "Backend artifact bytes: kind=dataset "
+        "repository=organization/sharegpt filename=sharegpt.json phase=download "
+        "completed_bytes=512 total_bytes=1024" in caplog.messages
+    )
+    assert "\r" not in captured.err
+
+
+def test_artifact_dynamic_bytes():
+    class TerminalBuffer(StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    terminal = TerminalBuffer()
+    with ArtifactDownloadRenderer(stream=terminal) as renderer:
+        renderer.update(
+            {
+                "kind": "dataset",
+                "repository_id": "organization/corpus",
+                "filename": "data.parquet",
+                "phase": "download",
+                "completed_bytes": 1024,
+                "total_bytes": 4096,
+            }
+        )
+        renderer.update(
+            {
+                "kind": "dataset",
+                "repository_id": "organization/corpus",
+                "filename": "data.parquet",
+                "phase": "download",
+                "completed_bytes": 4096,
+                "total_bytes": 4096,
+            }
+        )
+
+    rendered = terminal.getvalue()
+    assert "\rArtifact download: dataset organization/corpus/data.parquet" in rendered
+    assert "downloaded=1,024/4,096 bytes" in rendered
+    assert "downloaded=4,096/4,096 bytes" in rendered
+    assert rendered.endswith("\n")
+
+
+def test_campaign_preview_debug(tmp_path, capsys):
+    plan = tmp_path / "preview.yaml"
+    plan.write_text(
+        """
+version: "1.0.0"
+campaign:
+  name: preview-study
+task_definitions:
+  - name: cache-window
+    instances:
+      matrix:
+        delay: [5, 10]
+      trials: 1
+    payloads:
+      prompt:
+        seed_namespace: prompt
+    workflow:
+      - invoke:
+          name: prime
+          payload: prompt
+    runner: {}
+""",
+        encoding="utf-8",
+    )
+    client = FakeClient()
+    arguments = build_parser().parse_args(
+        ["campaign", "preview", "-f", str(plan), "--limit", "1", "--debug"]
+    )
+
+    result = preview_campaign_tasks(client, arguments)
+    render_result(adapt_cli_response(arguments, result))
+
+    output = capsys.readouterr().out
+    assert client.preview_request is not None
+    assert client.preview_request["limit"] == 1
+    assert client.preview_request["node_limit"] == 100
+    assert client.preview_request["debug"] is True
+    assert (
+        "Workload: immediate_runners=0 plans=0 definitions=1 "
+        "instances=2 nodes=4" in output
+    )
+    assert "Task: cache-window  instances=2 nodes=4" in output
+    assert "* [prime]" in output
+    assert "[prime] --> [probe]" in output
+    assert "debug: payload_seed=123" in output
+    assert "... 1 more instance(s)" in output
 
 
 def test_planned_campaign(tmp_path):
@@ -160,8 +499,9 @@ campaign:
   name: glm-study
 task_definitions:
   - name: retention
-    matrix: {delay: [0, 60, 300]}
-    trials: 2
+    instances:
+      matrix: {delay: [0, 60, 300]}
+      trials: 2
     payloads: {replay: {seed_namespace: replay}}
     sequence:
       - {kind: invoke, id: prime, role: prime, payload: replay}
@@ -181,7 +521,11 @@ task_definitions:
     )
     result = start_campaign(FakeClient(), arguments)
 
-    assert result["task_definitions"][0]["matrix"]["delay"] == [0, 60, 300]
+    assert result["task_definitions"][0]["instances"]["matrix"]["delay"] == [
+        0,
+        60,
+        300,
+    ]
 
 
 def test_residency_campaign(tmp_path):
@@ -193,7 +537,8 @@ campaign:
   name: glm-study
 task_definitions:
   - name: residency
-    matrix: {observations: [24]}
+    instances:
+      matrix: {observations: [24]}
     payloads: {replay: {seed_namespace: replay}}
     sequence:
       - {kind: invoke, id: prime, role: prime, payload: replay}
@@ -219,7 +564,7 @@ task_definitions:
 
     definition = result["task_definitions"][0]
     assert definition["sequence"][1]["kind"] == "repeat"
-    assert definition["matrix"]["observations"] == [24]
+    assert definition["instances"]["matrix"]["observations"] == [24]
 
 
 def test_promotion_campaign(tmp_path):
@@ -231,10 +576,11 @@ campaign:
   name: glm-study
 task_definitions:
   - name: repeat-dose
-    matrix:
-      warmup_count: [0, 1, 2, 4]
-      quiet_seconds: [0, 120, 600, 3600, 21600]
-    trials: 5
+    instances:
+      matrix:
+        warmup_count: [0, 1, 2, 4]
+        quiet_seconds: [0, 120, 600, 3600, 21600]
+      trials: 5
     payloads: {replay: {seed_namespace: replay}}
     sequence:
       - {kind: invoke, id: prime, role: prime, payload: replay}
@@ -259,12 +605,12 @@ task_definitions:
     result = start_campaign(FakeClient(), arguments)
 
     definition = result["task_definitions"][0]
-    assert definition["matrix"]["warmup_count"] == [0, 1, 2, 4]
-    assert definition["matrix"]["quiet_seconds"][-1] == 21600
+    assert definition["instances"]["matrix"]["warmup_count"] == [0, 1, 2, 4]
+    assert definition["instances"]["matrix"]["quiet_seconds"][-1] == 21600
 
 
 def test_campaign_export_status():
-    class CampaignClient:
+    class CampaignClient(StubClient):
         def export_campaign(self, campaign_id, include_requests=False):
             return {
                 "campaign": {"campaign_id": campaign_id},
@@ -345,7 +691,7 @@ def test_key_fallback(monkeypatch):
                 request.full_url,
                 401,
                 "Unauthorized",
-                None,
+                Message(),
                 BytesIO(b'{"detail":"invalid key"}'),
             )
         return _FakeResponse({"items": []})
@@ -374,7 +720,7 @@ def test_forbidden_key(monkeypatch):
             request.full_url,
             403,
             "Forbidden",
-            None,
+            Message(),
             BytesIO(b'{"detail":"superuser access required"}'),
         )
 
@@ -461,7 +807,7 @@ ARG_CASES = [
     pytest.param(
         {
             "argv": ["scheduler", "status"],
-            "expected": {"scheduler_command": "status"},
+            "expected": {"scheduler_command": "status", "json": False},
         },
         id="scheduler-status",
     ),
@@ -511,6 +857,19 @@ ARG_CASES = [
             "expected": {"limit": 50, "offset": 0, "json": False},
         },
         id="campaign-list-defaults",
+    ),
+    pytest.param(
+        {
+            "argv": ["campaign", "preview", "-f", "campaign.yaml"],
+            "expected": {
+                "campaign_command": "preview",
+                "limit": 20,
+                "node_limit": 100,
+                "debug": False,
+                "json": False,
+            },
+        },
+        id="campaign-preview-defaults",
     ),
     pytest.param(
         {
@@ -635,11 +994,32 @@ def test_campaign_list_table(capsys):
                 "outcome": "succeeded",
                 "runner_count": 2,
                 "runner_plan_count": 1,
+                "task_instance_count": 3,
+                "dispatch_count": 6,
                 "status_counts": {
                     "queued": 0,
                     "running": 0,
                     "succeeded": 2,
                     "failed": 0,
+                    "cancelled": 0,
+                },
+                "runner_plan_status_counts": {
+                    "active": 0,
+                    "paused": 0,
+                    "completed": 1,
+                    "cancelled": 0,
+                },
+                "task_instance_status_counts": {
+                    "planned": 0,
+                    "active": 0,
+                    "completed": 3,
+                    "failed": 0,
+                    "cancelled": 0,
+                },
+                "dispatch_status_counts": {
+                    "blocked": 0,
+                    "pending": 0,
+                    "emitted": 6,
                     "cancelled": 0,
                 },
                 "created_at": "2026-08-12T09:48:00.000000Z",
@@ -660,13 +1040,14 @@ def test_campaign_list_table(capsys):
     assert "succeeded" in output
     assert "cc895606-89d4-4562-811d-2e12a1e1a7de" in output
     assert "0/0/2/0/0" in output
-    assert "2/1" in output
+    assert "RUN/PLAN/TASK/DISP" in output
+    assert "2/1/3/6" in output
     assert "deepseek-v4-pro-kvcac" in output
     assert "must not be rendered" not in output
 
 
 def test_campaign_status_view(capsys):
-    class CampaignClient:
+    class CampaignClient(StubClient):
         def get_campaign(self, campaign_id):
             return {
                 "campaign_id": campaign_id,
@@ -688,9 +1069,31 @@ def test_campaign_status_view(capsys):
                     "completed": 1,
                     "cancelled": 0,
                 },
+                "task_instance_count": 1,
+                "task_instance_status_counts": {
+                    "planned": 0,
+                    "active": 0,
+                    "completed": 1,
+                    "failed": 0,
+                    "cancelled": 0,
+                },
+                "dispatch_count": 2,
+                "dispatch_status_counts": {
+                    "blocked": 0,
+                    "pending": 0,
+                    "emitted": 2,
+                    "cancelled": 0,
+                },
             }
 
-        def list_runners(self, status, limit, offset, full=False, campaign_id=None):
+        def list_runners(
+            self,
+            status=None,
+            limit=20,
+            offset=0,
+            full=False,
+            campaign_id=None,
+        ):
             assert status is None
             assert limit == 200
             assert offset == 0
@@ -820,7 +1223,18 @@ def test_action_output(capsys):
     )
 
     projection = adapt_cli_response(
-        arguments, {"campaign_id": "campaign-1", "large": [1, 2, 3]}
+        arguments,
+        {
+            "campaign_id": "campaign-1",
+            "summary": {
+                "immediate_runners": 0,
+                "runner_plans": 0,
+                "task_definitions": 1,
+                "task_instances": 135,
+                "task_nodes": 405,
+            },
+            "large": [1, 2, 3],
+        },
     )
     render_result(projection)
 
@@ -867,7 +1281,7 @@ def test_health_projection(capsys):
     assert "config_source" not in output
     assert "must-not-project" not in str(projected)
 
-    class HealthClient:
+    class HealthClient(StubClient):
         def health(self):
             return raw
 
@@ -891,7 +1305,7 @@ def test_status_projection(capsys):
         "stdout": "must not be rendered",
     }
 
-    class RunnerClient:
+    class RunnerClient(StubClient):
         def get_runner(self, runner_id):
             assert runner_id == "runner-1"
             return raw
@@ -914,6 +1328,79 @@ def test_status_projection(capsys):
     assert "summary" not in json_output
 
 
+def test_scheduler_projection(capsys):
+    raw = {
+        "scheduler_id": "scheduler-1",
+        "status": "running",
+        "max_concurrent_runners": 4,
+        "live_slots": 4,
+        "busy_slots": 2,
+        "worker_kind": "ray_task",
+        "active_workers": 2,
+        "ray_mode": "local",
+        "ray_address": "ray://must-not-render:10001",
+        "ray_actor_num_cpus": 1,
+        "ray_runtime": {
+            "status": "healthy",
+            "alive_nodes": 1,
+            "object_store_available_ratio": 0.9964756816625595,
+            "claim_blocked": False,
+            "cluster_resources": {"CPU": 8, "node:private": 1},
+        },
+        "performance_guard": {
+            "enabled": True,
+            "tripped": False,
+            "host_memory": {
+                "available": True,
+                "utilization": 0.44273800488308934,
+                "private": "must-not-render",
+            },
+        },
+    }
+
+    class SchedulerClient(LLMPerfClient):
+        def get_scheduler_status(self):
+            return raw
+
+    client = SchedulerClient("http://unused")
+    arguments = build_parser().parse_args(["scheduler", "status"])
+    result = execute(client, arguments)
+    projection = adapt_cli_response(arguments, result)
+    render_result(projection)
+    default_output = capsys.readouterr().out
+
+    assert projection.renderer == "scheduler_status"
+    assert "Scheduler: scheduler-1  Status: running" in default_output
+    assert "Capacity: busy=2 live=4 max=4 workers=2" in default_output
+    assert (
+        "Ray: status=healthy nodes=1 object_store_available=99.65% "
+        "claim_blocked=False" in default_output
+    )
+    assert (
+        "Guard: enabled=True tripped=False memory_utilization=44.27%" in default_output
+    )
+    assert "ray://must-not-render" not in default_output
+    assert "node:private" not in default_output
+
+    arguments = build_parser().parse_args(["scheduler", "status", "--json"])
+    result = execute(client, arguments)
+    projection = adapt_cli_response(arguments, result)
+    render_result(projection)
+    json_output = json.loads(capsys.readouterr().out)
+
+    assert projection.renderer == "json"
+    assert json_output["scheduler_id"] == "scheduler-1"
+    assert (
+        json_output["ray_runtime"]["object_store_available_ratio"] == 0.9964756816625595
+    )
+    assert (
+        json_output["performance_guard"]["host_memory"]["utilization"]
+        == 0.44273800488308934
+    )
+    assert json_output["ray_runtime"]["cluster_resources"] == {"CPU": 8}
+    assert "ray_address" not in json_output
+
+
 def test_adapter_route_registry():
     assert set(registered_routes()) == {
         "auth.add",
@@ -923,8 +1410,10 @@ def test_adapter_route_registry():
         "campaign.cancel",
         "campaign.export",
         "campaign.list",
+        "campaign.preview",
         "campaign.start",
         "campaign.status",
+        "campaign.validate",
         "config.get",
         "config.list",
         "config.path",
@@ -1060,6 +1549,140 @@ def test_datetime_payload(monkeypatch):
     assert captured["runner_plans"][0]["starts_at"] == "2026-08-14T00:00:00+00:00"
 
 
+def test_artifact_timeout(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return _FakeResponse(
+            {
+                "version": "1.0.0",
+                "valid": True,
+                "campaign": "validated",
+                "workload": {},
+                "artifacts": [],
+            }
+        )
+
+    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    client = LLMPerfClient("http://127.0.0.1:8000", timeout=120)
+
+    client.validate_campaign_artifacts(
+        {"name": "validated"},
+        [{}],
+        [],
+        timeout=900,
+    )
+
+    assert captured == {
+        "url": "http://127.0.0.1:8000/api/v1/campaigns/validate-artifacts",
+        "timeout": 900,
+    }
+
+
+def test_artifact_progress(monkeypatch):
+    captured = {}
+    progress_events = []
+    streamed_events = [
+        {
+            "event": "progress",
+            "progress": {
+                "kind": "dataset",
+                "repository_id": "organization/corpus",
+                "filename": "data.parquet",
+                "phase": "download",
+                "completed_bytes": 1024,
+                "total_bytes": 4096,
+            },
+        },
+        {"event": "heartbeat"},
+        {
+            "event": "result",
+            "result": {
+                "version": "1.0.0",
+                "valid": True,
+                "campaign": "validated",
+                "workload": {},
+                "artifacts": [],
+            },
+        },
+    ]
+
+    class FakeStreamResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exception_type, exception, traceback):
+            return False
+
+        def __iter__(self):
+            return iter(
+                json.dumps(event).encode("utf-8") + b"\n" for event in streamed_events
+            )
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return FakeStreamResponse()
+
+    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    client = LLMPerfClient("http://127.0.0.1:8000", timeout=120)
+
+    result = client.validate_campaign_artifacts(
+        {"name": "validated"},
+        [{}],
+        [],
+        timeout=900,
+        progress_callback=progress_events.append,
+    )
+
+    assert result["valid"] is True
+    assert captured == {
+        "url": ("http://127.0.0.1:8000/api/v1/campaigns/" "validate-artifacts/stream"),
+        "timeout": 900,
+    }
+    assert progress_events == [streamed_events[0]["progress"], {"phase": "waiting"}]
+
+
+def test_preview_client_query(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["payload"] = json.loads(request.data)
+        return _FakeResponse(
+            {
+                "version": "1.0.0",
+                "valid": True,
+                "campaign": "preview-study",
+                "debug": True,
+                "summary": {},
+                "task_definitions": [],
+            }
+        )
+
+    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    client = LLMPerfClient("http://127.0.0.1:8000")
+
+    client.preview_campaign_tasks(
+        {"name": "preview-study"},
+        [],
+        [],
+        [{"name": "task"}],
+        limit=7,
+        node_limit=33,
+        debug=True,
+    )
+
+    assert captured["url"] == (
+        "http://127.0.0.1:8000/api/v1/campaigns/preview?"
+        "limit=7&node_limit=33&debug=true"
+    )
+    assert captured["payload"]["version"] == "1.0.0"
+    assert captured["payload"]["task_definitions"] == [{"name": "task"}]
+
+
 def test_provider_encoding(monkeypatch):
     requested_urls = []
     requested_methods = []
@@ -1149,12 +1772,15 @@ def test_request_timeout(monkeypatch):
 
 
 def test_http_detail(monkeypatch):
+    response_headers = Message()
+    response_headers["X-Request-ID"] = "request-123"
+
     def fake_urlopen(request, timeout):
         raise HTTPError(
             request.full_url,
             422,
             "Unprocessable Entity",
-            {"X-Request-ID": "request-123"},
+            response_headers,
             BytesIO(
                 json.dumps(
                     {
@@ -1195,7 +1821,7 @@ def test_http_detail(monkeypatch):
 
 
 def test_wait_summary(caplog):
-    class FailedRunnerClient:
+    class FailedRunnerClient(StubClient):
         def get_runner(self, runner_id):
             return {
                 "runner_id": runner_id,
@@ -1268,7 +1894,7 @@ def test_wait_summary(caplog):
 
 
 def test_campaign_wait_logs(caplog):
-    class CampaignClient:
+    class CampaignClient(StubClient):
         def __init__(self):
             self.index = -1
             self.campaigns = [
@@ -1298,13 +1924,38 @@ def test_campaign_wait_logs(caplog):
                     "completed": int(plan_status == "completed"),
                     "cancelled": 0,
                 },
+                "task_instance_count": 1,
+                "task_instance_status_counts": {
+                    "planned": int(status == "planned"),
+                    "active": int(status == "running"),
+                    "completed": int(status == "completed"),
+                    "failed": 0,
+                    "cancelled": 0,
+                },
+                "dispatch_count": 2,
+                "dispatch_status_counts": {
+                    "blocked": int(status == "planned"),
+                    "pending": 0,
+                    "emitted": 2 - int(status == "planned"),
+                    "cancelled": 0,
+                },
             }
 
         def get_campaign(self, campaign_id):
             self.index += 1
             return self.campaigns[self.index]
 
-        def list_runner_plans(self, **kwargs):
+        def list_runner_plans(
+            self,
+            status=None,
+            campaign_id=None,
+            limit=50,
+            offset=0,
+        ):
+            assert status is None
+            assert campaign_id == "campaign-1"
+            assert limit == 200
+            assert offset == 0
             completed = self.index == 2
             return {
                 "items": [
@@ -1320,7 +1971,19 @@ def test_campaign_wait_logs(caplog):
                 ]
             }
 
-        def list_runners(self, **kwargs):
+        def list_runners(
+            self,
+            status=None,
+            limit=20,
+            offset=0,
+            full=False,
+            campaign_id=None,
+        ):
+            assert status is None
+            assert campaign_id == "campaign-1"
+            assert limit == 200
+            assert offset == 0
+            assert full is False
             if self.index == 0:
                 return {"items": []}
             succeeded = self.index == 2
@@ -1352,6 +2015,8 @@ def test_campaign_wait_logs(caplog):
     assert result["outcome"] == "succeeded"
     assert "status=planned" in caplog.text
     assert "runners=1 [queued=0 running=1" in caplog.text
+    assert "task_instances=1 [planned=0 active=1" in caplog.text
+    assert "dispatches=2 [blocked=0 pending=0 emitted=2" in caplog.text
     assert "RunnerPlan plan-1 updated" in caplog.text
     assert "occurrence=2 emitted=2" in caplog.text
     assert "Runner runner-1 status: running" in caplog.text
@@ -1364,7 +2029,7 @@ def test_campaign_wait_logs(caplog):
 
 
 def test_wait_runner_reconnect():
-    class SucceededRunnerClient:
+    class SucceededRunnerClient(StubClient):
         def get_runner(self, runner_id):
             return {
                 "runner_id": runner_id,

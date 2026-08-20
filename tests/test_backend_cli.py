@@ -11,7 +11,7 @@ from llmperf.user_config import (
     read_environment_file,
 )
 from llmperf_backend.__main__ import build_parser, execute_config
-from llmperf_backend.environment import (
+from llmperf_backend.config import (
     load_environment,
     load_provider_environment,
     resolve_environment_path,
@@ -55,6 +55,22 @@ def test_config_crud(tmp_path, monkeypatch):
     }
     assert execute_config(_arguments("unset", "LLMPERF_SERVER_HOST"))["removed"] is True
     assert "LLMPERF_SERVER_HOST" not in read_environment_file(path)
+
+
+def test_proxy_redaction(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    proxy_url = "http://proxy-user:proxy-password@proxy.internal:3128"
+
+    configured = execute_config(_arguments("set", "LLMPERF_PROXY", proxy_url))
+    fetched = execute_config(_arguments("get", "LLMPERF_PROXY"))
+    listed = execute_config(_arguments("list"))
+
+    assert configured["value"] == "<redacted>"
+    assert fetched["value"] == "<redacted>"
+    assert listed["items"] == {"LLMPERF_PROXY": "<redacted>"}
+    assert read_environment_file(backend_environment_path()) == {
+        "LLMPERF_PROXY": proxy_url
+    }
 
 
 def test_provider_scope(tmp_path):

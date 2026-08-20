@@ -2,8 +2,9 @@
 
 ## Architecture boundaries
 
-- `models.py`: strict API/YAML models and configuration constraints.
-- `task_compiler.py`: bounded matrix/repeat/parallel expansion into atomic invoke DAGs.
+- `models.py`: strict general API/YAML models and configuration constraints.
+- `task_compiler.py`: task-specific Pydantic AST, `BaseNode` hierarchy, bounded workflow
+  expansion, UUID-free compilation table, and runtime assembly.
 - `persistence.py`: PostgreSQL transactions, queues, task state, aggregation, and export.
 - `planner.py`: materialize due RunnerPlan or Dispatch work as ordinary Runners.
 - `scheduler.py`: claim queued Runners and supervise Worker handles.

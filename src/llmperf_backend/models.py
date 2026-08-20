@@ -1,8 +1,7 @@
 """Validated request and configuration models used by the backend."""
 
 from datetime import datetime, time
-from itertools import product
-from typing import Annotated, Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -11,6 +10,9 @@ from llmperf.prompt_datasets import (
     validate_external_dataset_adapter,
 )
 from llmperf.version import PROTOCOL_VERSION, ProtocolVersion
+from llmperf_backend.task_compiler import (
+    TaskDefinitionCreate as CompilerTaskDefinitionCreate,
+)
 
 DEFAULT_TOKENIZER_ID = "hf-internal-testing/llama-tokenizer"
 
@@ -321,6 +323,9 @@ class BenchmarkRunnerSpec(StrictModel):
     label: Optional[str] = Field(default=None, min_length=1, max_length=200)
 
 
+TaskDefinitionCreate = CompilerTaskDefinitionCreate[BenchmarkRunnerSpec]
+
+
 class BenchmarkRunnerCreate(BenchmarkRunnerSpec):
     """Start one Runner, optionally attached to a Campaign."""
 
@@ -333,161 +338,6 @@ class BenchmarkRunnerBatchCreate(StrictModel):
 
     version: ProtocolVersion = PROTOCOL_VERSION
     runners: List[BenchmarkRunnerSpec] = Field(min_length=1, max_length=100)
-
-
-class DimensionReference(StrictModel):
-    dimension: str = Field(min_length=1, max_length=64)
-
-
-TaskValue = Union[int, DimensionReference]
-
-
-class TaskPayloadSpec(StrictModel):
-    seed_namespace: str = Field(min_length=1, max_length=64)
-
-
-class InvokeStep(StrictModel):
-    kind: Literal["invoke"] = "invoke"
-    id: str = Field(min_length=1, max_length=64)
-    role: str = Field(min_length=1, max_length=64)
-    payload: str = Field(min_length=1, max_length=64)
-    after_seconds: TaskValue = 0
-
-
-class RepeatStep(StrictModel):
-    kind: Literal["repeat"] = "repeat"
-    id: str = Field(min_length=1, max_length=64)
-    count: TaskValue
-    interval_seconds: TaskValue = 0
-    invoke: InvokeStep
-
-
-class ParallelStep(StrictModel):
-    kind: Literal["parallel"] = "parallel"
-    after_seconds: TaskValue = 0
-    invokes: List[InvokeStep] = Field(min_length=1, max_length=100)
-
-
-TaskStep = Annotated[
-    Union[InvokeStep, RepeatStep, ParallelStep], Field(discriminator="kind")
-]
-
-
-class TaskDefinitionCreate(StrictModel):
-    """A finite compile-time recipe that expands into atomic invoke nodes."""
-
-    name: str = Field(min_length=1, max_length=200)
-    matrix: Dict[str, List[int]] = Field(default_factory=dict)
-    trials: int = Field(default=1, ge=1, le=1_000)
-    seed: int = Field(default=11111, ge=0, le=2_147_483_647)
-    payloads: Dict[str, TaskPayloadSpec] = Field(min_length=1, max_length=100)
-    sequence: List[TaskStep] = Field(min_length=1, max_length=100)
-    runner: BenchmarkRunnerSpec
-
-    @model_validator(mode="after")
-    def validate_graph(self) -> "TaskDefinitionCreate":
-        for name, values in self.matrix.items():
-            if not name or len(name) > 64:
-                raise ValueError("task matrix dimension names must contain 1-64 chars")
-            if not values or len(values) > 100:
-                raise ValueError("task matrix dimensions require 1-100 values")
-            if len(set(values)) != len(values):
-                raise ValueError("task matrix dimension values must be unique")
-        step_ids: List[str] = []
-        for step in self.sequence:
-            if isinstance(step, InvokeStep):
-                invokes = [step]
-                step_ids.append(step.id)
-            elif isinstance(step, RepeatStep):
-                invokes = [step.invoke]
-                step_ids.extend([step.id, step.invoke.id])
-            else:
-                invokes = step.invokes
-                step_ids.extend(item.id for item in invokes)
-            for invoke in invokes:
-                if invoke.payload not in self.payloads:
-                    raise ValueError(
-                        f"task invoke {invoke.id} references unknown payload "
-                        f"{invoke.payload}"
-                    )
-            values_to_check = (
-                [step.after_seconds]
-                if isinstance(step, InvokeStep)
-                else (
-                    [
-                        step.count,
-                        step.interval_seconds,
-                        step.invoke.after_seconds,
-                    ]
-                    if isinstance(step, RepeatStep)
-                    else [
-                        step.after_seconds,
-                        *(invoke.after_seconds for invoke in step.invokes),
-                    ]
-                )
-            )
-            for value in values_to_check:
-                if (
-                    isinstance(value, DimensionReference)
-                    and value.dimension not in self.matrix
-                ):
-                    raise ValueError(
-                        f"task expression references unknown dimension {value.dimension}"
-                    )
-        if len(step_ids) != len(set(step_ids)):
-            raise ValueError("task step IDs must be unique")
-        combinations = 1
-        for values in self.matrix.values():
-            combinations *= len(values)
-        if combinations * self.trials > 10_000:
-            raise ValueError("task definition cannot exceed 10000 instances")
-
-        dimension_names = sorted(self.matrix)
-        matrix_values = (
-            product(*(self.matrix[name] for name in dimension_names))
-            if dimension_names
-            else [()]
-        )
-        for coordinate in matrix_values:
-            dimensions = dict(zip(dimension_names, coordinate))
-
-            def resolve(value: TaskValue) -> int:
-                if isinstance(value, DimensionReference):
-                    return int(dimensions[value.dimension])
-                return int(value)
-
-            planned_span = 0
-            for step in self.sequence:
-                if isinstance(step, InvokeStep):
-                    delay = resolve(step.after_seconds)
-                elif isinstance(step, RepeatStep):
-                    count = resolve(step.count)
-                    interval = resolve(step.interval_seconds)
-                    node_delay = resolve(step.invoke.after_seconds)
-                    if not 0 <= count <= 100:
-                        raise ValueError(
-                            "expanded repeat count must be between 0 and 100"
-                        )
-                    if interval < 0 or node_delay < 0:
-                        raise ValueError("task delays cannot be negative")
-                    delay = count * (interval + node_delay)
-                else:
-                    parallel_delay = resolve(step.after_seconds)
-                    child_delays = [
-                        resolve(item.after_seconds) for item in step.invokes
-                    ]
-                    if parallel_delay < 0 or any(item < 0 for item in child_delays):
-                        raise ValueError("task delays cannot be negative")
-                    delay = parallel_delay + max(child_delays)
-                if delay < 0:
-                    raise ValueError("task delays cannot be negative")
-                planned_span += delay
-                if planned_span > 21_600:
-                    raise ValueError("task planned span cannot exceed six hours")
-        if self.runner.benchmark is not None:
-            if self.runner.benchmark.cache_probe is not None:
-                raise ValueError("compiled task runner cannot define cache_probe")
-        return self
 
 
 class RunnerPlanRecurrence(StrictModel):
@@ -604,10 +454,12 @@ class BenchmarkCampaignStart(StrictModel):
             raise ValueError("campaign workload cannot contain more than 100 items")
         instance_count = 0
         for definition in self.task_definitions:
-            combinations = 1
-            for values in definition.matrix.values():
-                combinations *= len(values)
-            instance_count += combinations * definition.trials
+            instance_count += definition.instance_count
+            if (
+                definition.runner.benchmark is not None
+                and definition.runner.benchmark.cache_probe is not None
+            ):
+                raise ValueError("compiled task runner cannot define cache_probe")
         if instance_count > 10_000:
             raise ValueError("campaign tasks cannot exceed 10000 total instances")
         return self

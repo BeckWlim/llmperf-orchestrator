@@ -1,4 +1,4 @@
-"""Safe YAML loading and atomic configuration reloads."""
+"""Backend environment loading, YAML validation, and atomic configuration state."""
 
 import copy
 import os
@@ -7,23 +7,95 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
+from dotenv import load_dotenv
 import yaml
 from pydantic import ValidationError
 
-from llmperf_backend.environment import load_environment
+from llmperf.user_config import backend_environment_path, read_environment_file
 from llmperf_backend.models import AppConfig, dump_model, validate_app_config
 
 CONFIG_PATH = "LLMPERF_BACKEND_CONFIG"
+ENV_FILE = "LLMPERF_ENV_FILE"
+PROVIDER_PREFIX = "LLMPERF_PROVIDER_"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "default.yaml"
 _ENV_PATTERN = re.compile(
     r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::-(?P<default>[^}]*))?\}"
 )
 
+# Capture the real process environment before dotenv values are added. Provider
+# reloads can then preserve exported-value precedence without retaining stale file
+# values from an older version of the environment file.
+_PROCESS_ENVIRONMENT = dict(os.environ)
+
 
 class ConfigError(ValueError):
     """Raised when a YAML configuration cannot be loaded or validated."""
+
+
+def resolve_environment_path(path: Optional[Path] = None) -> Path:
+    """Resolve an explicit path, override, or canonical user config path."""
+
+    if path is not None:
+        environment_path = Path(path)
+        return environment_path.expanduser().resolve()
+    configured_path = os.environ.get(ENV_FILE)
+    if configured_path:
+        environment_path = Path(configured_path)
+        return environment_path.expanduser().resolve()
+    return backend_environment_path()
+
+
+def load_environment(
+    path: Optional[Path] = None,
+    *,
+    override: bool = False,
+) -> Optional[Path]:
+    """Load the optional Backend dotenv file with explicit-path validation."""
+
+    environment_path = resolve_environment_path(path)
+    explicitly_selected = path is not None or bool(os.environ.get(ENV_FILE))
+    if not environment_path.is_file():
+        if explicitly_selected:
+            raise RuntimeError(f"Environment file does not exist: {environment_path}")
+        return None
+    load_dotenv(dotenv_path=environment_path, override=override)
+    return environment_path
+
+
+def load_provider_environment(
+    path: Optional[Path] = None,
+    *,
+    process_environment: Optional[Mapping[str, str]] = None,
+) -> Dict[str, str]:
+    """Read reloadable Provider-only settings with process-value precedence."""
+
+    environment_path = resolve_environment_path(path)
+    explicitly_selected = path is not None or bool(os.environ.get(ENV_FILE))
+    if not environment_path.is_file():
+        if explicitly_selected:
+            raise RuntimeError(f"Environment file does not exist: {environment_path}")
+        file_values: Mapping[str, str] = {}
+    else:
+        file_values = read_environment_file(environment_path)
+
+    effective_environment = {
+        name: value
+        for name, value in file_values.items()
+        if name.startswith(PROVIDER_PREFIX)
+    }
+    process_values = (
+        _PROCESS_ENVIRONMENT if process_environment is None else process_environment
+    )
+    effective_environment.update(
+        {
+            name: value
+            for name, value in process_values.items()
+            if name.startswith(PROVIDER_PREFIX)
+        }
+    )
+    return effective_environment
 
 
 def _expand_environment(value: Any) -> Any:
@@ -76,7 +148,8 @@ def resolve_config_path(path: Optional[Path] = None) -> Path:
     # retain precedence because dotenv loading uses override=False.
     load_environment()
     if path is not None:
-        return Path(path).expanduser().resolve()
+        config_path = Path(path)
+        return config_path.expanduser().resolve()
     configured_path = os.environ.get(CONFIG_PATH)
     if configured_path:
         return Path(configured_path).expanduser().resolve()

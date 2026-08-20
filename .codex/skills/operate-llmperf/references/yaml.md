@@ -46,7 +46,7 @@ benchmark:
     id: organization/sharegpt
     filename: sharegpt.json
     revision: 0123456789abcdef0123456789abcdef01234567
-    adapter: sharegpt
+    adapter: sharegpt-user
   dataset_prompt_mode: concatenate
   dataset_repeat_count: 1
   dataset_seed: 11111
@@ -56,12 +56,19 @@ benchmark:
     temperature: 0
 ```
 
-`dataset.adapter` is required and independent from artifact `source`. Use `sharegpt` for
-`conversations[0].value` JSON arrays or `text` for one non-empty prompt per line. Omit
-`dataset` to select the bundled `src/llmperf/sonnet.txt` adapter. Bundled and external
-adapters are normalized into indexed text records, then pass through the same seeded
-construction and evidence pipeline. In `sample` mode, intact records must already fit the
-requested token range.
+`dataset.adapter` is required and independent from artifact `source`. Use
+`sharegpt-user` for a user-input corpus: it accepts only `conversations[0]` entries whose
+normalized `from` role is `human` or `user`. The legacy `sharegpt` adapter accepts any
+non-empty first conversation value. Use `document-text` when every non-empty Parquet or
+Arrow `text` row is one complete document, including FineWeb-family artifacts. Use `text`
+for one non-empty prompt per text-file line. ShareGPT adapters support JSON, Parquet, and
+Arrow artifacts; `document-text` supports Parquet and Arrow; `text` supports text files.
+External adapters normalize through Hugging Face Datasets into a persistent Arrow-backed
+index, then pass through the same seeded construction and evidence pipeline. LLMPerf
+incrementally materializes ShareGPT JSON arrays and JSONL because the upstream builder
+fully reads array inputs; Parquet, Arrow, and text use their standard builders. Omit
+`dataset` to select the bundled `src/llmperf/sonnet.txt` adapter. In `sample` mode, intact
+records must already fit the requested token range.
 `concatenate` deterministically shuffles first turns, consumes each record once before
 cycling, joins diverse records, and truncates only the final segment to the requested token
 budget. Concatenation requires `dataset_repeat_count: 1`; exact repetition belongs in a
@@ -80,37 +87,51 @@ fields. They are not part of submitted YAML, and unknown fields are rejected.
 ```yaml
 task_definitions:
   - name: repeated-hit-surface
-    matrix:
-      warmup_count: [0, 1, 2, 4]
-      quiet_seconds: [0, 60, 300]
-    trials: 8
-    seed: 20260818
+    instances:
+      matrix:
+        warmup_count: [0, 1, 2, 4]
+        quiet_seconds: [0, 60, 300]
+      trials: 8
+      seed: 20260818
     payloads:
       replay: {seed_namespace: replay}
       cold: {seed_namespace: cold-control}
-    sequence:
-      - {kind: invoke, id: prime, role: prime, payload: replay}
-      - kind: repeat
-        id: warmups
-        count: {dimension: warmup_count}
-        interval_seconds: 0
-        invoke: {kind: invoke, id: warmup, role: warmup, payload: replay}
-      - kind: parallel
-        after_seconds: {dimension: quiet_seconds}
-        invokes:
-          - {kind: invoke, id: probe, role: probe, payload: replay}
-          - {kind: invoke, id: cold, role: cold_control, payload: cold}
+    workflow:
+      - invoke:
+          name: prime
+          payload: replay
+      - repeat:
+          name: warmups
+          count: $warmup_count
+          every_seconds: 0
+          node:
+            invoke:
+              name: warmup
+              payload: replay
+      - parallel:
+          name: observation
+          after_seconds: $quiet_seconds
+          branches:
+            - invoke:
+                name: probe
+                payload: replay
+            - invoke:
+                name: cold
+                role: cold_control
+                payload: cold
     runner:
       label: repeated-hit-surface
       metadata: {purpose: repeated-cache-hit}
-      benchmark: {}
 ```
 
 ### Matrix and trials
 
-`matrix` is a Cartesian product of named integer dimensions. `trials` creates independent
-samples at every coordinate. A scalar task value can be a literal integer or
-`{dimension: name}`.
+`instances` owns every independent expansion dimension. `instances.matrix` is a Cartesian
+product of named integer dimensions, and `instances.trials` creates independent samples at
+every coordinate. `instances.seed` controls deterministic payload families. A scalar task
+value can be a literal integer or a readable `$dimension_name` reference. Flat top-level
+`matrix`, `trials`, and `seed` fields are invalid. `instances` is one object rather than a
+list; its plural name describes the generated TaskInstance set.
 
 The compiler and performance guard account for expanded nodes, not YAML line count:
 
@@ -119,46 +140,74 @@ instances = product(matrix dimension sizes) × trials
 requests  = sum(expanded invoke nodes across instances)
 ```
 
-### Atomic invoke
+### Workflow and atomic invoke
+
+`workflow` is an implicit top-level sequence. Every list entry is a one-key primitive
+mapping, so the YAML hierarchy mirrors the compiler node hierarchy.
 
 ```yaml
-- kind: invoke
-  id: warm
-  role: warm
-  payload: replay
-  after_seconds: {dimension: delay_seconds}
+- invoke:
+    name: warm
+    payload: replay
+    after_seconds: $delay_seconds
 ```
 
-- `id` is topology identity within an instance.
-- `role` is free-form analysis metadata; it cannot alter scheduling.
+- `name` contributes to the stable logical node path within an instance.
+- `role` is optional and defaults to `name`; it is analysis metadata only.
 - `payload` references a declared logical payload.
 - `after_seconds` starts after every dependency completes.
 
 ### Repeat
 
 ```yaml
-- kind: repeat
-  id: observations
-  count: {dimension: observation_count}
-  interval_seconds: {dimension: interval_seconds}
-  invoke: {kind: invoke, id: warm, role: warm, payload: replay}
+- repeat:
+    name: observations
+    count: $observation_count
+    every_seconds: $interval_seconds
+    node:
+      invoke:
+        name: warm
+        payload: replay
 ```
 
-Repeat expands to a serial chain. Count may be zero and is bounded at compile time. Never
-encode an unbounded runtime loop.
+Repeat expands its nested node to a serial chain. The nested node may itself be a sequence,
+parallel group, or repeat. Count may be zero and is bounded at compile time. Never encode
+an unbounded runtime loop.
 
 ### Parallel and join
 
 ```yaml
-- kind: parallel
-  after_seconds: 300
-  invokes:
-    - {kind: invoke, id: probe, role: probe, payload: replay}
-    - {kind: invoke, id: cold, role: cold_control, payload: cold}
+- parallel:
+    name: observation
+    after_seconds: 300
+    branches:
+      - invoke:
+          name: probe
+          payload: replay
+      - invoke:
+          name: cold
+          role: cold_control
+          payload: cold
 ```
 
-All siblings share the incoming dependency frontier. The next sequence step waits for all
-siblings, forming an implicit join.
+All branches share the incoming dependency frontier. Each branch may be any primitive. The
+next workflow step waits for every outgoing branch frontier, forming an implicit join.
+
+### Nested sequence
+
+Use `sequence` when one parallel or repeated branch needs multiple ordered operations:
+
+```yaml
+- sequence:
+    name: verification
+    steps:
+      - invoke: {name: first, payload: replay}
+      - invoke: {name: second, payload: replay}
+```
+
+Expanded node IDs are hierarchical, for example `observation.verification.first` and
+`observations.2.warm`. UUIDs are assigned only after the logical compilation table is
+complete; they are not part of task authoring or graph semantics.
 
 ## Deterministic random payloads
 
@@ -169,7 +218,7 @@ global task seed + sorted matrix coordinates + trial index + payload seed_namesp
 ```
 
 Use cases include bundled-sonnet prompt families, deterministic sampling or concatenation
-from an immutable ShareGPT artifact, and independent controls. Reusing one payload ID in
+from an immutable external artifact, and independent controls. Reusing one payload ID in
 Prime/Warm/Probe guarantees the same derived seed; different namespace or trial produces an
 independent value. Persistence compares both the actual `prompt_hash` and the dataset
 selection evidence on every replay and fails closed on mismatch.
@@ -192,7 +241,7 @@ Repeated-hit behavior: matrix on warmup count and quiet window, Prime, Repeat Wa
 delayed Probe/Cold. Compare warmup counts only at like-for-like quiet windows.
 
 Multi-Provider comparison: submit one task definition per resolved Provider/model template
-using identical matrix, trials, seed namespaces, token shape, and sequence. Provider identity
+using identical matrix, trials, seed namespaces, token shape, and workflow. Provider identity
 is a cohort dimension, not a compiler condition.
 
 ## Safety checklist

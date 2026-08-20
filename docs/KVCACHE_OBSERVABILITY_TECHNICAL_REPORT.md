@@ -73,8 +73,8 @@ available. Do not infer a global Provider TTL from one short local probe.
 
 ## Cross-Runner task graphs
 
-Long waits and repeated access use `task_definitions`. Workload Compiler lowers matrix,
-sequence, repeat, and parallel syntax into atomic single-request Runner nodes. Planner only
+Long waits and repeated access use `task_definitions`. Workload Compiler lowers a typed
+matrix/workflow node tree into atomic single-request Runner nodes. Planner only
 handles dependencies and due times.
 
 ### Deterministic random payloads

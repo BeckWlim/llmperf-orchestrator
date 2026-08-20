@@ -11,8 +11,8 @@ from llmperf_backend.config import ConfigStore
 from llmperf_backend.models import DatabaseConfig
 from llmperf_backend.persistence import Base, Database
 from llmperf_backend.providers import ProviderRegistry
-from llmperf_backend.tokenizers import TokenizerResolution
-from llmperf_backend.datasets import DatasetResolution
+from llmperf_backend.artifacts import DatasetResolution
+from llmperf_backend.artifacts import TokenizerResolution
 
 CONFIG = """
 version: "1.0.0"
@@ -434,6 +434,60 @@ def test_atomic_campaign_start(client_factory):
         assert planned_status["runner_plan_count"] == 1
 
 
+def test_preview_persistence_free(client_factory):
+    payload = {
+        "campaign": {"name": "preview-study"},
+        "task_definitions": [
+            {
+                "name": "cache-window",
+                "instances": {
+                    "matrix": {"delay": [5, 10]},
+                    "trials": 2,
+                    "seed": 7,
+                },
+                "payloads": {"prompt": {"seed_namespace": "prompt"}},
+                "workflow": [
+                    {"invoke": {"name": "prime", "payload": "prompt"}},
+                    {
+                        "invoke": {
+                            "name": "probe",
+                            "payload": "prompt",
+                            "after_seconds": "$delay",
+                        }
+                    },
+                ],
+                "runner": {},
+            }
+        ],
+    }
+
+    with client_factory() as client:
+        preview = client.post(
+            "/api/v1/campaigns/preview?limit=2&debug=true",
+            json=payload,
+        )
+        campaigns = client.get("/api/v1/campaigns")
+
+    assert preview.status_code == 200
+    document = preview.json()
+    assert document["valid"] is True
+    assert document["summary"] == {
+        "immediate_runners": 0,
+        "runner_plans": 0,
+        "task_definitions": 1,
+        "task_instances": 4,
+        "task_nodes": 8,
+        "previewed_instances": 2,
+    }
+    definition = document["task_definitions"][0]
+    assert definition["shown_instance_count"] == 2
+    assert definition["truncated_instance_count"] == 2
+    assert definition["instances"][0]["nodes"][1]["dependencies"] == ["prime"]
+    assert definition["instances"][0]["nodes"][1]["after_seconds"] == 5
+    assert "payload_seed" in definition["instances"][0]["nodes"][0]
+    assert campaigns.json()["items"] == []
+
+
 def test_compiled_dataset(tmp_path: Path, client_factory):
     tokenizer_directory = tmp_path / "tokenizer"
     tokenizer_directory.mkdir()
@@ -483,14 +537,26 @@ def test_compiled_dataset(tmp_path: Path, client_factory):
                 "task_definitions": [task],
             },
         )
+        assert accepted.status_code == 202
+        campaign_id = accepted.json()["campaign"]["campaign_id"]
+        campaign_status = client.get(f"/api/v1/campaigns/{campaign_id}")
 
-    assert accepted.status_code == 202
     assert (
         accepted.json()["task_definitions"][0]["runner"]["benchmark"][
             "dataset_prompt_mode"
         ]
         == "concatenate"
     )
+    assert accepted.json()["summary"] == {
+        "immediate_runners": 0,
+        "runner_plans": 0,
+        "task_definitions": 1,
+        "task_instances": 1,
+        "task_nodes": 1,
+    }
+    assert campaign_status.status_code == 200
+    assert campaign_status.json()["task_instance_count"] == 1
+    assert campaign_status.json()["dispatch_count"] == 1
 
     mutable_cache = FakeDatasetCache(dataset_path, revision="main")
     with client_factory(

@@ -59,9 +59,10 @@ and persisted before results are exported as JSON or professional HTML reports.
   Runner fan-out, Provider requests, token budget, and effective concurrency.
 - **Reproducible experiments** — Provider/model selections, benchmark parameters,
   and immutable tokenizer and dataset revisions are frozen into every Runner.
-- **Composable workload input** — a bounded Workload Compiler expands matrix,
-  sequence, repeat, and parallel YAML into atomic invoke DAGs. It is an input-layer
-  component; Planner remains responsible for durable due-work materialization.
+- **Composable workload input** — a bounded Workload Compiler maps readable `workflow`
+  primitives to an immutable node hierarchy, expands a UUID-free logical DAG table, and
+  assembles atomic invokes only at the persistence boundary. Planner remains responsible
+  for durable due-work materialization.
 - **Secret isolation** — endpoints and credentials live in Backend-owned Provider
   Profiles and never need to appear in workload YAML or exported reports.
 - **KV-cache evidence, not guesses** — deterministic prime/warm pairs, normalized
@@ -196,8 +197,27 @@ Preview and submit the bounded two-round RunnerPlan example:
 llmperfctl planner preview -f examples/example-runner-plan.yaml
 .venv/bin/python .codex/skills/operate-llmperf/scripts/validate_workload.py \
   examples/example-runner-plan.yaml --scheduler-slots 1
+llmperfctl campaign preview -f examples/example-cache-promotion.yaml --debug
+llmperfctl campaign validate -f examples/example-runner-plan.yaml \
+  --artifact-timeout 3600
 llmperfctl campaign start -f examples/example-runner-plan.yaml
 ```
+
+`campaign validate` resolves every Backend-owned tokenizer and dataset, then fully reads
+and SHA-256 hashes the materialized cache files without creating benchmark work. Dataset
+validation also runs the selected adapter, materializes its normalized Hugging Face Arrow
+index, and reports the usable record count. Use it before `campaign start` for large
+uncached ShareGPT or tokenizer artifacts; the dedicated artifact timeout does not change
+the normal Backend request timeout. During uncached downloads, the Backend streams
+path-free absolute byte counts and heartbeats. On a terminal, `llmperfctl` dynamically
+refreshes one downloaded/total byte counter without drawing a progress bar; for redirected
+stderr it writes one structured byte record per event. Projected text/JSON on stdout is
+never contaminated.
+
+`campaign preview` performs Backend-authoritative schema validation and TaskCompiler
+expansion without downloading artifacts or writing database records. It renders a bounded
+ASCII dependency view by default; use `--limit`, `--node-limit`, `--debug`, or `--json` for
+more instances, more nodes per instance, deterministic payload seeds, or structured output.
 
 Copy the returned `campaign_id`, then inspect the Campaign and its Runners:
 
@@ -249,23 +269,36 @@ Workload YAML selects stable Provider and model IDs only. Provider URLs, keys,
 artifact caches, and service settings belong to the Backend configuration.
 
 `task_definitions` is compile-time composition, not a second scheduler. The compiler
-expands a finite `matrix`/`sequence`/`repeat`/`parallel` recipe into single-request
+expands finite `instances.matrix` coordinates and `instances.trials` plus typed `workflow`
+primitives into single-request
 `invoke` nodes. Reusing one logical payload produces deterministic random input from
-the task seed, matrix coordinates, trial index, and payload namespace; runtime
+`instances.seed`, matrix coordinates, trial index, and payload namespace; runtime
 `prompt_hash` validation proves Prime/Warm replay identity. Planner sees only generic
 dependencies and due times and never branches on role or experiment names.
+See [`docs/TASK_COMPILER_ARCHITECTURE.md`](docs/TASK_COMPILER_ARCHITECTURE.md) for the
+Pydantic AST, `BaseNode` hierarchy, compilation-table IR, and UUID assembly boundary.
 
 Large-context workloads can use Backend-resolved Hugging Face artifacts instead of
 expanding the small bundled sonnet corpus. Artifact location and record schema are separate:
 `source: huggingface` resolves the immutable file, while the required `adapter` selects a
-prompt-record decoder. `sharegpt` extracts `conversations[0].value`; `text` treats each
-non-empty line as one prompt. The bundled sonnet is another explicit adapter, not an
-implicit ShareGPT fallback. All adapters feed the same indexed-record loading, seeded
-construction, and evidence pipeline. Set `dataset_prompt_mode: sample` to benchmark intact
-records, or `concatenate` to assemble diverse records to the requested token budget without
-reusing a record until the corpus is exhausted. A new seeded cycle begins only after
-exhaustion. Dataset-backed compiled tasks require an immutable resolved dataset revision and
-persist text-free selection evidence in addition to the prompt hash.
+prompt-record decoder. `sharegpt` preserves the legacy behavior of accepting any non-empty
+`conversations[0].value`; `sharegpt-user` accepts only first turns whose normalized `from`
+role is `human` or `user`; `document-text` treats every non-empty Parquet or Arrow `text`
+row as one complete document; `text` treats each non-empty text-file line as one prompt.
+External files are normalized into a disk-backed Hugging Face Arrow index. ShareGPT JSON
+arrays and JSONL files are incrementally parsed because the upstream builder fully reads
+top-level arrays; Parquet, Arrow, and text continue through the standard builders. Prompt
+selection shuffles integer row positions and reads text lazily instead of constructing an
+in-memory copy of the corpus. Set `HF_DATASETS_CACHE` to choose the persistent Arrow cache
+directory.
+
+The bundled sonnet is another explicit adapter, not an implicit ShareGPT fallback. All
+adapters feed the same seeded construction and evidence pipeline. Set
+`dataset_prompt_mode: sample` to benchmark intact records, or `concatenate` to assemble
+diverse records to the requested token budget without reusing a record until the corpus is
+exhausted. A new seeded cycle begins only after exhaustion. Dataset-backed compiled tasks
+require an immutable resolved dataset revision and persist text-free selection evidence in
+addition to the prompt hash.
 
 ## Operational essentials
 

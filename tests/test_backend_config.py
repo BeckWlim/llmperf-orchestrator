@@ -15,7 +15,7 @@ from llmperf_backend.config import (
     load_config,
     load_config_text,
 )
-from llmperf_backend.environment import load_environment
+from llmperf_backend.config import load_environment
 from llmperf_backend.models import (
     AppConfig,
     BenchmarkConfig,
@@ -81,6 +81,16 @@ def test_dataset_prompt_modes():
     )
     assert text_benchmark.dataset is not None
     assert text_benchmark.dataset.adapter == "text"
+
+    document_benchmark = BenchmarkConfig(
+        provider="test",
+        model="model",
+        dataset=DatasetSpec.model_validate(
+            {**dataset_document, "adapter": "document-text"}
+        ),
+    )
+    assert document_benchmark.dataset is not None
+    assert document_benchmark.dataset.adapter == "document-text"
 
     with pytest.raises(ValueError, match="extra_forbidden"):
         BenchmarkConfig.model_validate(
@@ -211,8 +221,10 @@ def test_campaign_workload():
             "task_definitions": [
                 {
                     "name": "replay",
-                    "matrix": {"delay": [0, 60], "hits": [0, 2]},
-                    "trials": 2,
+                    "instances": {
+                        "matrix": {"delay": [0, 60], "hits": [0, 2]},
+                        "trials": 2,
+                    },
                     "payloads": {
                         "replay": {"seed_namespace": "replay"},
                         "cold": {"seed_namespace": "cold"},
@@ -260,8 +272,8 @@ def test_campaign_workload():
         }
     )
     definition = compiled.task_definitions[0]
-    assert definition.matrix["delay"] == [0, 60]
-    assert definition.trials == 2
+    assert definition.instances.matrix["delay"] == [0, 60]
+    assert definition.instances.trials == 2
 
     with pytest.raises(ValueError, match="unknown payload"):
         BenchmarkCampaignStart.model_validate(

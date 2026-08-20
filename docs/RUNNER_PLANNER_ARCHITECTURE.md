@@ -26,8 +26,9 @@ Control plane:
 Workload Compiler:
 
 - expands finite matrix/trial combinations;
-- lowers sequence, repeat, and parallel syntax into atomic invoke nodes;
+- lowers typed workflow nodes into a UUID-free logical compilation table;
 - derives deterministic payload seeds;
+- assembles runtime UUID dependencies only after expansion is complete;
 - persists generic dependencies and delays.
 
 Planner:
@@ -83,7 +84,9 @@ child.due_at = max(dependency actual completion) + child.after_seconds
 ```
 
 Each node uses the complete dependency list rather than a single parent field. Parallel
-siblings share an incoming frontier, and the next sequential node depends on all siblings.
+branches share an incoming frontier, and the next workflow node depends on every outgoing
+branch frontier. Compiler topology uses stable logical node paths; Dispatch UUIDs are
+introduced only during final assembly.
 
 In 1.0 this is deliberately an all-success completion policy. Optional predecessors,
 quorum joins, continue-on-error edges, and observation-conditioned activation are not

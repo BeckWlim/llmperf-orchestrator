@@ -34,11 +34,24 @@ def test_workload_costs():
     }
     retention = {
         "definition": {
-            "matrix": {"delay": [0, 60]},
-            "trials": 2,
-            "sequence": [
-                {"kind": "invoke"},
-                {"kind": "parallel", "invokes": [{}, {}]},
+            "name": "retention",
+            "instances": {
+                "matrix": {"delay": [0, 60]},
+                "trials": 2,
+            },
+            "payloads": {"replay": {"seed_namespace": "replay"}},
+            "workflow": [
+                {"invoke": {"name": "prime", "payload": "replay"}},
+                {
+                    "parallel": {
+                        "name": "observation",
+                        "after_seconds": "$delay",
+                        "branches": [
+                            {"invoke": {"name": "warm", "payload": "replay"}},
+                            {"invoke": {"name": "cold", "payload": "replay"}},
+                        ],
+                    }
+                },
             ],
         },
         "runner_template": {"benchmark": BENCHMARK},
@@ -63,15 +76,31 @@ def test_workload_costs():
 def test_promotion_costs():
     promotion = {
         "definition": {
-            "matrix": {"warmups": [0, 2, 4], "quiet": [60, 300]},
-            "trials": 2,
-            "sequence": [
-                {"kind": "invoke"},
+            "name": "promotion",
+            "instances": {
+                "matrix": {"warmups": [0, 2, 4], "quiet": [60, 300]},
+                "trials": 2,
+            },
+            "payloads": {"replay": {"seed_namespace": "replay"}},
+            "workflow": [
+                {"invoke": {"name": "prime", "payload": "replay"}},
                 {
-                    "kind": "repeat",
-                    "count": {"dimension": "warmups"},
+                    "repeat": {
+                        "name": "warmups",
+                        "count": "$warmups",
+                        "node": {"invoke": {"name": "warm", "payload": "replay"}},
+                    }
                 },
-                {"kind": "parallel", "invokes": [{}, {}]},
+                {
+                    "parallel": {
+                        "name": "observation",
+                        "after_seconds": "$quiet",
+                        "branches": [
+                            {"invoke": {"name": "probe", "payload": "replay"}},
+                            {"invoke": {"name": "cold", "payload": "replay"}},
+                        ],
+                    }
+                },
             ],
         },
         "runner_template": {"benchmark": BENCHMARK},
@@ -90,6 +119,28 @@ def test_promotion_costs():
     assert result["metrics"]["planned_runners"] == 60
     assert result["metrics"]["provider_requests"] == 60
     assert result["metrics"]["token_budget"] == 7_200
+
+
+def test_embedded_task_runner():
+    task_definition = {
+        "name": "embedded-runner",
+        "instances": {"trials": 2},
+        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "workflow": [{"invoke": {"name": "prime", "payload": "replay"}}],
+        "runner": {"benchmark": BENCHMARK},
+    }
+
+    result = assess_workload(
+        [],
+        [],
+        [{"definition": task_definition, "runner_template": {"benchmark": BENCHMARK}}],
+        PerformanceGuardConfig(),
+        scheduler_slots=1,
+        now=NOW,
+    )
+
+    assert result["metrics"]["planned_runners"] == 2
+    assert result["metrics"]["provider_requests"] == 2
 
 
 def test_workload_rejection():
@@ -145,6 +196,4 @@ def test_ray_capacity():
             now=NOW,
         )
 
-    assert captured.value.assessment["risks"][0]["code"] == (
-        "ray_actor_demand_limit"
-    )
+    assert captured.value.assessment["risks"][0]["code"] == ("ray_actor_demand_limit")

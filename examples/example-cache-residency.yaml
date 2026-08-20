@@ -10,20 +10,26 @@ wait: true
 
 task_definitions:
   - name: residency-chain
-    matrix:
-      observation_count: [2]
-      interval_seconds: [1]
-    trials: 1
-    seed: 22222
+    instances:
+      matrix:
+        observation_count: [2]
+        interval_seconds: [1]
+      trials: 1
+      seed: 22222
     payloads:
       replay: {seed_namespace: replay}
-    sequence:
-      - {kind: invoke, id: prime, role: prime, payload: replay}
-      - kind: repeat
-        id: observations
-        count: {dimension: observation_count}
-        interval_seconds: {dimension: interval_seconds}
-        invoke: {kind: invoke, id: warm, role: warm, payload: replay}
+    workflow:
+      - invoke:
+          name: prime
+          payload: replay
+      - repeat:
+          name: observations
+          count: $observation_count
+          every_seconds: $interval_seconds
+          node:
+            invoke:
+              name: warm
+              payload: replay
     runner:
       label: residency-chain
       metadata: {purpose: cache-residency}

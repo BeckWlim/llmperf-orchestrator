@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 import pytest
+from sqlalchemy.dialects import postgresql
 
 pytest.importorskip("sqlalchemy")
 pytest.importorskip("asyncpg")
@@ -29,6 +30,14 @@ def _benchmark(model):
         "stddev_output_tokens": 0,
         "additional_sampling_params": {},
     }
+
+
+def test_task_lock_scope():
+    statement = RunnerRepository._task_dispatch_rows_statement("task-instance")
+    compiled_sql = str(statement.compile(dialect=postgresql.dialect()))
+
+    assert "LEFT OUTER JOIN benchmark_runners" in compiled_sql
+    assert compiled_sql.endswith("FOR UPDATE OF benchmark_runner_dispatches")
 
 
 def test_postgres_lifecycle(postgresql_url):
@@ -176,6 +185,94 @@ def test_postgres_lifecycle(postgresql_url):
             assert persisted_skip["status"] == "completed"
             assert persisted_skip["emitted_count"] == 1
             assert persisted_skip["skipped_count"] == 1
+        finally:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.dispose()
+
+    asyncio.run(exercise_repository())
+
+
+def test_task_advancement(postgresql_url):
+    async def exercise_repository():
+        database = Database(DatabaseConfig(url=postgresql_url))
+        try:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+                await connection.run_sync(Base.metadata.create_all)
+
+            repository = RunnerRepository(database)
+            workload = await repository.create_campaign_workload(
+                "postgres-task",
+                "PostgreSQL task Dispatch advancement regression test",
+                {},
+                [],
+                [],
+                [
+                    {
+                        "definition": {
+                            "name": "postgres-task",
+                            "instances": {"trials": 1, "seed": 7},
+                            "payloads": {"replay": {"seed_namespace": "replay"}},
+                            "workflow": [
+                                {
+                                    "invoke": {
+                                        "name": "prime",
+                                        "payload": "replay",
+                                    }
+                                },
+                                {
+                                    "invoke": {
+                                        "name": "probe",
+                                        "payload": "replay",
+                                    }
+                                },
+                            ],
+                        },
+                        "runner_template": {
+                            "label": "postgres-task",
+                            "metadata": {},
+                            "benchmark": _benchmark("task-model"),
+                        },
+                    }
+                ],
+                "bootstrap-test",
+            )
+            campaign_id = workload["campaign"]["campaign_id"]
+            assert await repository.materialize_due_work(10) == 1
+            prime_runner = await repository.claim_next("task-scheduler")
+            assert prime_runner is not None
+            assert prime_runner["label"] == "postgres-task:prime"
+
+            committed = await repository.complete_runner(
+                prime_runner["runner_id"],
+                {"num_completed_requests": 1},
+                [
+                    {
+                        "request_metadata": {
+                            "prompt_hash": "stable-prompt-hash",
+                            "payload_evidence": {"record_index": 1},
+                        }
+                    }
+                ],
+                0,
+                "",
+                "",
+            )
+            assert committed is True
+            campaign_status = await repository.get_campaign_status(campaign_id)
+            assert campaign_status is not None
+            assert campaign_status["task_instance_status_counts"]["active"] == 1
+            assert campaign_status["dispatch_status_counts"] == {
+                "blocked": 0,
+                "pending": 1,
+                "emitted": 1,
+                "cancelled": 0,
+            }
+            assert await repository.materialize_due_work(10) == 1
+            probe_runner = await repository.claim_next("task-scheduler")
+            assert probe_runner is not None
+            assert probe_runner["label"] == "postgres-task:probe"
         finally:
             async with database.engine.begin() as connection:
                 await connection.run_sync(Base.metadata.drop_all)

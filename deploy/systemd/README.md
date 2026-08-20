@@ -46,6 +46,26 @@ account whose `~/.config/llmperf/backend.env` is discovered by the Backend, whil
 `WorkingDirectory` provides the project path used by the service and Worker process.
 The Backend does not load a project-local `.env` file.
 Backend defaults keep one Uvicorn process unless its own configuration overrides it.
+For a deployment whose proxy has complete network reachability and benchmark capacity,
+persist `LLMPERF_PROXY` in the Backend environment. LLMPerf maps it to the standard
+uppercase/lowercase HTTP, HTTPS, and ALL proxy variables before importing clients, so
+native `hf-xet`, Hugging Face metadata, and Provider HTTP traffic share one proxy policy.
+Backend-to-Ray gRPC control traffic remains direct because LLMPerf explicitly disables
+Ray's HTTP-proxy option; Ray Workers inherit the standard variables for Provider traffic.
+Use `LLMPERF_NO_PROXY` for explicit local or internal bypasses. The unit still needs no
+inline `Environment=` values.
+
+For a Campaign with a large uncached tokenizer or dataset, populate and verify the cache
+before creating benchmark work:
+
+```bash
+llmperfctl campaign validate -f campaign.yaml --artifact-timeout 3600
+```
+
+The command fully reads and hashes each resolved artifact and does not create a Campaign.
+For datasets it also executes the adapter and persists a normalized Arrow index. Configure
+`HF_DATASETS_CACHE` in the Backend environment when the service user's default Hugging Face
+cache directory is not the desired persistent location.
 
 Review the installed unit before starting it:
 

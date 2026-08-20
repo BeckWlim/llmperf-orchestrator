@@ -1,18 +1,29 @@
 """Command-line task orchestration and export client."""
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import getpass
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from types import TracebackType
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    TextIO,
+    Tuple,
+    TypeVar,
+)
 
 import yaml
-from tqdm import tqdm
 
 from llmperf.logging import LOG_COLOR_MODES, LOG_LEVELS, configure_logging
 from llmperf.version import PROTOCOL_VERSION
@@ -27,6 +38,7 @@ from llmperf_cli.client import ClientError, LLMPerfClient, write_json
 from llmperf_cli.projections import (
     CLIProjection,
     adapt_cli_response,
+    project_campaign_start,
     project_health,
     project_runner,
 )
@@ -36,10 +48,84 @@ TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 CAMPAIGN_TERMINAL_STATUSES = {"completed", "cancelled", "empty"}
 UNSUCCESSFUL_OUTCOMES = {"partial_failed", "failed", "cancelled"}
 LOGGER = logging.getLogger("llmperfctl")
+SubmissionResult = TypeVar("SubmissionResult")
+
+
+@dataclass(frozen=True)
+class CampaignSubmission:
+    """Validated top-level Campaign components loaded from one YAML file."""
+
+    campaign: Dict[str, Any]
+    runners: List[Dict[str, Any]]
+    runner_plans: List[Dict[str, Any]]
+    task_definitions: List[Dict[str, Any]]
+    wait: bool
+    export: Optional[str]
+
+
+class CampaignTaskPreviewClient(Protocol):
+    """Narrow client capability required by persistence-free task preview."""
+
+    def preview_campaign_tasks(
+        self,
+        campaign: Dict[str, Any],
+        runners: List[Dict[str, Any]],
+        runner_plans: List[Dict[str, Any]],
+        task_definitions: Optional[List[Dict[str, Any]]] = None,
+        *,
+        limit: int,
+        node_limit: int,
+        debug: bool,
+    ) -> Dict[str, Any]: ...
+
+
+class CampaignArtifactValidationClient(Protocol):
+    """Narrow client capability required by artifact validation."""
+
+    def validate_campaign_artifacts(
+        self,
+        campaign: Dict[str, Any],
+        runners: List[Dict[str, Any]],
+        runner_plans: List[Dict[str, Any]],
+        task_definitions: Optional[List[Dict[str, Any]]] = None,
+        *,
+        timeout: float,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]: ...
 
 
 class HelpFormatter(argparse.RawDescriptionHelpFormatter):
     """Preserve command examples while keeping argparse's standard layout."""
+
+
+def _positive_seconds(raw_value: str) -> float:
+    try:
+        seconds = float(raw_value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return seconds
+
+
+def _preview_limit(raw_value: str) -> int:
+    try:
+        limit = int(raw_value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 1 <= limit <= 200:
+        raise argparse.ArgumentTypeError("must be between 1 and 200")
+    return limit
+
+
+def _preview_node_limit(raw_value: str) -> int:
+    try:
+        node_limit = int(raw_value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 1 <= node_limit <= 1_000:
+        raise argparse.ArgumentTypeError("must be between 1 and 1000")
+    return node_limit
 
 
 TOP_LEVEL_HELP = """\
@@ -111,6 +197,56 @@ def load_runner_plan(path: Path) -> Dict[str, Any]:
     return dict(plans[0])
 
 
+def load_campaign_submission(file_value: str) -> CampaignSubmission:
+    """Load and structurally validate one Campaign YAML submission."""
+
+    campaign_file = Path(file_value).expanduser()
+    LOGGER.info("Loading Campaign YAML: %s", campaign_file)
+    plan = load_yaml(campaign_file)
+    campaign_spec = plan.get("campaign")
+    if not isinstance(campaign_spec, dict) or not campaign_spec.get("name"):
+        raise ClientError("campaign file must define campaign.name")
+    raw_runners = plan.get("runners", [])
+    raw_runner_plans = plan.get("runner_plans", [])
+    raw_task_definitions = plan.get("task_definitions", [])
+    if not isinstance(raw_runners, list):
+        raise ClientError("campaign runners must be a list")
+    if not isinstance(raw_runner_plans, list):
+        raise ClientError("campaign runner_plans must be a list")
+    if not isinstance(raw_task_definitions, list):
+        raise ClientError("campaign task_definitions must be a list")
+    if not raw_runners and not raw_runner_plans and not raw_task_definitions:
+        raise ClientError(
+            "campaign requires runners, runner_plans, or task_definitions"
+        )
+    raw_export = plan.get("export")
+    if raw_export is not None and not isinstance(raw_export, str):
+        raise ClientError("campaign export must be a file path string")
+    prepared_runners: List[Dict[str, Any]] = []
+    for index, runner in enumerate(raw_runners):
+        if not isinstance(runner, dict):
+            raise ClientError(f"campaign runners[{index}] must be a mapping")
+        prepared_runners.append(dict(runner))
+    prepared_runner_plans: List[Dict[str, Any]] = []
+    for index, runner_plan in enumerate(raw_runner_plans):
+        if not isinstance(runner_plan, dict):
+            raise ClientError(f"campaign runner_plans[{index}] must be a mapping")
+        prepared_runner_plans.append(dict(runner_plan))
+    prepared_task_definitions: List[Dict[str, Any]] = []
+    for index, task_definition in enumerate(raw_task_definitions):
+        if not isinstance(task_definition, dict):
+            raise ClientError(f"campaign task_definitions[{index}] must be a mapping")
+        prepared_task_definitions.append(dict(task_definition))
+    return CampaignSubmission(
+        campaign=dict(campaign_spec),
+        runners=prepared_runners,
+        runner_plans=prepared_runner_plans,
+        task_definitions=prepared_task_definitions,
+        wait=bool(plan.get("wait")),
+        export=raw_export,
+    )
+
+
 def print_json(document: Any) -> None:
     print(json.dumps(document, ensure_ascii=False, indent=2, default=str))
 
@@ -130,36 +266,260 @@ def print_health(document: Dict[str, Any]) -> None:
     )
 
 
-def submit_with_artifact_progress(action):
-    """Render one indicator for backend tokenizer and dataset resolution."""
+def _ratio_percentage(value: Any) -> str:
+    """Render one finite 0-1 ratio as a two-decimal percentage."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return _table_value(value)
+    numeric_ratio = float(value)
+    if not math.isfinite(numeric_ratio):
+        return "-"
+    return f"{numeric_ratio * 100:.2f}%"
+
+
+def print_scheduler_status(document: Dict[str, Any]) -> None:
+    """Render the allow-listed Scheduler and Ray capacity projection."""
+
+    print(
+        f"Scheduler: {_table_value(document.get('scheduler_id'))}  "
+        f"Status: {_table_value(document.get('status'))}"
+    )
+    print(
+        "Capacity: "
+        f"busy={_table_value(document.get('busy_slots'), '0')} "
+        f"live={_table_value(document.get('live_slots'), '0')} "
+        f"max={_table_value(document.get('max_concurrent_runners'), '0')} "
+        f"workers={_table_value(document.get('active_workers'), '0')}"
+    )
+    print(
+        f"Execution: worker={_table_value(document.get('worker_kind'))} "
+        f"ray_mode={_table_value(document.get('ray_mode'))} "
+        f"actor_cpus={_table_value(document.get('ray_actor_num_cpus'))}"
+    )
+
+    runtime = document.get("ray_runtime") or {}
+    print(
+        f"Ray: status={_table_value(runtime.get('status'))} "
+        f"nodes={_table_value(runtime.get('alive_nodes'))} "
+        "object_store_available="
+        f"{_ratio_percentage(runtime.get('object_store_available_ratio'))} "
+        f"claim_blocked={_table_value(runtime.get('claim_blocked'), 'False')}"
+    )
+    block_reason = runtime.get("claim_block_reason")
+    runtime_error = runtime.get("error")
+    if block_reason or runtime_error:
+        print(
+            f"Ray detail: reason={_table_value(block_reason)} "
+            f"error={_table_value(runtime_error)}"
+        )
+
+    guard = document.get("performance_guard") or {}
+    host_memory = guard.get("host_memory") or {}
+    print(
+        f"Guard: enabled={_table_value(guard.get('enabled'), 'False')} "
+        f"tripped={_table_value(guard.get('tripped'), 'False')} "
+        f"memory_utilization={_ratio_percentage(host_memory.get('utilization'))}"
+    )
+    guard_reason = guard.get("reason")
+    if guard_reason:
+        print(f"Guard detail: reason={_table_value(guard_reason)}")
+
+
+def print_artifact_validation(document: Dict[str, Any]) -> None:
+    """Render cache-integrity evidence without exposing Backend-local paths."""
+
+    workload = document.get("workload") or {}
+    artifacts = document.get("artifacts") or []
+    print(
+        f"Campaign: {_table_value(document.get('campaign'))}  "
+        f"Valid: {_table_value(document.get('valid'))}  "
+        f"Artifacts: {len(artifacts)}"
+    )
+    print(
+        "Workload: "
+        f"immediate_runners={_table_value(workload.get('immediate_runners'), '0')} "
+        f"plans={_table_value(workload.get('runner_plans'), '0')} "
+        f"definitions={_table_value(workload.get('task_definitions'), '0')} "
+        f"instances={_table_value(workload.get('task_instances'), '0')} "
+        f"nodes={_table_value(workload.get('task_nodes'), '0')}"
+    )
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        filename = artifact.get("filename")
+        artifact_name = str(artifact.get("repository_id") or "-")
+        if filename:
+            artifact_name = f"{artifact_name}/{filename}"
+        print(
+            f"- {_table_value(artifact.get('kind'))}: {artifact_name} "
+            f"revision={_table_value(artifact.get('revision'))} "
+            f"cache_hit={_table_value(artifact.get('cache_hit'))} "
+            f"adapter={_table_value(artifact.get('adapter'))} "
+            f"records={_table_value(artifact.get('record_count'))} "
+            f"files={_table_value(artifact.get('file_count'))} "
+            f"bytes={_table_value(artifact.get('size_bytes'))} "
+            f"sha256={_table_value(artifact.get('sha256'))}"
+        )
+
+
+def print_task_preview(document: Dict[str, Any]) -> None:
+    """Render a bounded ASCII view of expanded TaskInstance DAGs."""
+
+    summary = document.get("summary") or {}
+    print(
+        f"Campaign: {_table_value(document.get('campaign'))}  "
+        f"Valid: {_table_value(document.get('valid'))}"
+    )
+    print(
+        "Workload: "
+        "immediate_runners="
+        f"{_table_value(summary.get('immediate_runners'), '0')} "
+        f"plans={_table_value(summary.get('runner_plans'), '0')} "
+        f"definitions={_table_value(summary.get('task_definitions'), '0')} "
+        f"instances={_table_value(summary.get('task_instances'), '0')} "
+        f"nodes={_table_value(summary.get('task_nodes'), '0')}"
+    )
+    for definition in document.get("task_definitions") or []:
+        print(
+            f"\nTask: {_table_value(definition.get('name'))}  "
+            f"instances={_table_value(definition.get('instance_count'), '0')} "
+            f"nodes={_table_value(definition.get('node_count'), '0')}"
+        )
+        for instance in definition.get("instances") or []:
+            dimensions = instance.get("dimensions") or {}
+            dimension_label = ", ".join(
+                f"{name}={value}" for name, value in sorted(dimensions.items())
+            )
+            if not dimension_label:
+                dimension_label = "(none)"
+            print(
+                f"  Instance: {_table_value(instance.get('instance_key'))}  "
+                f"matrix={dimension_label} "
+                f"trial={_table_value(instance.get('trial_index'))} "
+                f"nodes={_table_value(instance.get('node_count'), '0')}"
+            )
+            for node in instance.get("nodes") or []:
+                dependencies = node.get("dependencies") or []
+                node_label = f"[{_table_value(node.get('node_id'))}]"
+                if dependencies:
+                    source_label = ", ".join(f"[{item}]" for item in dependencies)
+                    graph_line = f"{source_label} --> {node_label}"
+                else:
+                    graph_line = f"* {node_label}"
+                print(
+                    f"    {graph_line}  "
+                    f"+{_table_value(node.get('after_seconds'), '0')}s "
+                    f"role={_table_value(node.get('role'))} "
+                    f"payload={_table_value(node.get('payload_id'))}"
+                )
+                if "payload_seed" in node:
+                    print(
+                        "      debug: "
+                        f"payload_seed={_table_value(node.get('payload_seed'))}"
+                    )
+            truncated_node_count = int(instance.get("truncated_node_count") or 0)
+            if truncated_node_count:
+                print(
+                    f"    ... {truncated_node_count} more node(s); "
+                    "increase --node-limit to display them"
+                )
+        truncated_count = int(definition.get("truncated_instance_count") or 0)
+        if truncated_count:
+            print(
+                f"  ... {truncated_count} more instance(s); "
+                "increase --limit to display them"
+            )
+
+
+def submit_with_backend_timing(
+    action: Callable[[], SubmissionResult],
+) -> SubmissionResult:
+    """Run one synchronous Backend submission and log its elapsed time."""
 
     started = time.monotonic()
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(action)
-        if future.done():
-            result = future.result()
-            LOGGER.info(
-                "Backend validation/submission completed in %.1fs",
-                time.monotonic() - started,
-            )
-            return result
-        with tqdm(
-            total=None,
-            desc="Backend artifact download/cache lookup",
-            file=sys.stderr,
-            dynamic_ncols=True,
-            leave=False,
-            bar_format="{desc}: {elapsed}",
-        ) as progress:
-            while not future.done():
-                time.sleep(1)
-                progress.refresh()
-        result = future.result()
-        LOGGER.info(
-            "Backend validation/submission completed in %.1fs",
-            time.monotonic() - started,
+    result = action()
+    LOGGER.info(
+        "Backend validation/submission completed in %.1fs",
+        time.monotonic() - started,
+    )
+    return result
+
+
+class ArtifactDownloadRenderer:
+    """Render artifact byte counters dynamically without drawing a progress bar."""
+
+    def __init__(self, stream: Optional[TextIO] = None) -> None:
+        self._stream = sys.stderr if stream is None else stream
+        self._dynamic = self._stream.isatty()
+        self._rendered_width = 0
+
+    def __enter__(self) -> "ArtifactDownloadRenderer":
+        return self
+
+    def __exit__(
+        self,
+        exception_type: Optional[type[BaseException]],
+        exception: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Terminate a live counter line before ordinary logging resumes."""
+
+        if self._dynamic and self._rendered_width:
+            self._stream.write("\n")
+            self._stream.flush()
+            self._rendered_width = 0
+
+    def update(self, event: Dict[str, Any]) -> None:
+        """Render one absolute transfer counter or Backend heartbeat."""
+
+        phase = str(event.get("phase") or "waiting")
+        if phase == "waiting":
+            if not self._dynamic:
+                LOGGER.info("Backend artifact validation heartbeat")
+            return
+
+        kind = str(event.get("kind") or "artifact")
+        repository_id = str(event.get("repository_id") or "unknown")
+        filename_value = event.get("filename")
+        filename = str(filename_value) if filename_value else "-"
+        total_value = event.get("total_bytes")
+        total_bytes = (
+            int(total_value) if type(total_value) is int and total_value >= 0 else None
         )
-        return result
+        completed_value = event.get("completed_bytes")
+        completed_bytes = (
+            int(completed_value)
+            if type(completed_value) is int and completed_value >= 0
+            else 0
+        )
+        if self._dynamic:
+            total_text = f"{total_bytes:,}" if total_bytes is not None else "unknown"
+            artifact_name = (
+                repository_id if filename == "-" else f"{repository_id}/{filename}"
+            )
+            counter = (
+                f"Artifact {phase}: {kind} {artifact_name} "
+                f"downloaded={completed_bytes:,}/{total_text} bytes"
+            )
+            trailing_spaces = " " * max(0, self._rendered_width - len(counter))
+            self._stream.write(f"\r{counter}{trailing_spaces}")
+            self._stream.flush()
+            self._rendered_width = len(counter)
+            return
+
+        LOGGER.info(
+            "Backend artifact bytes: kind=%s repository=%s filename=%s phase=%s "
+            "completed_bytes=%d total_bytes=%s",
+            kind,
+            repository_id,
+            filename,
+            phase,
+            completed_bytes,
+            total_bytes if total_bytes is not None else "unknown",
+        )
 
 
 def _table_value(value: Any, default: str = "-") -> str:
@@ -273,7 +633,12 @@ def _validate_campaign_list(document: Any) -> Dict[str, Any]:
         "outcome",
         "runner_count",
         "runner_plan_count",
+        "task_instance_count",
+        "dispatch_count",
         "status_counts",
+        "runner_plan_status_counts",
+        "task_instance_status_counts",
+        "dispatch_status_counts",
         "created_at",
     }
     for index, item in enumerate(items):
@@ -289,6 +654,15 @@ def _validate_campaign_list(document: Any) -> Dict[str, Any]:
             raise ClientError(
                 f"Campaign list item {index}.status_counts must be an object"
             )
+        for count_field in (
+            "runner_plan_status_counts",
+            "task_instance_status_counts",
+            "dispatch_status_counts",
+        ):
+            if not isinstance(item[count_field], dict):
+                raise ClientError(
+                    f"Campaign list item {index}.{count_field} must be an object"
+                )
     return document
 
 
@@ -304,7 +678,7 @@ def print_campaign_table(document: Dict[str, Any]) -> None:
         ("STATUS", 9),
         ("OUTCOME", 14),
         ("CAMPAIGN ID", 36),
-        ("RUNNERS/PLANS", 13),
+        ("RUN/PLAN/TASK/DISP", 18),
         ("Q/R/OK/F/C", 12),
         ("CREATED", 16),
         ("NAME", 24),
@@ -321,7 +695,8 @@ def print_campaign_table(document: Dict[str, Any]) -> None:
             item.get("status"),
             item.get("outcome"),
             item.get("campaign_id"),
-            f"{item.get('runner_count')}/{item.get('runner_plan_count')}",
+            f"{item.get('runner_count')}/{item.get('runner_plan_count')}/"
+            f"{item.get('task_instance_count')}/{item.get('dispatch_count')}",
             states,
             _compact_timestamp(item.get("created_at")),
             item.get("name"),
@@ -548,13 +923,16 @@ def print_runner_logs(document: Dict[str, Any]) -> None:
             print("(empty)")
 
 
-def render_result(result: CLIProjection) -> None:
+def render_result(result: object) -> None:
     """Render only registered projections; raw documents are rejected."""
 
     if not isinstance(result, CLIProjection):
         raise ClientError("CLI renderer accepts only registered projections")
     renderers = {
         "health": print_health,
+        "scheduler_status": print_scheduler_status,
+        "artifact_validation": print_artifact_validation,
+        "task_preview": print_task_preview,
         "campaign_status": print_campaign_status,
         "campaign_table": print_campaign_table,
         "runner_table": print_runner_table,
@@ -743,10 +1121,15 @@ def wait_for_campaign(
         if campaign_signature != last_campaign:
             runner_counts = campaign.get("status_counts") or {}
             plan_counts = campaign.get("runner_plan_status_counts") or {}
+            task_counts = campaign.get("task_instance_status_counts") or {}
+            dispatch_counts = campaign.get("dispatch_status_counts") or {}
             LOGGER.info(
                 "Campaign %s status=%s outcome=%s elapsed=%.1fs runners=%s "
                 "[queued=%s running=%s succeeded=%s failed=%s cancelled=%s] "
-                "plans=%s [active=%s paused=%s completed=%s cancelled=%s]",
+                "plans=%s [active=%s paused=%s completed=%s cancelled=%s] "
+                "task_instances=%s "
+                "[planned=%s active=%s completed=%s failed=%s cancelled=%s] "
+                "dispatches=%s [blocked=%s pending=%s emitted=%s cancelled=%s]",
                 campaign_id,
                 current_status,
                 campaign.get("outcome") or "-",
@@ -762,6 +1145,17 @@ def wait_for_campaign(
                 plan_counts.get("paused", 0),
                 plan_counts.get("completed", 0),
                 plan_counts.get("cancelled", 0),
+                campaign.get("task_instance_count", 0),
+                task_counts.get("planned", 0),
+                task_counts.get("active", 0),
+                task_counts.get("completed", 0),
+                task_counts.get("failed", 0),
+                task_counts.get("cancelled", 0),
+                campaign.get("dispatch_count", 0),
+                dispatch_counts.get("blocked", 0),
+                dispatch_counts.get("pending", 0),
+                dispatch_counts.get("emitted", 0),
+                dispatch_counts.get("cancelled", 0),
             )
             last_campaign = campaign_signature
         plans = client.list_runner_plans(
@@ -790,12 +1184,14 @@ def wait_for_campaign(
         if current_status in CAMPAIGN_TERMINAL_STATUSES:
             LOGGER.info(
                 "Campaign %s finished: status=%s outcome=%s elapsed=%.1fs "
-                "runners=%s",
+                "runners=%s task_instances=%s dispatches=%s",
                 campaign_id,
                 current_status,
                 campaign.get("outcome") or "-",
                 elapsed,
                 campaign.get("runner_count", 0),
+                campaign.get("task_instance_count", 0),
+                campaign.get("dispatch_count", 0),
             )
             return campaign
         if timeout is not None and time.monotonic() - started >= timeout:
@@ -803,7 +1199,9 @@ def wait_for_campaign(
                 f"Timed out waiting for Campaign {campaign_id} after "
                 f"{elapsed:.1f}s ({current_status}); runners="
                 f"{campaign.get('status_counts', {})}, plans="
-                f"{campaign.get('runner_plan_status_counts', {})}"
+                f"{campaign.get('runner_plan_status_counts', {})}, task_instances="
+                f"{campaign.get('task_instance_status_counts', {})}, dispatches="
+                f"{campaign.get('dispatch_status_counts', {})}"
             )
         time.sleep(poll_interval)
 
@@ -811,6 +1209,8 @@ def wait_for_campaign(
 def _campaign_signature(campaign: Dict[str, Any]) -> Any:
     runner_counts = campaign.get("status_counts") or {}
     plan_counts = campaign.get("runner_plan_status_counts") or {}
+    task_counts = campaign.get("task_instance_status_counts") or {}
+    dispatch_counts = campaign.get("dispatch_status_counts") or {}
     return (
         campaign.get("status"),
         campaign.get("outcome"),
@@ -824,6 +1224,16 @@ def _campaign_signature(campaign: Dict[str, Any]) -> Any:
         tuple(
             plan_counts.get(status, 0)
             for status in ("active", "paused", "completed", "cancelled")
+        ),
+        campaign.get("task_instance_count"),
+        tuple(
+            task_counts.get(state, 0)
+            for state in ("planned", "active", "completed", "failed", "cancelled")
+        ),
+        campaign.get("dispatch_count"),
+        tuple(
+            dispatch_counts.get(state, 0)
+            for state in ("blocked", "pending", "emitted", "cancelled")
         ),
     )
 
@@ -857,43 +1267,13 @@ def _log_plan_state(runner_plan: Dict[str, Any], action: str) -> None:
 
 
 def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
-    campaign_file = Path(arguments.file).expanduser()
-    LOGGER.info("Loading Campaign YAML: %s", campaign_file)
-    plan = load_yaml(campaign_file)
-    campaign_spec = plan.get("campaign")
-    if not isinstance(campaign_spec, dict) or not campaign_spec.get("name"):
-        raise ClientError("campaign.start file must define campaign.name")
-    runners = plan.get("runners", [])
-    runner_plans = plan.get("runner_plans", [])
-    task_definitions = plan.get("task_definitions", [])
-    if not isinstance(runners, list):
-        raise ClientError("campaign.start runners must be a list")
-    if not isinstance(runner_plans, list):
-        raise ClientError("campaign.start runner_plans must be a list")
-    if not isinstance(task_definitions, list):
-        raise ClientError("campaign.start task_definitions must be a list")
-    if not runners and not runner_plans and not task_definitions:
-        raise ClientError(
-            "campaign.start requires runners, runner_plans, or task_definitions"
-        )
-    prepared_runners = []
-    for index, runner in enumerate(runners):
-        if not isinstance(runner, dict):
-            raise ClientError(f"plan.runners[{index}] must be a mapping")
-        prepared_runners.append(dict(runner))
-    prepared_plans = []
-    for index, runner_plan in enumerate(runner_plans):
-        if not isinstance(runner_plan, dict):
-            raise ClientError(f"plan.runner_plans[{index}] must be a mapping")
-        prepared_plans.append(dict(runner_plan))
-    prepared_definitions = []
-    for index, definition in enumerate(task_definitions):
-        if not isinstance(definition, dict):
-            raise ClientError(f"plan.task_definitions[{index}] must be a mapping")
-        prepared_definitions.append(dict(definition))
-    batch = submit_with_artifact_progress(
+    submission = load_campaign_submission(arguments.file)
+    batch = submit_with_backend_timing(
         lambda: client.start_campaign(
-            campaign_spec, prepared_runners, prepared_plans, prepared_definitions
+            submission.campaign,
+            submission.runners,
+            submission.runner_plans,
+            submission.task_definitions,
         )
     )
     campaign_id = batch["campaign"]["campaign_id"]
@@ -901,28 +1281,29 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
     created = batch["items"]
     created_plans = batch["runner_plans"]
     created_definitions = batch.get("task_definitions", [])
-    LOGGER.info("Submitted %d Runner(s) to Campaign %s", len(created), campaign_id)
-    for runner in created:
-        _log_runner_state(runner, 0)
-    LOGGER.info(
-        "Registered %d RunnerPlan(s) in Campaign %s",
-        len(created_plans),
-        campaign_id,
-    )
-    for runner_plan in created_plans:
-        _log_plan_state(runner_plan, "registered")
-    LOGGER.info(
-        "Registered %d task definition(s) in Campaign %s",
-        len(created_definitions),
-        campaign_id,
-    )
     result: Dict[str, Any] = {
         "campaign_id": campaign_id,
+        "summary": batch.get("summary"),
         "runners": created,
         "runner_plans": created_plans,
         "task_definitions": created_definitions,
     }
-    should_wait = arguments.wait or bool(plan.get("wait"))
+    submission_view = project_campaign_start(result)
+    workload_summary = submission_view["summary"]
+    LOGGER.info(
+        "Campaign workload registered: immediate_runners=%d runner_plans=%d "
+        "task_definitions=%d task_instances=%d task_nodes=%d",
+        workload_summary["immediate_runners"],
+        workload_summary["runner_plans"],
+        workload_summary["task_definitions"],
+        workload_summary["task_instances"],
+        workload_summary["task_nodes"],
+    )
+    for runner in created:
+        _log_runner_state(runner, 0)
+    for runner_plan in created_plans:
+        _log_plan_state(runner_plan, "registered")
+    should_wait = arguments.wait or submission.wait
     if should_wait:
         LOGGER.info("Waiting for the complete Campaign workload")
         result["campaign_status"] = wait_for_campaign(
@@ -936,7 +1317,7 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
         if getattr(arguments, "full", False):
             completed_document = client.export_campaign(campaign_id)
             result["completed"] = completed_document["runners"]
-    output = arguments.output or plan.get("export")
+    output = arguments.output or submission.export
     if output:
         if not should_wait:
             raise ClientError("Aggregate export requires --wait or plan.wait: true")
@@ -947,6 +1328,51 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
         LOGGER.info("Exported Campaign %s to %s", campaign_id, output)
         result["exported_to"] = str(Path(output))
     return result
+
+
+def validate_campaign_artifacts(
+    client: CampaignArtifactValidationClient, arguments: argparse.Namespace
+) -> Dict[str, Any]:
+    """Materialize and verify Campaign artifacts without creating work."""
+
+    submission = load_campaign_submission(arguments.file)
+    with ArtifactDownloadRenderer() as download_renderer:
+        validation = client.validate_campaign_artifacts(
+            submission.campaign,
+            submission.runners,
+            submission.runner_plans,
+            submission.task_definitions,
+            timeout=arguments.artifact_timeout,
+            progress_callback=download_renderer.update,
+        )
+    LOGGER.info(
+        "Campaign artifacts validated: campaign=%s artifacts=%d bytes=%d",
+        validation.get("campaign"),
+        len(validation.get("artifacts", [])),
+        sum(
+            int(artifact.get("size_bytes", 0))
+            for artifact in validation.get("artifacts", [])
+            if isinstance(artifact, dict)
+        ),
+    )
+    return validation
+
+
+def preview_campaign_tasks(
+    client: CampaignTaskPreviewClient, arguments: argparse.Namespace
+) -> Dict[str, Any]:
+    """Request Backend-authoritative, persistence-free TaskCompiler output."""
+
+    submission = load_campaign_submission(arguments.file)
+    return client.preview_campaign_tasks(
+        submission.campaign,
+        submission.runners,
+        submission.runner_plans,
+        submission.task_definitions,
+        limit=arguments.limit,
+        node_limit=arguments.node_limit,
+        debug=arguments.debug,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1128,12 +1554,24 @@ Examples:
         title="scheduler commands",
         metavar="COMMAND",
     )
-    _command_parser(
+    scheduler_status = _command_parser(
         scheduler_commands,
         "status",
         help="Show Scheduler state and active capacity",
-        description="Show Scheduler identity, state, capacity, and Worker module.",
-        epilog="Example:\n  llmperfctl scheduler status",
+        description=(
+            "Show the filtered Scheduler, Ray capacity, and performance-guard "
+            "projection. Use --json for the same allow-listed fields."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  llmperfctl scheduler status\n"
+            "  llmperfctl scheduler status --json"
+        ),
+    )
+    scheduler_status.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the filtered Scheduler projection as JSON",
     )
 
     planner = _command_parser(
@@ -1382,6 +1820,8 @@ Examples:
         ),
         epilog="""\
 Examples:
+  llmperfctl campaign preview -f campaign.yaml --debug
+  llmperfctl campaign validate -f campaign.yaml
   llmperfctl campaign start -f campaign.yaml --wait
   llmperfctl campaign status <campaign-id>
   llmperfctl campaign list
@@ -1395,6 +1835,79 @@ See examples/example-campaign.yaml for the Campaign YAML shape.
         required=True,
         title="campaign commands",
         metavar="COMMAND",
+    )
+    campaign_preview = _command_parser(
+        campaign_commands,
+        "preview",
+        help="Validate and display expanded task graphs",
+        description=(
+            "Ask the Backend TaskCompiler to validate and expand Campaign task "
+            "definitions without resolving artifacts or creating durable work."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  llmperfctl campaign preview -f campaign.yaml\n"
+            "  llmperfctl campaign preview -f campaign.yaml --limit 50 "
+            "--node-limit 200 --debug\n"
+            "  llmperfctl campaign preview -f campaign.yaml --json"
+        ),
+    )
+    campaign_preview.add_argument(
+        "-f", "--file", required=True, metavar="FILE", help="Campaign YAML file"
+    )
+    campaign_preview.add_argument(
+        "--limit",
+        type=_preview_limit,
+        default=20,
+        metavar="COUNT",
+        help="Maximum expanded instances shown across the Campaign (default: 20)",
+    )
+    campaign_preview.add_argument(
+        "--node-limit",
+        type=_preview_node_limit,
+        default=100,
+        metavar="COUNT",
+        help="Maximum expanded nodes shown per instance (default: 100)",
+    )
+    campaign_preview.add_argument(
+        "--debug",
+        action="store_true",
+        help="Include deterministic payload seeds in the preview",
+    )
+    campaign_preview.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the bounded preview as JSON",
+    )
+    campaign_validate = _command_parser(
+        campaign_commands,
+        "validate",
+        help="Materialize and verify Campaign cache artifacts",
+        description=(
+            "Resolve every Campaign tokenizer and dataset, verify complete files "
+            "on Backend storage, and return integrity evidence without creating "
+            "a Campaign or Runner."
+        ),
+        epilog=(
+            "Example:\n"
+            "  llmperfctl campaign validate -f campaign.yaml "
+            "--artifact-timeout 3600"
+        ),
+    )
+    campaign_validate.add_argument(
+        "-f", "--file", required=True, metavar="FILE", help="Campaign YAML file"
+    )
+    campaign_validate.add_argument(
+        "--artifact-timeout",
+        type=_positive_seconds,
+        default=3600.0,
+        metavar="SECONDS",
+        help="Maximum cache materialization and validation time (default: 3600)",
+    )
+    campaign_validate.add_argument(
+        "--json",
+        action="store_true",
+        help="Print validation evidence as JSON",
     )
     campaign_start = _command_parser(
         campaign_commands,
@@ -1876,6 +2389,10 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
             return client.revoke_trusted_client(arguments.username)
         return client.list_trusted_client_events(arguments.limit)
     if arguments.command == "campaign":
+        if arguments.campaign_command == "preview":
+            return preview_campaign_tasks(client, arguments)
+        if arguments.campaign_command == "validate":
+            return validate_campaign_artifacts(client, arguments)
         if arguments.campaign_command == "start":
             return start_campaign(client, arguments)
         if arguments.campaign_command == "status":
@@ -1893,12 +2410,14 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
             campaign = client.cancel_campaign(arguments.campaign_id)
             LOGGER.info(
                 "Campaign %s cancellation result: status=%s outcome=%s "
-                "runners=%s plans=%s",
+                "runners=%s plans=%s task_instances=%s dispatches=%s",
                 arguments.campaign_id,
                 campaign.get("status"),
                 campaign.get("outcome"),
                 campaign.get("runner_count"),
                 campaign.get("runner_plan_count"),
+                campaign.get("task_instance_count"),
+                campaign.get("dispatch_count"),
             )
             return campaign
         document = client.export_campaign(
@@ -1924,9 +2443,7 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
                 "Validating and submitting Runner (request timeout: %g seconds)",
                 arguments.request_timeout,
             )
-            created = submit_with_artifact_progress(
-                lambda: client.start_runner(payload)
-            )
+            created = submit_with_backend_timing(lambda: client.start_runner(payload))
             runner_id = created["runner_id"]
             runner_status = created.get("status", "submitted")
             benchmark = created.get("benchmark") or payload.get("benchmark") or {}

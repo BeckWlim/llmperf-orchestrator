@@ -10,17 +10,26 @@ wait: true
 
 task_definitions:
   - name: sharegpt-64k-replay
-    trials: 1
-    seed: 20260819
+    instances:
+      trials: 1
+      seed: 20260819
     payloads:
       replay: {seed_namespace: replay}
       cold: {seed_namespace: cold-control}
-    sequence:
-      - {kind: invoke, id: prime, role: prime, payload: replay}
-      - kind: parallel
-        invokes:
-          - {kind: invoke, id: warm, role: warm, payload: replay}
-          - {kind: invoke, id: cold, role: cold_control, payload: cold}
+    workflow:
+      - invoke:
+          name: prime
+          payload: replay
+      - parallel:
+          name: observation
+          branches:
+            - invoke:
+                name: warm
+                payload: replay
+            - invoke:
+                name: cold
+                role: cold_control
+                payload: cold
     runner:
       label: sharegpt-64k-replay
       metadata: {purpose: long-context-cache-replay}
@@ -36,7 +45,7 @@ task_definitions:
           id: learnanything/sharegpt_v3_unfiltered_cleaned_split
           filename: ShareGPT_V3_unfiltered_cleaned_split.json
           revision: ddc6e27875b7198a46702daec3e61a55e222fc14
-          adapter: sharegpt
+          adapter: sharegpt-user
         dataset_prompt_mode: concatenate
         dataset_repeat_count: 1
         timeout_seconds: 600

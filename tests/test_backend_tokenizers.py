@@ -2,12 +2,13 @@ import asyncio
 from pathlib import Path
 from unittest.mock import Mock
 
-from llmperf_backend.tokenizers import (
+from llmperf_backend.artifacts import (
     TOKENIZER_SNAPSHOT_ALLOW_PATTERNS,
     TokenizerCache,
     TokenizerResolution,
 )
-from llmperf_backend.tokenizers import TokenizerResolutionError
+from llmperf_backend.artifacts import TokenizerResolutionError
+from llmperf_backend.outbound import STANDARD_PROXY_NAMES
 import pytest
 
 SNAPSHOT_COMMIT = "d" * 40
@@ -31,10 +32,10 @@ def _mock_download(tmp_path, monkeypatch, commit=SNAPSHOT_COMMIT):
     snapshot = _snapshot(tmp_path, commit)
     downloader = Mock(return_value=str(snapshot))
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        "llmperf_backend.artifacts.try_to_load_from_cache",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr("llmperf_backend.tokenizers.snapshot_download", downloader)
+    monkeypatch.setattr("llmperf_backend.artifacts.snapshot_download", downloader)
     return snapshot, downloader
 
 
@@ -65,7 +66,7 @@ def test_cached_commit(tmp_path, monkeypatch):
     cached_file.parent.mkdir(parents=True)
     cached_file.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        "llmperf_backend.artifacts.try_to_load_from_cache",
         lambda *args, **kwargs: str(cached_file),
     )
     cache = TokenizerCache(cache_directory=tmp_path, proxy_url="")
@@ -79,7 +80,7 @@ def test_cache(tmp_path, monkeypatch):
     snapshot, downloader = _mock_download(tmp_path, monkeypatch)
     loader = Mock(return_value=FakeTokenizer())
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+        "llmperf_backend.artifacts.AutoTokenizer.from_pretrained", loader
     )
     cache = TokenizerCache(
         cache_directory=tmp_path, local_files_only=False, proxy_url=""
@@ -118,13 +119,13 @@ def test_cache(tmp_path, monkeypatch):
 def test_offline(tmp_path, monkeypatch):
     downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        "llmperf_backend.artifacts.try_to_load_from_cache",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr("llmperf_backend.tokenizers.snapshot_download", downloader)
+    monkeypatch.setattr("llmperf_backend.artifacts.snapshot_download", downloader)
     loader = Mock(side_effect=AssertionError("unexpected tokenizer load"))
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+        "llmperf_backend.artifacts.AutoTokenizer.from_pretrained", loader
     )
     cache = TokenizerCache(cache_directory=tmp_path, local_files_only=True)
 
@@ -140,12 +141,12 @@ def test_offline_hit(tmp_path, monkeypatch):
     downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
     loader = Mock(return_value=FakeTokenizer())
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        "llmperf_backend.artifacts.try_to_load_from_cache",
         lambda *args, **kwargs: str(snapshot / "tokenizer_config.json"),
     )
-    monkeypatch.setattr("llmperf_backend.tokenizers.snapshot_download", downloader)
+    monkeypatch.setattr("llmperf_backend.artifacts.snapshot_download", downloader)
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+        "llmperf_backend.artifacts.AutoTokenizer.from_pretrained", loader
     )
     cache = TokenizerCache(cache_directory=tmp_path, local_files_only=True)
 
@@ -177,12 +178,12 @@ def test_offline_fallback(tmp_path, monkeypatch):
     downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
     loader = Mock(side_effect=AssertionError("unexpected tokenizer load"))
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        "llmperf_backend.artifacts.try_to_load_from_cache",
         lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr("llmperf_backend.tokenizers.snapshot_download", downloader)
+    monkeypatch.setattr("llmperf_backend.artifacts.snapshot_download", downloader)
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+        "llmperf_backend.artifacts.AutoTokenizer.from_pretrained", loader
     )
     cache = TokenizerCache(cache_directory=tmp_path, local_files_only=True)
     target = cache.resolved_directory / cache._artifact_key(
@@ -211,14 +212,14 @@ def test_offline_snapshot(tmp_path, monkeypatch):
     snapshot.mkdir(parents=True)
     (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        "llmperf_backend.artifacts.try_to_load_from_cache",
         lambda *args, **kwargs: None,
     )
     downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
-    monkeypatch.setattr("llmperf_backend.tokenizers.snapshot_download", downloader)
+    monkeypatch.setattr("llmperf_backend.artifacts.snapshot_download", downloader)
     loader = Mock(return_value=FakeTokenizer())
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+        "llmperf_backend.artifacts.AutoTokenizer.from_pretrained", loader
     )
     cache = TokenizerCache(cache_directory=tmp_path, local_files_only=True)
 
@@ -241,7 +242,7 @@ def test_offline_ambiguity(tmp_path, monkeypatch):
         snapshot.mkdir(parents=True)
         (snapshot / "tokenizer.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        "llmperf_backend.artifacts.try_to_load_from_cache",
         lambda *args, **kwargs: None,
     )
     cache = TokenizerCache(cache_directory=tmp_path, local_files_only=True)
@@ -260,10 +261,10 @@ def test_backend_compatibility(tmp_path, monkeypatch):
     )
     fast_loader = Mock(return_value=FakeTokenizer())
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", auto_loader
+        "llmperf_backend.artifacts.AutoTokenizer.from_pretrained", auto_loader
     )
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.PreTrainedTokenizerFast.from_pretrained",
+        "llmperf_backend.artifacts.PreTrainedTokenizerFast.from_pretrained",
         fast_loader,
     )
     cache = TokenizerCache(
@@ -286,7 +287,7 @@ def test_proxy(tmp_path, monkeypatch):
     _, downloader = _mock_download(tmp_path, monkeypatch)
     loader = Mock(return_value=FakeTokenizer())
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+        "llmperf_backend.artifacts.AutoTokenizer.from_pretrained", loader
     )
     cache = TokenizerCache(
         cache_directory=tmp_path,
@@ -306,12 +307,12 @@ def test_snapshot_local(tmp_path, monkeypatch):
     downloader = Mock(side_effect=AssertionError("unexpected Hub download"))
     loader = Mock(return_value=FakeTokenizer())
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        "llmperf_backend.artifacts.try_to_load_from_cache",
         lambda *args, **kwargs: str(snapshot / "tokenizer_config.json"),
     )
-    monkeypatch.setattr("llmperf_backend.tokenizers.snapshot_download", downloader)
+    monkeypatch.setattr("llmperf_backend.artifacts.snapshot_download", downloader)
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+        "llmperf_backend.artifacts.AutoTokenizer.from_pretrained", loader
     )
     cache = TokenizerCache(
         cache_directory=tmp_path, local_files_only=False, proxy_url=""
@@ -334,12 +335,12 @@ def test_snapshot_refresh(tmp_path, monkeypatch):
     loader = Mock(side_effect=[OSError("missing merges"), FakeTokenizer()])
     downloader = Mock(return_value=str(snapshot))
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.try_to_load_from_cache",
+        "llmperf_backend.artifacts.try_to_load_from_cache",
         lambda *args, **kwargs: str(snapshot / "tokenizer_config.json"),
     )
-    monkeypatch.setattr("llmperf_backend.tokenizers.snapshot_download", downloader)
+    monkeypatch.setattr("llmperf_backend.artifacts.snapshot_download", downloader)
     monkeypatch.setattr(
-        "llmperf_backend.tokenizers.AutoTokenizer.from_pretrained", loader
+        "llmperf_backend.artifacts.AutoTokenizer.from_pretrained", loader
     )
     cache = TokenizerCache(
         cache_directory=tmp_path, local_files_only=False, proxy_url=""
@@ -353,7 +354,9 @@ def test_snapshot_refresh(tmp_path, monkeypatch):
 
 
 def test_shared_proxy_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("LLMPERF_HUGGINGFACE_PROXY", "http://proxy.environment:8080")
+    for proxy_name in STANDARD_PROXY_NAMES:
+        monkeypatch.delenv(proxy_name, raising=False)
+    monkeypatch.setenv("LLMPERF_PROXY", "http://proxy.environment:8080")
 
     cache = TokenizerCache(cache_directory=tmp_path, local_files_only=False)
 

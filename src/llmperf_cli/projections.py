@@ -1,12 +1,20 @@
 """Strict, whitelist-only projections for every CLI response."""
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 
 from llmperf_cli.client import ClientError
 from llmperf.user_config import display_environment_value
 
 Projector = Callable[[Any, bool], Any]
+
+_WORKLOAD_SUMMARY_FIELDS = (
+    "immediate_runners",
+    "runner_plans",
+    "task_definitions",
+    "task_instances",
+    "task_nodes",
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +38,18 @@ def _pick(document: Mapping[str, Any], fields: Sequence[str]) -> Dict[str, Any]:
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _workload_summary(raw_summary: Any, route: str) -> Dict[str, int]:
+    if not isinstance(raw_summary, Mapping):
+        raise ClientError(f"{route} response must contain a workload summary object")
+    summary: Dict[str, int] = {}
+    for field in _WORKLOAD_SUMMARY_FIELDS:
+        count = raw_summary.get(field)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ClientError(f"{route} response summary.{field} must be a count")
+        summary[field] = count
+    return summary
 
 
 def _items(
@@ -195,6 +215,106 @@ def _campaign_status(document: Any, detailed: bool) -> Dict[str, Any]:
     return {
         "campaign": _campaign(merged),
         "runners": [project_runner(item, detailed=detailed) for item in runners],
+    }
+
+
+def _campaign_preview(document: Any, detailed: bool) -> Dict[str, Any]:
+    source = _object(document, "campaign.preview")
+    raw_summary = source.get("summary")
+    workload_summary = _workload_summary(raw_summary, "campaign.preview")
+    if not isinstance(raw_summary, Mapping):
+        raise ClientError("campaign.preview response must contain a summary object")
+    previewed_instances = raw_summary.get("previewed_instances")
+    if (
+        isinstance(previewed_instances, bool)
+        or not isinstance(previewed_instances, int)
+        or previewed_instances < 0
+    ):
+        raise ClientError(
+            "campaign.preview response summary.previewed_instances must be a count"
+        )
+    workload_summary["previewed_instances"] = previewed_instances
+    raw_definitions = source.get("task_definitions")
+    if not isinstance(raw_definitions, list):
+        raise ClientError(
+            "campaign.preview response must contain a task_definitions array"
+        )
+    definitions: List[Dict[str, Any]] = []
+    for definition_index, raw_definition in enumerate(raw_definitions):
+        if not isinstance(raw_definition, Mapping):
+            raise ClientError(
+                f"campaign.preview task definition {definition_index} must be an object"
+            )
+        raw_instances = raw_definition.get("instances")
+        if not isinstance(raw_instances, list):
+            raise ClientError(
+                "campaign.preview task definition must contain an instances array"
+            )
+        instances: List[Dict[str, Any]] = []
+        for instance_index, raw_instance in enumerate(raw_instances):
+            if not isinstance(raw_instance, Mapping):
+                raise ClientError(
+                    "campaign.preview task instance "
+                    f"{definition_index}:{instance_index} must be an object"
+                )
+            raw_nodes = raw_instance.get("nodes")
+            if not isinstance(raw_nodes, list):
+                raise ClientError(
+                    "campaign.preview task instance must contain a nodes array"
+                )
+            nodes: List[Dict[str, Any]] = []
+            for node_index, raw_node in enumerate(raw_nodes):
+                if not isinstance(raw_node, Mapping):
+                    raise ClientError(
+                        "campaign.preview task node "
+                        f"{definition_index}:{instance_index}:{node_index} "
+                        "must be an object"
+                    )
+                node = _pick(
+                    raw_node,
+                    (
+                        "node_id",
+                        "dependencies",
+                        "after_seconds",
+                        "role",
+                        "payload_id",
+                    ),
+                )
+                if detailed and "payload_seed" in raw_node:
+                    node["payload_seed"] = raw_node.get("payload_seed")
+                nodes.append(node)
+            instance = _pick(
+                raw_instance,
+                (
+                    "instance_key",
+                    "dimensions",
+                    "trial_index",
+                    "node_count",
+                    "shown_node_count",
+                    "truncated_node_count",
+                ),
+            )
+            instance["nodes"] = nodes
+            instances.append(instance)
+        definition = _pick(
+            raw_definition,
+            (
+                "name",
+                "instance_count",
+                "node_count",
+                "shown_instance_count",
+                "truncated_instance_count",
+            ),
+        )
+        definition["instances"] = instances
+        definitions.append(definition)
+    return {
+        "version": source.get("version"),
+        "valid": source.get("valid"),
+        "campaign": source.get("campaign"),
+        "debug": source.get("debug"),
+        "summary": workload_summary,
+        "task_definitions": definitions,
     }
 
 
@@ -447,9 +567,10 @@ def _campaign_one(document: Any, detailed: bool) -> Dict[str, Any]:
     return _campaign(_object(document, "campaign"))
 
 
-def _campaign_start(document: Any, detailed: bool) -> Dict[str, Any]:
+def project_campaign_start(document: Any, detailed: bool = False) -> Dict[str, Any]:
     source = _object(document, "campaign.start")
     result = _pick(source, ("campaign_id", "exported_to"))
+    result["summary"] = _workload_summary(source.get("summary"), "campaign.start")
     if detailed:
         result["runners"] = [
             project_runner(item, True) for item in source.get("runners", [])
@@ -460,6 +581,45 @@ def _campaign_start(document: Any, detailed: bool) -> Dict[str, Any]:
         if isinstance(source.get("campaign_status"), Mapping):
             result["campaign_status"] = _campaign(source["campaign_status"])
     return result
+
+
+def _campaign_validate(document: Any, detailed: bool) -> Dict[str, Any]:
+    source = _object(document, "campaign.validate")
+    raw_artifacts = source.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        raise ClientError("campaign.validate response must contain an artifacts array")
+    artifacts = []
+    for index, artifact in enumerate(raw_artifacts):
+        if not isinstance(artifact, Mapping):
+            raise ClientError(f"campaign.validate artifact {index} must be an object")
+        artifacts.append(
+            _pick(
+                artifact,
+                (
+                    "kind",
+                    "repository_id",
+                    "filename",
+                    "revision",
+                    "immutable_revision",
+                    "cache_hit",
+                    "file_count",
+                    "size_bytes",
+                    "sha256",
+                    "adapter",
+                    "record_count",
+                ),
+            )
+        )
+    return {
+        "version": source.get("version"),
+        "valid": source.get("valid"),
+        "campaign": source.get("campaign"),
+        "workload": _workload_summary(
+            source.get("workload"),
+            "campaign.validate",
+        ),
+        "artifacts": artifacts,
+    }
 
 
 def _runner_one(document: Any, detailed: bool) -> Dict[str, Any]:
@@ -508,7 +668,9 @@ _ADAPTERS: Dict[str, Projector] = {
     "auth.add": _auth_one,
     "auth.revoke": _auth_one,
     "auth.events": _auth_events,
-    "campaign.start": _campaign_start,
+    "campaign.validate": _campaign_validate,
+    "campaign.preview": _campaign_preview,
+    "campaign.start": project_campaign_start,
     "campaign.status": _campaign_status,
     "campaign.list": _campaign_list,
     "campaign.cancel": _campaign_one,
@@ -534,6 +696,8 @@ def _renderer(route: str, arguments: Any) -> str:
         getattr(arguments, "json", False) or getattr(arguments, "full", False)
     ):
         return "health"
+    if route == "scheduler.status" and not getattr(arguments, "json", False):
+        return "scheduler_status"
     if route == "campaign.status" and not (
         getattr(arguments, "json", False)
         or getattr(arguments, "full", False)
@@ -542,6 +706,10 @@ def _renderer(route: str, arguments: Any) -> str:
         return "campaign_status"
     if route == "campaign.list" and not getattr(arguments, "json", False):
         return "campaign_table"
+    if route == "campaign.validate" and not getattr(arguments, "json", False):
+        return "artifact_validation"
+    if route == "campaign.preview" and not getattr(arguments, "json", False):
+        return "task_preview"
     if route == "runner.list" and not (
         getattr(arguments, "json", False) or getattr(arguments, "full", False)
     ):
@@ -581,6 +749,7 @@ def adapt_cli_response(arguments: Any, document: Any) -> CLIProjection:
     detailed = bool(
         getattr(arguments, "full", False)
         or getattr(arguments, "include_requests", False)
+        or getattr(arguments, "debug", False)
     )
     return CLIProjection(
         route=route,

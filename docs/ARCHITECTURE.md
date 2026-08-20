@@ -8,7 +8,7 @@ Prime, Warm, Probe, retention, and promotion is metadata, never Planner behavior
 
 ```text
 YAML authoring syntax
-  matrix / sequence / repeat / parallel / invoke
+  instances(matrix, trials, seed) / workflow / invoke / repeat / parallel / sequence
                     │
                     ▼
              Workload Compiler
@@ -71,34 +71,68 @@ The performance guard estimates the fully expanded graph before acceptance:
 Unknown benchmark defaults remain visible as admission warnings. A `repeat` is finite and
 bounded; there is no runtime loop capable of escaping static accounting.
 
+### 2.1 Backend ownership layers
+
+Backend support code is organized by stable ownership boundary rather than by individual
+download or validation features:
+
+- `config.py` owns dotenv discovery, Provider-only environment reloads, YAML expansion,
+  validation, and the atomic active configuration store;
+- `outbound.py` owns process-wide HTTP(S) proxy normalization, the Hugging Face HTTP
+  client, native Xet proxy visibility, and the explicit direct-connection policy for Ray
+  control traffic;
+- `artifacts.py` owns the common artifact descriptor and resolver capabilities, Hugging
+  Face identity rules, dataset and tokenizer materialization, and active post-download
+  integrity validation.
+
+Dataset and tokenizer caches receive the same immutable outbound policy. Their resolutions
+implement one artifact descriptor protocol, so preflight validation depends on the common
+contract rather than importing and type-dispatching over concrete cache implementations.
+Artifact validation also exposes an NDJSON stream of path-free byte progress, heartbeat,
+and terminal result events. This keeps Hugging Face filesystem paths inside the Backend
+while allowing a remote CLI to render transfer progress on stderr.
+Worker runtime constants remain in `worker.py`; importing a Worker does not initialize the
+Backend artifact stack merely to obtain its dataset handoff key. Worker-side token counting
+retains its separate execution dependency on Transformers.
+
 ## 3. Workload Compiler
 
-`task_definitions` is compile-time syntax. It is not a second scheduler.
+`task_definitions` is a typed compile-time DSL. It is not a second scheduler. Its dedicated
+design is documented in [TASK_COMPILER_ARCHITECTURE.md](TASK_COMPILER_ARCHITECTURE.md).
 
 ### 3.1 Atomic node
 
-Every compiled node contains:
+Every logical compilation row contains:
 
 - stable `node_id` inside one task instance;
-- dependency Dispatch IDs;
+- logical dependency node IDs;
 - `after_seconds` relative to completion of all dependencies;
-- one resolved Runner template;
 - semantic `role` tag;
 - logical `payload_id` and derived `payload_seed`;
 - matrix dimensions and zero-based `trial_index`.
+
+Final assembly maps logical dependencies to Dispatch IDs and attaches one resolved Runner
+template to each node.
 
 The compiler forces task Runners to `concurrent_requests: 1` and
 `max_completed_requests: 1`.
 
 ### 3.2 Composition
 
-- `matrix` creates Cartesian coordinates.
-- `trials` creates independent samples at each coordinate.
-- `sequence` carries the current dependency frontier forward.
-- `repeat` expands to a serial chain; count and interval may reference dimensions.
-- `parallel` creates siblings from the same frontier; the next sequence item joins all
-  siblings.
-- `invoke` is the only runtime node type.
+- `instances.matrix` creates Cartesian coordinates.
+- `instances.trials` creates independent samples at each coordinate.
+- `instances.seed` identifies deterministic payload families.
+- top-level `workflow` carries the current dependency frontier forward;
+- `invoke`, `repeat`, `parallel`, and nested `sequence` map directly to immutable
+  `BaseNode` subclasses;
+- `repeat` expands any nested node to a bounded serial chain;
+- `parallel` expands nested branches from the same frontier and implicitly joins their
+  outgoing frontiers;
+- `invoke` remains the only runtime node type.
+
+Expansion first produces a UUID-free `CompilationTable` of logical instance and node rows.
+Only `TaskAssembler` assigns Task Instance and Dispatch UUIDs and converts logical
+dependencies into persistence identities.
 
 The Planner receives only the resulting DAG and therefore does not change when new
 experiments are composed, provided that the experiment stays inside the finite,
@@ -120,10 +154,18 @@ makes that behavior measurable.
 
 The payload boundary resolves artifact location independently from record decoding. A
 dataset's required `adapter` names a registered prompt-record decoder: `sharegpt` extracts
-the first conversation value, `text` maps non-empty lines, and `builtin-sonnet` owns the
-packaged fallback and its instruction. No orchestration layer branches on ShareGPT. All
-adapters normalize into one indexed-record interface without changing graph or Planner
-semantics. Dataset `sample` mode preserves a whole record. `concatenate` mode walks a
+any non-empty first conversation value, `sharegpt-user` restricts first-turn roles to
+`human` or `user`, `document-text` maps every non-empty Parquet or Arrow `text` row to one
+complete document, `text` maps non-empty text-file lines, and `builtin-sonnet` owns the
+packaged fallback and its instruction. External adapters use Hugging Face Datasets to
+normalize JSON, Parquet, Arrow, or text artifacts into a persistent Arrow-backed row index.
+ShareGPT JSON arrays and JSONL are incrementally parsed into that index because the
+upstream JSON builder otherwise performs a full read for arrays; other supported formats
+use standard builders. The in-memory selection state contains shuffled row positions
+rather than a second copy of all prompt text. No orchestration layer branches on a dataset
+brand. All adapters expose one indexed record interface without changing graph or Planner
+semantics. Dataset `sample` mode
+preserves a whole record. `concatenate` mode walks a
 seeded shuffle without replacement until the corpus is exhausted, then starts a newly
 shuffled cycle only as needed to fill the requested token budget. A truncated final record
 is still consumed in that cycle. The Worker records a text-free selection manifest (source

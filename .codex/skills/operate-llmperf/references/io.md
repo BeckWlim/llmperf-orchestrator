@@ -48,6 +48,9 @@ PostgreSQL/API authoritative record
 - Worker stdout/stderr appears only through `logs` or explicit full export.
 - Start, cancel, and export actions write progress and durable IDs to stderr and do not dump
   raw responses to stdout.
+- Artifact transfers use path-free absolute `completed_bytes/total_bytes` events and
+  heartbeats. Render a dynamic byte counter on terminal stderr and structured event records
+  on redirected stderr; do not introduce terminal progress-bar rendering.
 - `render_result` is the only CLI rendering-policy entry point; it must reject raw dict/list
   responses.
 

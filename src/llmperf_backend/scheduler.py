@@ -13,6 +13,7 @@ from llmperf_backend.models import (
     PerformanceGuardConfig,
     SchedulerConfig,
 )
+from llmperf_backend.outbound import configure_ray_direct
 from llmperf_backend.persistence import (
     CANCELLED,
     FAILED,
@@ -20,11 +21,17 @@ from llmperf_backend.persistence import (
     TERMINAL_STATUSES,
 )
 from llmperf_backend.providers import ProviderRegistry
-from llmperf_backend.tokenizers import TokenizerCache, TokenizerResolver
-from llmperf_backend.datasets import DatasetCache, DatasetResolver, WORKER_DATASET_PATH
+from llmperf_backend.artifacts import (
+    ArtifactCaches,
+    DatasetCache,
+    DatasetResolver,
+    TokenizerCache,
+    TokenizerResolver,
+)
 from llmperf_backend.safety import RuntimePerformanceGuard
 from llmperf_backend.worker import (
     Worker,
+    WORKER_DATASET_PATH,
     benchmark_actor_count,
     summarize_outcome,
 )
@@ -88,8 +95,13 @@ class Scheduler:
         self.config = config
         self.database_config = database_config
         self.provider_registry = provider_registry
-        self.tokenizer_cache = tokenizer_cache or TokenizerCache()
-        self.dataset_cache = dataset_cache or DatasetCache()
+        if tokenizer_cache is None and dataset_cache is None:
+            artifact_caches = ArtifactCaches.from_environment()
+            self.tokenizer_cache: TokenizerResolver = artifact_caches.tokenizer
+            self.dataset_cache: DatasetResolver = artifact_caches.dataset
+        else:
+            self.tokenizer_cache = tokenizer_cache or TokenizerCache()
+            self.dataset_cache = dataset_cache or DatasetCache()
         self.performance_guard = RuntimePerformanceGuard(
             performance_guard_config or PerformanceGuardConfig()
         )
@@ -173,6 +185,7 @@ class Scheduler:
         }
 
     async def _start_ray_runtime(self) -> None:
+        configure_ray_direct(os.environ)
         import ray
 
         options: Dict[str, Any] = {

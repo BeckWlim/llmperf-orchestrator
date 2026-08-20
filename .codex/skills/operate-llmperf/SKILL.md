@@ -43,8 +43,8 @@ Apply these invariants:
 6. Keep Provider endpoints and credentials in Backend-owned profiles. Put only
    the stable provider ID and model ID in workload YAML.
 7. Treat an atomic single-request Runner as the only compiled-task execution primitive.
-   The Workload Compiler owns matrix/repeat/parallel expansion; the Planner only handles
-   dependencies and due times and must not interpret role names.
+   The Workload Compiler owns typed workflow-node expansion and runtime assembly; the
+   Planner only handles dependencies and due times and must not interpret role names.
 8. Distinguish Campaign lifecycle `status` from aggregate execution `outcome`.
    Never infer that `completed` means every Runner succeeded.
 
@@ -104,17 +104,18 @@ Select the durable shape:
 - Use Campaign `runners` to compare several immediate configurations.
 - Use a bounded RunnerPlan for repeated wall-clock or interval measurements.
 - Use `cache_probe` for within-Runner exact-repeat or prefix/mutation comparisons.
-- Use `task_definitions` for cross-Runner causal experiments. Compose only the atomic
-  `invoke` node with bounded `matrix`, `sequence`, `repeat`, and `parallel` syntax.
+- Use `task_definitions` for cross-Runner causal experiments. Compose the atomic `invoke`
+  node through bounded `instances.matrix` expansion and typed `workflow` primitives:
+  `repeat`, `parallel`, and nested `sequence`.
 - Express passive retention as independent delay-matrix instances; express access-
   conditioned residency as a repeat chain; express repeated-hit behavior as a
   `warmup_count × quiet_seconds` matrix. Role strings are analysis tags only.
 - Use the same payload ID for exact Prime/Warm/Probe replay and a different payload
   namespace for controls. Random sampling must be deterministic and hash-verified.
-- Treat the bundled sonnet file and downloaded ShareGPT artifacts as adapters to the same
-  prompt-dataset pipeline. Sonnet remains the zero-dependency fallback; for large or long-
-  context workloads, prefer a revision-pinned ShareGPT dataset. Use `sample` for intact
-  first turns and `concatenate` for seeded, no-replacement assembly to a token budget.
+- Treat bundled sonnet, conversation, and document artifacts as adapters to the same
+  prompt-dataset pipeline. Sonnet remains the zero-dependency fallback; use a
+  revision-pinned document corpus for coherent long-context workloads. Use `sample` for
+  intact records and `concatenate` for seeded, no-replacement assembly to a token budget.
 
 ## Follow the end-to-end workflow
 

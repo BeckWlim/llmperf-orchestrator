@@ -1,25 +1,48 @@
 """FastAPI application for configuration and durable benchmark orchestration."""
 
+import asyncio
 from contextlib import asynccontextmanager
 import copy
 from datetime import datetime, timezone
+import json
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.engine import make_url
 
 from llmperf.version import PROTOCOL_VERSION
+from llmperf_backend.artifacts import (
+    ArtifactCaches,
+    ArtifactDownloadProgress,
+    ArtifactProgressCallback,
+    ArtifactResolution,
+    ArtifactValidationError,
+    DatasetCache,
+    DatasetResolutionError,
+    DatasetResolver,
+    TokenizerCache,
+    TokenizerResolutionError,
+    TokenizerResolver,
+    artifact_progress_scope,
+    is_immutable_huggingface_revision,
+    validate_resolved_artifacts,
+)
 from llmperf_backend.auth import TokenVerifier, normalize_public_key
-from llmperf_backend.config import ConfigError, ConfigStore, ConfigSnapshot
-from llmperf_backend.environment import load_provider_environment
+from llmperf_backend.config import (
+    ConfigError,
+    ConfigSnapshot,
+    ConfigStore,
+    load_provider_environment,
+)
 from llmperf_backend.models import (
     BenchmarkCampaignCreate,
     BenchmarkCampaignStart,
     BenchmarkRunnerBatchCreate,
     BenchmarkRunnerCreate,
+    BenchmarkRunnerSpec,
     ResolvedBenchmarkConfig,
     RunnerPlanCreate,
     RunnerPlanPreview,
@@ -48,20 +71,92 @@ from llmperf_backend.providers import (
 )
 from llmperf_backend.scheduler import Scheduler
 from llmperf_backend.safety import WorkloadSafetyError, assess_workload
-from llmperf_backend.tokenizers import (
-    TokenizerCache,
-    TokenizerResolutionError,
-    TokenizerResolver,
-)
-from llmperf_backend.datasets import (
-    DatasetCache,
-    DatasetResolver,
-    DatasetResolutionError,
-    is_immutable_dataset_revision,
-)
+from llmperf_backend.task_compiler import TaskCompileContext, TaskCompiler
 
 RUNNER_STATUSES = {QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED}
 LOGGER = logging.getLogger(__name__)
+
+
+def _compile_campaign_task_preview(
+    payload: BenchmarkCampaignStart,
+    instance_limit: int,
+    node_limit: int,
+    include_debug: bool,
+) -> Dict[str, Any]:
+    """Compile TaskDefinitions into a bounded, persistence-free preview."""
+
+    definition_previews: List[Dict[str, Any]] = []
+    total_instances = 0
+    total_nodes = 0
+    previewed_instances = 0
+    for definition_index, definition in enumerate(payload.task_definitions):
+        recipe = definition.recipe()
+        compile_context = TaskCompileContext(
+            definition_id=f"preview-{definition_index}",
+            definition_name=definition.name,
+            definition=recipe,
+            runner_template=dump_model(definition.runner),
+        )
+        compilation_table = TaskCompiler(compile_context).compile()
+        instance_count = len(compilation_table.instances)
+        node_count = len(compilation_table.nodes)
+        remaining_instance_count = max(instance_limit - previewed_instances, 0)
+        visible_instances = compilation_table.instances[:remaining_instance_count]
+        instance_previews: List[Dict[str, Any]] = []
+        for instance_row in visible_instances:
+            node_previews: List[Dict[str, Any]] = []
+            instance_nodes = compilation_table.nodes_for(instance_row.instance_key)
+            for node_row in instance_nodes[:node_limit]:
+                node_preview: Dict[str, Any] = {
+                    "node_id": node_row.node_id,
+                    "dependencies": list(node_row.dependencies),
+                    "after_seconds": node_row.after_seconds,
+                    "role": node_row.role,
+                    "payload_id": node_row.payload_id,
+                }
+                if include_debug:
+                    node_preview["payload_seed"] = node_row.payload_seed
+                node_previews.append(node_preview)
+            instance_previews.append(
+                {
+                    "instance_key": instance_row.instance_key,
+                    "dimensions": instance_row.dimensions,
+                    "trial_index": instance_row.trial_index,
+                    "node_count": len(instance_nodes),
+                    "shown_node_count": min(len(instance_nodes), node_limit),
+                    "truncated_node_count": max(len(instance_nodes) - node_limit, 0),
+                    "nodes": node_previews,
+                }
+            )
+        shown_instance_count = len(instance_previews)
+        definition_previews.append(
+            {
+                "name": definition.name,
+                "instance_count": instance_count,
+                "node_count": node_count,
+                "shown_instance_count": shown_instance_count,
+                "truncated_instance_count": instance_count - shown_instance_count,
+                "instances": instance_previews,
+            }
+        )
+        total_instances += instance_count
+        total_nodes += node_count
+        previewed_instances += shown_instance_count
+    return {
+        "version": PROTOCOL_VERSION,
+        "valid": True,
+        "campaign": payload.campaign.name,
+        "debug": include_debug,
+        "summary": {
+            "immediate_runners": len(payload.runners),
+            "runner_plans": len(payload.runner_plans),
+            "task_definitions": len(payload.task_definitions),
+            "task_instances": total_instances,
+            "task_nodes": total_nodes,
+            "previewed_instances": previewed_instances,
+        },
+        "task_definitions": definition_previews,
+    }
 
 
 def _redact_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -104,8 +199,13 @@ def create_app(
         load_provider_environment(), reload_loader=load_provider_environment
     )
     discovery = model_discovery or ProviderModelDiscovery(providers)
-    tokenizers = tokenizer_cache or TokenizerCache()
-    datasets = dataset_cache or DatasetCache()
+    if tokenizer_cache is None and dataset_cache is None:
+        artifact_caches = ArtifactCaches.from_environment()
+        tokenizers: TokenizerResolver = artifact_caches.tokenizer
+        datasets: DatasetResolver = artifact_caches.dataset
+    else:
+        tokenizers = tokenizer_cache or TokenizerCache()
+        datasets = dataset_cache or DatasetCache()
     token_verifier = TokenVerifier(validated_config.auth, repository)
     active_scheduler = scheduler or Scheduler(
         repository,
@@ -168,12 +268,23 @@ def create_app(
         benchmark: Dict[str, Any],
         *,
         tokenizer_selection: str,
+        artifact_resolutions: Optional[
+            Dict[Tuple[str, ...], ArtifactResolution]
+        ] = None,
     ) -> Dict[str, Any]:
         try:
             resolved = request.app.state.provider_registry.resolve_benchmark(benchmark)
             tokenizer = resolved.get("tokenizer")
             if tokenizer is not None:
                 resolution = await request.app.state.tokenizer_cache.resolve(tokenizer)
+                if artifact_resolutions is not None:
+                    tokenizer_key = (
+                        "tokenizer",
+                        resolution.tokenizer_id,
+                        resolution.revision,
+                        str(resolution.use_fast),
+                    )
+                    artifact_resolutions.setdefault(tokenizer_key, resolution)
                 tokenizer_spec = resolution.benchmark_spec(
                     selection=tokenizer_selection,
                     accuracy=(
@@ -224,6 +335,14 @@ def create_app(
                 dataset_resolution = await request.app.state.dataset_cache.resolve(
                     dataset
                 )
+                if artifact_resolutions is not None:
+                    dataset_key = (
+                        "dataset",
+                        dataset_resolution.dataset_id,
+                        dataset_resolution.filename,
+                        dataset_resolution.revision,
+                    )
+                    artifact_resolutions.setdefault(dataset_key, dataset_resolution)
                 resolved["dataset"] = dataset_resolution.benchmark_spec()
             return dump_model(ResolvedBenchmarkConfig.model_validate(resolved))
         except (
@@ -237,25 +356,30 @@ def create_app(
         request: Request,
         runner: Any,
         default_benchmark: Dict[str, Any],
+        artifact_resolutions: Optional[
+            Dict[Tuple[str, ...], ArtifactResolution]
+        ] = None,
     ) -> Dict[str, Any]:
+        validated_runner = BenchmarkRunnerSpec.model_validate(runner)
         benchmark = (
             default_benchmark
-            if runner.benchmark is None
-            else dump_model(runner.benchmark)
+            if validated_runner.benchmark is None
+            else dump_model(validated_runner.benchmark)
         )
         tokenizer_selection = (
             "explicit"
-            if runner.benchmark is not None
-            and "tokenizer" in runner.benchmark.model_fields_set
+            if validated_runner.benchmark is not None
+            and "tokenizer" in validated_runner.benchmark.model_fields_set
             else "global_default"
         )
         return {
-            "label": runner.label,
-            "metadata": runner.metadata,
+            "label": validated_runner.label,
+            "metadata": validated_runner.metadata,
             "benchmark": await resolve_benchmark(
                 request,
                 benchmark,
                 tokenizer_selection=tokenizer_selection,
+                artifact_resolutions=artifact_resolutions,
             ),
         }
 
@@ -263,6 +387,9 @@ def create_app(
         request: Request,
         runner_plan: RunnerPlanCreate,
         default_benchmark: Dict[str, Any],
+        artifact_resolutions: Optional[
+            Dict[Tuple[str, ...], ArtifactResolution]
+        ] = None,
     ) -> Dict[str, Any]:
         return {
             "plan": {
@@ -276,7 +403,10 @@ def create_app(
                 "misfire_grace_seconds": runner_plan.misfire_grace_seconds,
             },
             "runner_template": await resolve_runner(
-                request, runner_plan.runner, default_benchmark
+                request,
+                runner_plan.runner,
+                default_benchmark,
+                artifact_resolutions,
             ),
         }
 
@@ -309,6 +439,101 @@ def create_app(
             ) from exc
         LOGGER.info("Performance safety assessment: %s", assessment)
         return assessment
+
+    async def resolve_campaign_payload(
+        request: Request,
+        payload: BenchmarkCampaignStart,
+        artifact_resolutions: Optional[
+            Dict[Tuple[str, ...], ArtifactResolution]
+        ] = None,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Resolve and validate one Campaign workload without persisting it."""
+
+        default_benchmark = request.app.state.config_store.snapshot().config[
+            "benchmark"
+        ]
+        resolved_runners = [
+            await resolve_runner(
+                request,
+                runner,
+                default_benchmark,
+                artifact_resolutions,
+            )
+            for runner in payload.runners
+        ]
+        resolved_runner_plans = [
+            await resolve_plan(
+                request,
+                runner_plan,
+                default_benchmark,
+                artifact_resolutions,
+            )
+            for runner_plan in payload.runner_plans
+        ]
+        resolved_task_definitions: List[Dict[str, Any]] = []
+        for definition in payload.task_definitions:
+            resolved_runner = await resolve_runner(
+                request,
+                definition.runner,
+                default_benchmark,
+                artifact_resolutions,
+            )
+            resolved_benchmark = resolved_runner["benchmark"]
+            if resolved_benchmark.get("cache_probe") is not None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="compiled task runner cannot define cache_probe",
+                )
+            resolved_dataset = resolved_benchmark.get("dataset")
+            if resolved_dataset is not None and not is_immutable_huggingface_revision(
+                resolved_dataset.get("revision")
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "compiled task datasets must resolve to an immutable "
+                        "Hugging Face commit revision"
+                    ),
+                )
+            if int(resolved_benchmark.get("stddev_input_tokens", 0)) != 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail="compiled tasks require stddev_input_tokens=0",
+                )
+            if int(resolved_benchmark.get("stddev_output_tokens", 0)) != 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail="compiled tasks require stddev_output_tokens=0",
+                )
+            resolved_tokenizer = resolved_benchmark.get("tokenizer") or {}
+            if (
+                not resolved_tokenizer.get("immutable_revision")
+                or resolved_tokenizer.get("accuracy") == "approximate"
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "compiled tasks require an explicit/model-bound "
+                        "tokenizer at an immutable Hugging Face revision"
+                    ),
+                )
+            resolved_task_definitions.append(
+                {
+                    "definition": dump_model(definition),
+                    "runner_template": resolved_runner,
+                }
+            )
+        enforce_performance_guard(
+            request,
+            runners=resolved_runners,
+            runner_plans=resolved_runner_plans,
+            task_definitions=resolved_task_definitions,
+        )
+        return (
+            resolved_runners,
+            resolved_runner_plans,
+            resolved_task_definitions,
+        )
 
     @application.get("/health", tags=["system"])
     async def health(request: Request) -> Dict[str, Any]:
@@ -419,6 +644,156 @@ def create_app(
             payload.name, payload.description, payload.tags, actor
         )
 
+    async def validate_campaign_artifact_document(
+        request: Request,
+        payload: BenchmarkCampaignStart,
+        progress_callback: Optional[ArtifactProgressCallback] = None,
+    ) -> Dict[str, Any]:
+        """Materialize and verify Campaign artifacts without persistence."""
+
+        artifact_resolutions: Dict[Tuple[str, ...], ArtifactResolution] = {}
+        if progress_callback is None:
+            resolved_payload = await resolve_campaign_payload(
+                request, payload, artifact_resolutions
+            )
+        else:
+            with artifact_progress_scope(progress_callback):
+                resolved_payload = await resolve_campaign_payload(
+                    request, payload, artifact_resolutions
+                )
+        resolved_runners, resolved_runner_plans, resolved_task_definitions = (
+            resolved_payload
+        )
+        ordered_resolutions = tuple(
+            resolution for _, resolution in sorted(artifact_resolutions.items())
+        )
+        event_loop = asyncio.get_running_loop()
+        try:
+            artifact_evidence = await event_loop.run_in_executor(
+                None, validate_resolved_artifacts, ordered_resolutions
+            )
+        except ArtifactValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        artifacts = [evidence.public_dict() for evidence in artifact_evidence]
+        task_estimates = []
+        for task_definition in resolved_task_definitions:
+            definition_document = task_definition["definition"]
+            recipe_document = {
+                key: value
+                for key, value in definition_document.items()
+                if key != "runner"
+            }
+            task_estimates.append(TaskCompiler.estimate(recipe_document))
+        LOGGER.info(
+            "Campaign artifact validation completed: campaign=%s artifacts=%d "
+            "bytes=%d",
+            payload.campaign.name,
+            len(artifacts),
+            sum(int(artifact["size_bytes"]) for artifact in artifacts),
+        )
+        return {
+            "version": PROTOCOL_VERSION,
+            "valid": True,
+            "campaign": payload.campaign.name,
+            "workload": {
+                "immediate_runners": len(resolved_runners),
+                "runner_plans": len(resolved_runner_plans),
+                "task_definitions": len(resolved_task_definitions),
+                "task_instances": sum(
+                    estimate["instances"] for estimate in task_estimates
+                ),
+                "task_nodes": sum(estimate["nodes"] for estimate in task_estimates),
+            },
+            "artifacts": artifacts,
+        }
+
+    @api.post(
+        "/campaigns/validate-artifacts",
+        tags=["campaigns", "artifacts"],
+    )
+    async def validate_campaign_artifacts(
+        request: Request, payload: BenchmarkCampaignStart
+    ) -> Dict[str, Any]:
+        """Materialize and verify Campaign artifacts without persistence."""
+
+        require_role(request, "operator")
+        return await validate_campaign_artifact_document(request, payload)
+
+    @api.post(
+        "/campaigns/validate-artifacts/stream",
+        tags=["campaigns", "artifacts"],
+    )
+    async def stream_campaign_artifacts(
+        request: Request, payload: BenchmarkCampaignStart
+    ) -> StreamingResponse:
+        """Stream path-free transfer progress and final validation evidence."""
+
+        require_role(request, "operator")
+        event_loop = asyncio.get_running_loop()
+        progress_events: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+
+        def publish_progress(progress: ArtifactDownloadProgress) -> None:
+            event_loop.call_soon_threadsafe(
+                progress_events.put_nowait,
+                {"event": "progress", "progress": progress.public_dict()},
+            )
+
+        async def run_validation() -> None:
+            try:
+                validation = await validate_campaign_artifact_document(
+                    request,
+                    payload,
+                    publish_progress,
+                )
+                await progress_events.put({"event": "result", "result": validation})
+            except HTTPException as exc:
+                await progress_events.put(
+                    {
+                        "event": "error",
+                        "status_code": exc.status_code,
+                        "detail": exc.detail,
+                    }
+                )
+            except Exception:
+                LOGGER.exception("Streaming Campaign artifact validation failed")
+                await progress_events.put(
+                    {
+                        "event": "error",
+                        "status_code": 500,
+                        "detail": "Internal Server Error",
+                    }
+                )
+
+        async def event_stream() -> AsyncIterator[str]:
+            validation_task = asyncio.create_task(run_validation())
+            while True:
+                try:
+                    event = await asyncio.wait_for(progress_events.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    event = {"event": "heartbeat"}
+                yield json.dumps(event, separators=(",", ":")) + "\n"
+                if event["event"] in {"result", "error"}:
+                    await validation_task
+                    return
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="application/x-ndjson",
+        )
+
+    @api.post("/campaigns/preview", tags=["campaigns", "tasks"])
+    async def preview_campaign_tasks(
+        request: Request,
+        payload: BenchmarkCampaignStart,
+        limit: int = Query(default=20, ge=1, le=200),
+        node_limit: int = Query(default=100, ge=1, le=1_000),
+        debug: bool = Query(default=False),
+    ) -> Dict[str, Any]:
+        """Validate and expand TaskDefinitions without persistence or artifacts."""
+
+        require_role(request, "viewer")
+        return _compile_campaign_task_preview(payload, limit, node_limit, debug)
+
     @api.post(
         "/campaigns/start",
         tags=["campaigns", "runners", "planner"],
@@ -430,70 +805,9 @@ def create_app(
         """Validate first, then atomically distribute one Campaign workload."""
 
         actor = require_role(request, "operator")
-        default_benchmark = request.app.state.config_store.snapshot().config[
-            "benchmark"
-        ]
-        runners = [
-            await resolve_runner(request, runner, default_benchmark)
-            for runner in payload.runners
-        ]
-        runner_plans = [
-            await resolve_plan(request, runner_plan, default_benchmark)
-            for runner_plan in payload.runner_plans
-        ]
-        task_definitions = []
-        for definition in payload.task_definitions:
-            runner = await resolve_runner(request, definition.runner, default_benchmark)
-            benchmark = runner["benchmark"]
-            if benchmark.get("cache_probe") is not None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="compiled task runner cannot define cache_probe",
-                )
-            dataset = benchmark.get("dataset")
-            if dataset is not None and not is_immutable_dataset_revision(
-                dataset.get("revision")
-            ):
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "compiled task datasets must resolve to an immutable "
-                        "Hugging Face commit revision"
-                    ),
-                )
-            if int(benchmark.get("stddev_input_tokens", 0)) != 0:
-                raise HTTPException(
-                    status_code=422,
-                    detail="compiled tasks require stddev_input_tokens=0",
-                )
-            if int(benchmark.get("stddev_output_tokens", 0)) != 0:
-                raise HTTPException(
-                    status_code=422,
-                    detail="compiled tasks require stddev_output_tokens=0",
-                )
-            tokenizer = benchmark.get("tokenizer") or {}
-            if (
-                not tokenizer.get("immutable_revision")
-                or tokenizer.get("accuracy") == "approximate"
-            ):
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        "compiled tasks require an explicit/model-bound "
-                        "tokenizer at an immutable Hugging Face revision"
-                    ),
-                )
-            task_definitions.append(
-                {
-                    "definition": dump_model(definition),
-                    "runner_template": runner,
-                }
-            )
-        enforce_performance_guard(
+        runners, runner_plans, task_definitions = await resolve_campaign_payload(
             request,
-            runners=runners,
-            runner_plans=runner_plans,
-            task_definitions=task_definitions,
+            payload,
         )
         workload = await request.app.state.runner_repository.create_campaign_workload(
             payload.campaign.name,
@@ -505,12 +819,16 @@ def create_app(
             actor,
         )
         campaign_id = workload["campaign"]["campaign_id"]
+        workload_summary = workload["summary"]
         LOGGER.info(
-            "Campaign %s workload accepted: runners=%d runner_plans=%d task_definitions=%d",
+            "Campaign %s workload accepted: immediate_runners=%d runner_plans=%d "
+            "task_definitions=%d task_instances=%d task_nodes=%d",
             campaign_id,
-            len(workload["items"]),
-            len(workload["runner_plans"]),
-            len(workload["task_definitions"]),
+            workload_summary["immediate_runners"],
+            workload_summary["runner_plans"],
+            workload_summary["task_definitions"],
+            workload_summary["task_instances"],
+            workload_summary["task_nodes"],
         )
         for runner_plan in workload["runner_plans"]:
             LOGGER.info(

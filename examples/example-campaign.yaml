@@ -44,13 +44,19 @@ runners:
 
 task_definitions:
   - name: example-replay-task
-    trials: 1
-    seed: 11111
+    instances:
+      trials: 1
+      seed: 11111
     payloads:
       replay: {seed_namespace: replay}
-    sequence:
-      - {kind: invoke, id: prime, role: prime, payload: replay}
-      - {kind: invoke, id: warm, role: warm, payload: replay, after_seconds: 1}
+    workflow:
+      - invoke:
+          name: prime
+          payload: replay
+      - invoke:
+          name: warm
+          payload: replay
+          after_seconds: 1
     runner:
       label: example-replay-task
       metadata:

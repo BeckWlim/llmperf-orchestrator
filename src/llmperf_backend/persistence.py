@@ -1,8 +1,9 @@
 """Asynchronous PostgreSQL persistence for benchmark Runners and metrics."""
 
 import math
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -31,11 +32,17 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, aliased, mapped_column
+from sqlalchemy.sql import Select
 
 from llmperf.version import PROTOCOL_VERSION, TASK_FORMAT_VERSION
 from llmperf_backend.models import DatabaseConfig
 from llmperf_backend.planner import as_utc, next_fire_details
-from llmperf_backend.task_compiler import TaskCompileContext, compile_task_definition
+from llmperf_backend.task_compiler import (
+    TaskAssembler,
+    TaskCompileContext,
+    TaskCompiler,
+    TaskRecipe,
+)
 
 QUEUED = "queued"
 RUNNING = "running"
@@ -340,6 +347,114 @@ class BenchmarkRunnerRecord(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     stdout: Mapped[Optional[str]] = mapped_column(Text)
     stderr: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class RunnerRecordFactory:
+    """Construct queued Runner records without persistence side effects."""
+
+    @staticmethod
+    def _json_document(document: Mapping[str, Any]) -> Dict[str, Any]:
+        return {str(key): json_safe(value) for key, value in document.items()}
+
+    @classmethod
+    def queued(
+        cls,
+        benchmark_config: Mapping[str, Any],
+        user_metadata: Mapping[str, Any],
+        created_by: str,
+        campaign_id: Optional[str] = None,
+        label: Optional[str] = None,
+        runner_plan_id: Optional[str] = None,
+        plan_occurrence: Optional[int] = None,
+        scheduled_for: Optional[datetime] = None,
+        plan_template_version: Optional[str] = None,
+    ) -> BenchmarkRunnerRecord:
+        """Create one queued Runner from validated execution inputs."""
+
+        normalized_benchmark = cls._json_document(benchmark_config)
+        normalized_metadata = cls._json_document(user_metadata)
+        return BenchmarkRunnerRecord(
+            id=str(uuid4()),
+            campaign_id=campaign_id,
+            runner_plan_id=runner_plan_id,
+            plan_occurrence=plan_occurrence,
+            scheduled_for=scheduled_for,
+            plan_template_version=plan_template_version,
+            label=label,
+            created_by=created_by,
+            status=QUEUED,
+            benchmark_config=normalized_benchmark,
+            user_metadata=normalized_metadata,
+        )
+
+    @classmethod
+    def from_template(
+        cls,
+        runner_template: Mapping[str, Any],
+        created_by: str,
+        campaign_id: Optional[str] = None,
+        runner_plan_id: Optional[str] = None,
+        plan_occurrence: Optional[int] = None,
+        scheduled_for: Optional[datetime] = None,
+        plan_template_version: Optional[str] = None,
+    ) -> BenchmarkRunnerRecord:
+        """Create one queued Runner from a persisted Runner template."""
+
+        benchmark_value: object = runner_template.get("benchmark")
+        if not isinstance(benchmark_value, Mapping):
+            raise ValueError("runner_template.benchmark must be an object")
+        metadata_value: object = runner_template.get("metadata", {})
+        if not isinstance(metadata_value, Mapping):
+            raise ValueError("runner_template.metadata must be an object")
+        label_value: object = runner_template.get("label")
+        if label_value is not None and not isinstance(label_value, str):
+            raise ValueError("runner_template.label must be a string or null")
+
+        return cls.queued(
+            benchmark_config=benchmark_value,
+            user_metadata=metadata_value,
+            created_by=created_by,
+            campaign_id=campaign_id,
+            label=label_value,
+            runner_plan_id=runner_plan_id,
+            plan_occurrence=plan_occurrence,
+            scheduled_for=scheduled_for,
+            plan_template_version=plan_template_version,
+        )
+
+    @classmethod
+    def from_dispatch(
+        cls, dispatch: BenchmarkRunnerDispatchRecord
+    ) -> BenchmarkRunnerRecord:
+        """Create one queued Runner while preserving Dispatch provenance."""
+
+        lineage: Mapping[str, Any] = dispatch.lineage or {}
+        created_by_value: object = lineage.get("created_by")
+        created_by = (
+            created_by_value
+            if isinstance(created_by_value, str) and created_by_value
+            else "planner"
+        )
+        plan_occurrence_value: object = lineage.get("plan_occurrence")
+        if plan_occurrence_value is not None and not isinstance(
+            plan_occurrence_value, int
+        ):
+            raise ValueError("dispatch.lineage.plan_occurrence must be an integer")
+        template_version_value: object = lineage.get("plan_template_version")
+        if template_version_value is not None and not isinstance(
+            template_version_value, str
+        ):
+            raise ValueError("dispatch.lineage.plan_template_version must be a string")
+
+        return cls.from_template(
+            dispatch.runner_template,
+            created_by=created_by,
+            campaign_id=dispatch.campaign_id,
+            runner_plan_id=dispatch.runner_plan_id,
+            plan_occurrence=plan_occurrence_value,
+            scheduled_for=dispatch.due_at,
+            plan_template_version=template_version_value,
+        )
 
 
 class BenchmarkRequestRecord(Base):
@@ -786,14 +901,12 @@ class RunnerRepository:
         campaign_id: Optional[str] = None,
         label: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        runner = BenchmarkRunnerRecord(
-            id=str(uuid4()),
+        runner = RunnerRecordFactory.queued(
+            benchmark_config=benchmark,
+            user_metadata=metadata,
+            created_by=created_by,
             campaign_id=campaign_id,
             label=label,
-            created_by=created_by,
-            status=QUEUED,
-            benchmark_config=json_safe(benchmark),
-            user_metadata=json_safe(metadata),
         )
         async with self.database.sessions() as session, session.begin():
             if campaign_id is not None:
@@ -812,14 +925,10 @@ class RunnerRepository:
         self, campaign_id: str, runners: Sequence[Dict[str, Any]], created_by: str
     ) -> Optional[List[Dict[str, Any]]]:
         records = [
-            BenchmarkRunnerRecord(
-                id=str(uuid4()),
-                campaign_id=campaign_id,
-                label=runner.get("label"),
+            RunnerRecordFactory.from_template(
+                runner,
                 created_by=created_by,
-                status=QUEUED,
-                benchmark_config=json_safe(runner["benchmark"]),
-                user_metadata=json_safe(runner.get("metadata", {})),
+                campaign_id=campaign_id,
             )
             for runner in runners
         ]
@@ -876,14 +985,10 @@ class RunnerRepository:
             created_by=created_by,
         )
         records = [
-            BenchmarkRunnerRecord(
-                id=str(uuid4()),
-                campaign_id=campaign.id,
-                label=runner.get("label"),
+            RunnerRecordFactory.from_template(
+                runner,
                 created_by=created_by,
-                status=QUEUED,
-                benchmark_config=json_safe(runner["benchmark"]),
-                user_metadata=json_safe(runner.get("metadata", {})),
+                campaign_id=campaign.id,
             )
             for runner in runners
         ]
@@ -926,43 +1031,45 @@ class RunnerRepository:
                 )
                 session.add(definition)
                 await session.flush()
-                blueprints = compile_task_definition(
-                    TaskCompileContext(
-                        definition_id=definition.id,
-                        definition_name=definition.name,
-                        definition=definition_payload,
-                        runner_template=submitted["runner_template"],
-                        database_now=database_now,
-                        created_by=created_by,
-                    )
+                task_recipe = TaskRecipe.model_validate(definition_payload)
+                compile_context = TaskCompileContext(
+                    definition_id=definition.id,
+                    definition_name=definition.name,
+                    definition=task_recipe,
+                    runner_template=submitted["runner_template"],
                 )
-                for blueprint in blueprints:
+                compiler = TaskCompiler(compile_context)
+                compilation_table = compiler.compile()
+                assemblies = TaskAssembler(
+                    compile_context, compilation_table
+                ).assemble()
+                for assembly in assemblies:
                     instance_records.append(
                         BenchmarkTaskInstanceRecord(
-                            id=blueprint.instance_id,
+                            id=assembly.instance_id,
                             definition_id=definition.id,
                             campaign_id=campaign.id,
                             format_version=definition.format_version,
-                            instance_key=blueprint.instance_key,
+                            instance_key=assembly.instance_key,
                             state="planned",
                             spec=json_safe(
                                 {
-                                    "dimensions": blueprint.dimensions,
-                                    "trial_index": blueprint.trial_index,
+                                    "dimensions": assembly.dimensions,
+                                    "trial_index": assembly.trial_index,
                                 }
                             ),
                             checkpoint={},
                             outcome={"nodes": {}},
                         )
                     )
-                    for node in blueprint.nodes:
+                    for node in assembly.nodes:
                         dispatch_records.append(
                             BenchmarkRunnerDispatchRecord(
                                 id=node.dispatch_id,
                                 campaign_id=campaign.id,
                                 due_at=database_now if not node.dependencies else None,
                                 state="pending" if not node.dependencies else "blocked",
-                                task_instance_id=blueprint.instance_id,
+                                task_instance_id=assembly.instance_id,
                                 node_id=node.node_id,
                                 runner_template=json_safe(node.runner_template),
                                 lineage=json_safe(
@@ -980,6 +1087,10 @@ class RunnerRepository:
             session.add_all(records)
             session.add_all(plans)
             session.add_all(instance_records)
+            # Dispatches reference TaskInstances by scalar foreign-key ID rather than
+            # an ORM relationship. Establish every parent row explicitly before the
+            # dependent Dispatch INSERT batch so flush ordering is deterministic.
+            await session.flush()
             session.add_all(dispatch_records)
             await session.flush()
             session.add_all(
@@ -999,6 +1110,13 @@ class RunnerRepository:
             await session.flush()
         return {
             "campaign": self._campaign_dict(campaign),
+            "summary": {
+                "immediate_runners": len(records),
+                "runner_plans": len(plans),
+                "task_definitions": len(definition_records),
+                "task_instances": len(instance_records),
+                "task_nodes": len(dispatch_records),
+            },
             "items": [_runner_dict(runner) for runner in records],
             "runner_plans": [_runner_plan_dict(plan) for plan in plans],
             "task_definitions": [
@@ -1190,21 +1308,7 @@ class RunnerRepository:
         database_now: datetime,
         planner_id: Optional[str],
     ) -> None:
-        template = dispatch.runner_template
-        lineage = dispatch.lineage or {}
-        runner = BenchmarkRunnerRecord(
-            id=str(uuid4()),
-            campaign_id=dispatch.campaign_id,
-            runner_plan_id=dispatch.runner_plan_id,
-            plan_occurrence=lineage.get("plan_occurrence"),
-            scheduled_for=dispatch.due_at,
-            plan_template_version=lineage.get("plan_template_version"),
-            label=template.get("label"),
-            created_by=str(lineage.get("created_by") or "planner"),
-            status=QUEUED,
-            benchmark_config=json_safe(template["benchmark"]),
-            user_metadata=json_safe(template.get("metadata", {})),
-        )
+        runner = RunnerRecordFactory.from_dispatch(dispatch)
         session.add(runner)
         await session.flush()
         dispatch.state = "emitted"
@@ -1222,7 +1326,7 @@ class RunnerRepository:
                     self._plan_event(
                         plan.id,
                         "emitted",
-                        occurrence=lineage.get("plan_occurrence"),
+                        occurrence=runner.plan_occurrence,
                         scheduled_for=dispatch.due_at,
                         runner_id=runner.id,
                         message="Runner emitted through durable dispatch",
@@ -2012,22 +2116,8 @@ class RunnerRepository:
             checkpoint["payload_evidence"] = payload_evidence
         instance.checkpoint = json_safe(checkpoint)
 
-        rows = list(
-            (
-                await session.execute(
-                    select(BenchmarkRunnerDispatchRecord, BenchmarkRunnerRecord)
-                    .outerjoin(
-                        BenchmarkRunnerRecord,
-                        BenchmarkRunnerRecord.id
-                        == BenchmarkRunnerDispatchRecord.runner_id,
-                    )
-                    .where(
-                        BenchmarkRunnerDispatchRecord.task_instance_id == instance_id
-                    )
-                    .with_for_update()
-                )
-            ).all()
-        )
+        dispatch_rows_statement = self._task_dispatch_rows_statement(instance_id)
+        rows = list((await session.execute(dispatch_rows_statement)).all())
         statuses = {
             dispatch.id: (
                 terminal_status
@@ -2077,6 +2167,20 @@ class RunnerRepository:
             else "active"
         )
         instance.error = None
+
+    @staticmethod
+    def _task_dispatch_rows_statement(
+        instance_id: str,
+    ) -> Select[Tuple[BenchmarkRunnerDispatchRecord, BenchmarkRunnerRecord]]:
+        return (
+            select(BenchmarkRunnerDispatchRecord, BenchmarkRunnerRecord)
+            .outerjoin(
+                BenchmarkRunnerRecord,
+                BenchmarkRunnerRecord.id == BenchmarkRunnerDispatchRecord.runner_id,
+            )
+            .where(BenchmarkRunnerDispatchRecord.task_instance_id == instance_id)
+            .with_for_update(of=BenchmarkRunnerDispatchRecord)
+        )
 
     async def _cancel_task_dispatches(
         self, session: AsyncSession, instance_id: str

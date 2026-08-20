@@ -65,6 +65,11 @@ NORMALIZATION_CASES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def isolated_dataset_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_DATASETS_CACHE", str(tmp_path / "datasets-cache"))
+
+
 def _event(document):
     return b"data:" + json.dumps(document).encode("utf-8")
 

@@ -1,25 +1,68 @@
 """Scheduler runtime ownership and Scheduler→Runner→Worker wiring tests."""
 
 import asyncio
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from llmperf import common_metrics
 from llmperf.utils import TOKENIZER_FAST, TOKENIZER_PATH
 import llmperf_backend.scheduler as scheduler_module
 from llmperf_backend.models import DatabaseConfig, SchedulerConfig
+from llmperf_backend.outbound import RAY_GRPC_ENABLE_HTTP_PROXY
 from llmperf_backend.providers import ProviderRegistry
 from llmperf_backend.scheduler import (
     Scheduler,
     WORKER_RAY_ACTOR_CPUS,
 )
-from llmperf_backend.tokenizers import TokenizerResolution
-from llmperf_backend.datasets import DatasetResolution, WORKER_DATASET_PATH
+from llmperf_backend.artifacts import DatasetResolution
+from llmperf_backend.artifacts import TokenizerResolution
+from llmperf_backend.worker import WORKER_DATASET_PATH
 
 
 class UnusedRepository:
-    pass
+    """Complete Scheduler repository stub that rejects unexpected persistence calls."""
+
+    async def requeue_stale(self, stale_after_seconds: int) -> int:
+        raise AssertionError("requeue_stale is not expected in this test")
+
+    async def claim_next(self, scheduler_id: str) -> Optional[Dict[str, Any]]:
+        raise AssertionError("claim_next is not expected in this test")
+
+    async def heartbeat(self, runner_id: str) -> bool:
+        raise AssertionError("heartbeat is not expected in this test")
+
+    async def complete_runner(
+        self,
+        runner_id: str,
+        summary: Dict[str, Any],
+        request_metrics: Sequence[Dict[str, Any]],
+        exit_code: int,
+        stdout: str,
+        stderr: str,
+        terminal_status: str = "succeeded",
+        error_message: Optional[str] = None,
+    ) -> bool:
+        raise AssertionError("complete_runner is not expected in this test")
+
+    async def finish_runner(
+        self,
+        runner_id: str,
+        status: str,
+        message: str,
+        exit_code: Optional[int],
+        stdout: str,
+        stderr: str,
+    ) -> bool:
+        raise AssertionError("finish_runner is not expected in this test")
+
+    async def get_runner(self, runner_id: str) -> Optional[Dict[str, Any]]:
+        raise AssertionError("get_runner is not expected in this test")
+
+    async def requeue_runner(self, runner_id: str, message: str) -> None:
+        raise AssertionError("requeue_runner is not expected in this test")
 
 
 class FakeTokenizerCache:
@@ -166,6 +209,7 @@ def test_actor_environment(tmp_path: Path):
 
 def test_embedded_ray(tmp_path: Path, monkeypatch):
     calls = {}
+    monkeypatch.setenv(RAY_GRPC_ENABLE_HTTP_PROXY, "true")
 
     def initialize(**options):
         calls["init"] = options
@@ -212,6 +256,7 @@ def test_embedded_ray(tmp_path: Path, monkeypatch):
     status = asyncio.run(exercise())
 
     assert calls["init"]["include_dashboard"] is False
+    assert os.environ[RAY_GRPC_ENABLE_HTTP_PROXY] == "0"
     assert calls["init"]["num_cpus"] == 8
     assert calls["init"]["object_store_memory"] == 268_435_456
     assert status["ray_mode"] == "embedded"
@@ -223,24 +268,62 @@ def test_embedded_ray(tmp_path: Path, monkeypatch):
     assert calls["shutdown"] is True
 
 
-class ExecutionRepository:
-    def __init__(self, cancel=False):
+class ExecutionRepository(UnusedRepository):
+    def __init__(self, cancel: bool = False):
         self.cancel = cancel
-        self.completed = None
-        self.finished = None
+        self.completed: Optional[
+            Tuple[
+                str,
+                Dict[str, Any],
+                Sequence[Dict[str, Any]],
+                int,
+                str,
+                str,
+                str,
+                Optional[str],
+            ]
+        ] = None
+        self.finished: Optional[Tuple[str, str, str, Optional[int], str, str]] = None
 
-    async def heartbeat(self, runner_id):
+    async def heartbeat(self, runner_id: str) -> bool:
         return self.cancel
 
-    async def complete_runner(self, *arguments, **options):
-        self.completed = (arguments, options)
+    async def complete_runner(
+        self,
+        runner_id: str,
+        summary: Dict[str, Any],
+        request_metrics: Sequence[Dict[str, Any]],
+        exit_code: int,
+        stdout: str,
+        stderr: str,
+        terminal_status: str = "succeeded",
+        error_message: Optional[str] = None,
+    ) -> bool:
+        self.completed = (
+            runner_id,
+            summary,
+            request_metrics,
+            exit_code,
+            stdout,
+            stderr,
+            terminal_status,
+            error_message,
+        )
         return True
 
-    async def finish_runner(self, *arguments):
-        self.finished = arguments
+    async def finish_runner(
+        self,
+        runner_id: str,
+        status: str,
+        message: str,
+        exit_code: Optional[int],
+        stdout: str,
+        stderr: str,
+    ) -> bool:
+        self.finished = (runner_id, status, message, exit_code, stdout, stderr)
         return True
 
-    async def get_runner(self, runner_id):
+    async def get_runner(self, runner_id: str) -> Optional[Dict[str, Any]]:
         return {"status": "running", "cancel_requested": self.cancel}
 
 
@@ -330,8 +413,8 @@ def test_worker_execution(tmp_path: Path, monkeypatch):
     assert calls["started"][2]["resource_scheduling"] == "independent_actors"
     assert calls["started"][2]["campaign_id"] == "campaign-1"
     assert repository.completed is not None
-    assert repository.completed[0][0] == "runner-1"
-    assert repository.completed[0][1]["execution_runtime"]["worker_id"] == "task-1"
+    assert repository.completed[0] == "runner-1"
+    assert repository.completed[1]["execution_runtime"]["worker_id"] == "task-1"
     assert repository.finished is None
     assert calls["closed"] is True
     assert scheduler.status()["active_workers"] == 0

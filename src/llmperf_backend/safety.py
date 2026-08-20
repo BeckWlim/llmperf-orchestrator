@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from llmperf_backend.models import PerformanceGuardConfig
 from llmperf_backend.planner import preview_fires
-from llmperf_backend.task_compiler import estimate_task_definition
+from llmperf_backend.task_compiler import TaskCompiler
 
 
 UTC = timezone.utc
@@ -206,10 +206,14 @@ def assess_workload(
         )
 
     for item in task_definitions:
-        definition = item.get("definition", item)
-        template = item.get("runner_template", definition.get("runner", {}))
+        definition_document = item.get("definition", item)
+        embedded_runner = definition_document.get("runner", {})
+        recipe_document = {
+            key: value for key, value in definition_document.items() if key != "runner"
+        }
+        template = item.get("runner_template", embedded_runner)
         benchmark = template.get("benchmark")
-        expansion = estimate_task_definition(definition)
+        expansion = TaskCompiler.estimate(recipe_document)
         requests = expansion["nodes"]
         runners_count = requests
         tokens_per_request = (

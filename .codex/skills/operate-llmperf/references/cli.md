@@ -33,6 +33,10 @@ only when request distributions or outliers are needed.
 ## Campaign and task operations
 
 ```bash
+llmperfctl campaign preview -f examples/example-cache-promotion.yaml
+llmperfctl campaign preview -f examples/example-cache-promotion.yaml \
+  --limit 50 --node-limit 200 --debug
+llmperfctl campaign validate -f examples/example-campaign.yaml --artifact-timeout 3600
 llmperfctl campaign start -f examples/example-campaign.yaml
 llmperfctl campaign start -f examples/example-cache-promotion.yaml --wait
 llmperfctl campaign list
@@ -41,9 +45,36 @@ llmperfctl campaign cancel CAMPAIGN_ID
 llmperfctl campaign export CAMPAIGN_ID -o campaign.json
 ```
 
+`campaign preview` sends the Campaign document to the Backend's authoritative TaskCompiler
+and displays a bounded ASCII expansion without resolving artifacts or writing Campaign,
+TaskInstance, Dispatch, or Runner records. The summary always reports total expanded
+instances and nodes separately from immediate Runners; `--limit` bounds displayed instances across the Campaign,
+`--node-limit` bounds displayed nodes per instance, `--debug` adds deterministic payload
+seeds, and `--json` returns the registered structured projection.
+
+Run `campaign validate` before a long-context Campaign whose Backend-owned tokenizer or
+dataset may not be cached. It resolves all workload references, fully reads and hashes the
+materialized cache files, rejects `.incomplete`, empty, unreadable, or changing artifacts,
+and returns integrity evidence without creating a Campaign, RunnerPlan, Dispatch, or
+Runner. Dataset validation additionally executes the configured adapter, persists its
+normalized Arrow index through Hugging Face Datasets, and returns the adapter and usable
+record count. Its workload projection reports the same immediate Runner, RunnerPlan,
+TaskDefinition, expanded TaskInstance, and TaskNode counts as preview/start.
+`--artifact-timeout` is deliberately separate from the ordinary Backend
+request timeout. After validation succeeds, `campaign start` should use raw-artifact and
+Arrow-index cache hits. While the Backend downloads an uncached artifact, the validation
+endpoint streams path-free byte counts and heartbeats; `llmperfctl` renders them as a
+dynamic downloaded/total byte counter on terminal stderr, without a progress bar. When
+stderr is redirected, every event becomes a structured `completed_bytes/total_bytes` log
+record. The final human or JSON result remains on stdout.
+
 Campaign YAML may contain immediate `runners`, bounded `runner_plans`, and compiled
 `task_definitions`. The CLI forwards task recipes; Backend validation, artifact resolution,
 safety assessment, compilation, and persistence remain authoritative.
+On successful submission, the CLI logs one authoritative workload summary that separates
+immediate Runners, RunnerPlans, TaskDefinitions, expanded TaskInstances, and TaskNodes.
+TaskNodes are durable Dispatches and become ordinary Runners only when their dependencies
+and due times are satisfied.
 Every Runner or Campaign YAML document declares `version: "1.0.0"`; other or missing
 versions fail locally before submission.
 
@@ -51,6 +82,8 @@ Campaign `status` describes lifecycle. `outcome` describes aggregate execution a
 of `pending`, `succeeded`, `partial_failed`, `failed`, `cancelled`, or `no_runs`. A completed
 Campaign may have `partial_failed` outcome. Wait commands return exit code 2 for an
 unsuccessful terminal outcome while preserving durable results.
+Campaign list, status, wait, and cancellation projections retain TaskInstance and Dispatch
+counts; a materialized Runner count alone is not treated as the size of a compiled task.
 
 Campaign export version 1.0.0 contains `task_definitions`, `task_instances`, `dispatches`,
 generic `task_analyses`, and `runners`. A Task Instance with completed parents and future
@@ -97,6 +130,12 @@ Do not dump complete stdout/stderr through ordinary status commands.
 
 Operational progress and durable IDs go to stderr. Queries use stdout. Never parse the
 human table when `--json` or export is available.
+
+`scheduler status` follows the same boundary: its default view is a compact Scheduler,
+Ray-capacity, and performance-guard summary; `scheduler status --json` serializes the same
+allow-listed projection. Human-readable utilization ratios use two-decimal percentages;
+JSON retains the original 0-1 numeric ratios. Backend Ray addresses and private resource
+labels are excluded.
 
 ## Failure triage
 
