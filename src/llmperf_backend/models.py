@@ -7,6 +7,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from llmperf.prompt_datasets import (
+    validate_external_dataset_adapter,
+)
+from llmperf.version import PROTOCOL_VERSION, ProtocolVersion
+
 DEFAULT_TOKENIZER_ID = "hf-internal-testing/llama-tokenizer"
 
 
@@ -27,20 +32,25 @@ class ServerConfig(StrictModel):
 
 
 class TokenizerSpec(StrictModel):
-    """A server-resolved Hugging Face tokenizer selected by one benchmark."""
+    """A Hugging Face tokenizer requested by one benchmark."""
 
     source: Literal["huggingface"] = "huggingface"
     id: str = Field(min_length=1, max_length=200)
     revision: Optional[str] = Field(default=None, min_length=1, max_length=200)
-    requested_revision: Optional[str] = Field(
-        default=None, min_length=1, max_length=200
-    )
     use_fast: bool = True
-    immutable_revision: bool = False
-    selection: Literal[
-        "explicit", "model_binding", "provider_default", "global_default"
-    ] = "global_default"
-    accuracy: Literal["exact", "compatible", "approximate"] = "approximate"
+
+
+class ResolvedTokenizerSpec(StrictModel):
+    """Backend-owned tokenizer identity persisted with a resolved Runner."""
+
+    source: Literal["huggingface"] = "huggingface"
+    id: str = Field(min_length=1, max_length=200)
+    revision: str = Field(min_length=1, max_length=200)
+    use_fast: bool = True
+    requested_revision: str = Field(min_length=1, max_length=200)
+    immutable_revision: bool
+    selection: Literal["explicit", "global_default"]
+    accuracy: Literal["compatible", "approximate"]
 
 
 class CacheProbeConfig(StrictModel):
@@ -61,7 +71,7 @@ class CacheProbeConfig(StrictModel):
     minimum_counter_coverage: float = Field(default=0.8, ge=0, le=1)
 
 
-class TaskRequestContext(StrictModel):
+class CompiledTaskContext(StrictModel):
     """Compiler-owned identity for one atomic task-graph invocation."""
 
     definition_id: str = Field(min_length=1, max_length=36)
@@ -81,17 +91,22 @@ class DatasetSpec(StrictModel):
     id: str = Field(min_length=1, max_length=200)
     filename: str = Field(min_length=1, max_length=500)
     revision: Optional[str] = Field(default=None, min_length=1, max_length=200)
-    format: Literal["sharegpt"] = "sharegpt"
+    adapter: str = Field(min_length=1, max_length=64)
+
+    @field_validator("adapter")
+    @classmethod
+    def validate_adapter(cls, value: str) -> str:
+        try:
+            return validate_external_dataset_adapter(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
 
 
-class BenchmarkConfig(StrictModel):
-    """Defaults matching the existing token benchmark command-line options."""
+class _BenchmarkFields(StrictModel):
+    """Fields and validation shared by submitted and resolved benchmarks."""
 
     provider: str = Field(min_length=1, max_length=64)
     model: str = Field(min_length=1)
-    llm_api: Literal["openai", "anthropic", "litellm", "sagemaker", "vertexai"] = (
-        "openai"
-    )
     timeout_seconds: int = Field(default=90, gt=0)
     max_completed_requests: int = Field(default=10, gt=0)
     concurrent_requests: int = Field(default=1, gt=0)
@@ -99,45 +114,26 @@ class BenchmarkConfig(StrictModel):
     stddev_input_tokens: int = Field(default=150, ge=0)
     shared_prefix_tokens: int = Field(default=0, ge=0)
     dataset: Optional[DatasetSpec] = None
+    dataset_prompt_mode: Literal["sample", "concatenate"] = "sample"
     dataset_repeat_count: int = Field(default=1, ge=1)
     dataset_seed: int = 11111
     mean_output_tokens: int = Field(default=150, gt=0)
     stddev_output_tokens: int = Field(default=80, ge=0)
     additional_sampling_params: Dict[str, Any] = Field(default_factory=dict)
-    tokenizer: TokenizerSpec = Field(
-        default_factory=lambda: TokenizerSpec(id=DEFAULT_TOKENIZER_ID)
-    )
     cache_probe: Optional[CacheProbeConfig] = None
-    task_request: Optional[TaskRequestContext] = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def mark_explicit_tokenizer(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        result = dict(data)
-        tokenizer = result.get("tokenizer")
-        if isinstance(tokenizer, dict):
-            tokenizer = dict(tokenizer)
-            tokenizer.setdefault("selection", "explicit")
-            tokenizer.setdefault("accuracy", "compatible")
-            result["tokenizer"] = tokenizer
-        return result
 
     @model_validator(mode="after")
-    def validate_cache_probe(self) -> "BenchmarkConfig":
-        if self.cache_probe is not None and self.task_request is not None:
-            raise ValueError("cache_probe and task_request cannot be combined")
+    def validate_cache_probe(self) -> "_BenchmarkFields":
+        if self.dataset is not None and self.shared_prefix_tokens:
+            raise ValueError("dataset and shared_prefix_tokens cannot be used together")
+        if self.dataset is None and self.dataset_prompt_mode != "sample":
+            raise ValueError("dataset_prompt_mode requires dataset")
+        if self.dataset_prompt_mode == "concatenate" and self.dataset_repeat_count != 1:
+            raise ValueError(
+                "concatenated dataset prompts require dataset_repeat_count=1"
+            )
         if self.cache_probe is None:
             return self
-        if (
-            self.tokenizer.accuracy == "approximate"
-            and not self.cache_probe.allow_approximate_tokenizer
-        ):
-            raise ValueError(
-                "cache_probe requires an explicit or model-bound tokenizer; set "
-                "allow_approximate_tokenizer=true to acknowledge the global fallback"
-            )
         if self.cache_probe.mode == "shared_prefix":
             prefix = self.cache_probe.shared_prefix_tokens or self.shared_prefix_tokens
             if not prefix:
@@ -148,6 +144,35 @@ class BenchmarkConfig(StrictModel):
                 raise ValueError(
                     "cache_probe shared_prefix_tokens must be less than mean_input_tokens"
                 )
+        return self
+
+
+class BenchmarkConfig(_BenchmarkFields):
+    """Defaults matching the existing token benchmark command-line options."""
+
+    tokenizer: TokenizerSpec = Field(
+        default_factory=lambda: TokenizerSpec(id=DEFAULT_TOKENIZER_ID)
+    )
+
+
+class ResolvedBenchmarkConfig(_BenchmarkFields):
+    """Backend-owned execution fields added after Provider and artifact resolution."""
+
+    adapter: Literal["openai", "anthropic", "litellm", "sagemaker", "vertexai"]
+    tokenizer: ResolvedTokenizerSpec
+
+
+class CompiledBenchmarkConfig(ResolvedBenchmarkConfig):
+    """Internal one-request benchmark emitted only by the task compiler."""
+
+    task_context: CompiledTaskContext
+
+    @model_validator(mode="after")
+    def validate_compiled_shape(self) -> "CompiledBenchmarkConfig":
+        if self.cache_probe is not None:
+            raise ValueError("compiled benchmark cannot define cache_probe")
+        if self.max_completed_requests != 1 or self.concurrent_requests != 1:
+            raise ValueError("compiled benchmark must contain exactly one request")
         return self
 
 
@@ -175,9 +200,6 @@ class SchedulerConfig(StrictModel):
     poll_interval_seconds: float = Field(default=1.0, gt=0)
     cancel_grace_seconds: float = Field(default=5.0, gt=0)
     stale_after_seconds: int = Field(default=300, gt=0)
-    # Legacy configuration keys retained while Worker remains the public domain name.
-    working_directory: str = "."
-    worker_module: str = "llmperf_backend.worker"
     log_bytes_limit: int = Field(default=1_000_000, ge=1024)
     ray_address: Optional[str] = Field(default=None, min_length=1)
     ray_num_cpus: int = Field(default=8, ge=1, le=1024)
@@ -250,7 +272,7 @@ class AuthConfig(StrictModel):
 
 
 class AppConfig(StrictModel):
-    version: int = Field(default=1, ge=1)
+    version: ProtocolVersion
     environment: str = "development"
     server: ServerConfig = Field(default_factory=ServerConfig)
     benchmark: BenchmarkConfig
@@ -302,12 +324,14 @@ class BenchmarkRunnerSpec(StrictModel):
 class BenchmarkRunnerCreate(BenchmarkRunnerSpec):
     """Start one Runner, optionally attached to a Campaign."""
 
+    version: ProtocolVersion = PROTOCOL_VERSION
     campaign_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
 
 
 class BenchmarkRunnerBatchCreate(StrictModel):
     """Atomically start multiple Runners in one Campaign."""
 
+    version: ProtocolVersion = PROTOCOL_VERSION
     runners: List[BenchmarkRunnerSpec] = Field(min_length=1, max_length=100)
 
 
@@ -389,19 +413,24 @@ class TaskDefinitionCreate(StrictModel):
             values_to_check = (
                 [step.after_seconds]
                 if isinstance(step, InvokeStep)
-                else [
-                    step.count,
-                    step.interval_seconds,
-                    step.invoke.after_seconds,
-                ]
-                if isinstance(step, RepeatStep)
-                else [
-                    step.after_seconds,
-                    *(invoke.after_seconds for invoke in step.invokes),
-                ]
+                else (
+                    [
+                        step.count,
+                        step.interval_seconds,
+                        step.invoke.after_seconds,
+                    ]
+                    if isinstance(step, RepeatStep)
+                    else [
+                        step.after_seconds,
+                        *(invoke.after_seconds for invoke in step.invokes),
+                    ]
+                )
             )
             for value in values_to_check:
-                if isinstance(value, DimensionReference) and value.dimension not in self.matrix:
+                if (
+                    isinstance(value, DimensionReference)
+                    and value.dimension not in self.matrix
+                ):
                     raise ValueError(
                         f"task expression references unknown dimension {value.dimension}"
                     )
@@ -436,13 +465,17 @@ class TaskDefinitionCreate(StrictModel):
                     interval = resolve(step.interval_seconds)
                     node_delay = resolve(step.invoke.after_seconds)
                     if not 0 <= count <= 100:
-                        raise ValueError("expanded repeat count must be between 0 and 100")
+                        raise ValueError(
+                            "expanded repeat count must be between 0 and 100"
+                        )
                     if interval < 0 or node_delay < 0:
                         raise ValueError("task delays cannot be negative")
                     delay = count * (interval + node_delay)
                 else:
                     parallel_delay = resolve(step.after_seconds)
-                    child_delays = [resolve(item.after_seconds) for item in step.invokes]
+                    child_delays = [
+                        resolve(item.after_seconds) for item in step.invokes
+                    ]
                     if parallel_delay < 0 or any(item < 0 for item in child_delays):
                         raise ValueError("task delays cannot be negative")
                     delay = parallel_delay + max(child_delays)
@@ -454,8 +487,6 @@ class TaskDefinitionCreate(StrictModel):
         if self.runner.benchmark is not None:
             if self.runner.benchmark.cache_probe is not None:
                 raise ValueError("compiled task runner cannot define cache_probe")
-            if self.runner.benchmark.task_request is not None:
-                raise ValueError("task_request is compiler-owned and cannot be submitted")
         return self
 
 
@@ -552,6 +583,7 @@ class BenchmarkCampaignCreate(StrictModel):
 class BenchmarkCampaignStart(StrictModel):
     """Atomically create one Campaign and its initial workload."""
 
+    version: ProtocolVersion = PROTOCOL_VERSION
     campaign: BenchmarkCampaignCreate
     runners: List[BenchmarkRunnerSpec] = Field(default_factory=list, max_length=100)
     runner_plans: List[RunnerPlanCreate] = Field(default_factory=list, max_length=100)

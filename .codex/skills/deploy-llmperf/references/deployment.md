@@ -29,7 +29,7 @@ backup, and rollback strategy.
 
 ## Python and PostgreSQL
 
-LLMPerf requires Python 3.9+. Install only adapter extras that are needed.
+LLMPerf requires Python 3.10+. Install only adapter extras that are needed.
 
 ```bash
 python3 -m venv .venv
@@ -44,11 +44,10 @@ Production should use a dedicated non-superuser role and explicit host/database/
 Never print database passwords. SQLAlchemy `create_all` does not migrate an existing
 schema. Review schema differences, active Campaigns, and backups before upgrades.
 
-This task-graph release is intentionally incompatible with legacy protocol tables and
-Dispatch columns. Do not restart the new code against a database with pending legacy
-Dispatches. Let them finish under the old process, export results, back up, then perform an
-explicit migration or rebuild. A separate database and service port is the safe parallel
-deployment option.
+Version 1.0.0 is the first supported database contract. Do not start it against a
+pre-release schema: export anything still needed, back up PostgreSQL, then initialize a
+clean 1.0.0 schema. A separate database and service port is the safe parallel deployment
+option.
 
 ## Persisted Backend configuration
 

@@ -1,4 +1,4 @@
-version: 1
+version: "1.0.0"
 environment: "${LLMPERF_ENVIRONMENT:-development}"
 
 server:
@@ -22,9 +22,6 @@ scheduler:
   poll_interval_seconds: "${LLMPERF_RUNNER_POLL:-1.0}"
   cancel_grace_seconds: "${LLMPERF_RUNNER_GRACE:-5.0}"
   stale_after_seconds: "${LLMPERF_RUNNER_STALE:-300}"
-  # Retained for configuration/API compatibility; Worker is now a Ray task handle.
-  working_directory: "${LLMPERF_WORKING_DIRECTORY:-.}"
-  worker_module: llmperf_backend.worker
   log_bytes_limit: "${LLMPERF_LOG_LIMIT:-1000000}"
   # Empty starts one Backend-owned shared Ray runtime; otherwise connect externally.
   ray_address: "${LLMPERF_RAY_ADDRESS:-}"
@@ -75,8 +72,6 @@ benchmark:
     id: "${LLMPERF_DEFAULT_TOKENIZER:-hf-internal-testing/llama-tokenizer}"
     revision: main
     use_fast: true
-    selection: global_default
-    accuracy: approximate
   timeout_seconds: "${LLMPERF_TIMEOUT_SECONDS:-90}"
   max_completed_requests: "${LLMPERF_REQUESTS_MAX:-10}"
   concurrent_requests: "${LLMPERF_CONCURRENT_REQUESTS:-1}"

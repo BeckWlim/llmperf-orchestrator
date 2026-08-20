@@ -74,16 +74,13 @@ def _summarize_cache_counters(
     denominator = complete_hit + complete_miss
     request_count = len(requests)
     result = {
-        # Retain legacy fields while making their coverage semantics explicit.
         "measured_requests": len(hit_values),
-        "hit_tokens": sum(hit_values),
-        "miss_tokens": complete_miss if complete_pairs else None,
-        "hit_ratio": complete_hit / denominator if denominator else None,
         "requests_total": request_count,
-        "requests_with_hit_counter": len(hit_values),
-        "requests_with_complete_cache_counters": len(complete_pairs),
+        "complete_counter_requests": len(complete_pairs),
         "counter_coverage": len(complete_pairs) / request_count if request_count else 0,
-        "request_hit_ratio": request_hits / len(hit_values) if hit_values else None,
+        "request_hit_probability": (
+            request_hits / len(hit_values) if hit_values else None
+        ),
         "weighted_token_hit_ratio": complete_hit / denominator if denominator else None,
         "complete_hit_tokens": complete_hit,
         "complete_miss_tokens": complete_miss,
@@ -183,7 +180,7 @@ def analyze_cache_probe(
         ) > 0
 
     observed_hit = any(valid_hit(request) for request in paired_warm_requests)
-    counters_present = cache["requests_with_hit_counter"] > 0
+    counters_present = cache["measured_requests"] > 0
     counter_coverage_ok = cache["counter_coverage"] >= minimum_counter_coverage
     latency_positive = ci_low is not None and ci_low > 0
 

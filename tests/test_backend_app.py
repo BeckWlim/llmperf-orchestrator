@@ -1,5 +1,7 @@
 import asyncio
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
+from typing import Any, Optional
 
 import httpx
 import pytest
@@ -12,9 +14,8 @@ from llmperf_backend.providers import ProviderRegistry
 from llmperf_backend.tokenizers import TokenizerResolution
 from llmperf_backend.datasets import DatasetResolution
 
-
 CONFIG = """
-version: 1
+version: "1.0.0"
 environment: test
 server:
   host: 127.0.0.1
@@ -35,8 +36,9 @@ pytestmark = pytest.mark.postgresql
 
 
 class FakeTokenizerCache:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, revision: str = "resolved-commit"):
         self.path = path
+        self.revision = revision
         self.specs = []
 
     async def resolve(self, spec):
@@ -44,7 +46,7 @@ class FakeTokenizerCache:
         return TokenizerResolution(
             source="huggingface",
             tokenizer_id=spec["id"],
-            revision="resolved-commit",
+            revision=self.revision,
             use_fast=spec.get("use_fast", True),
             path=self.path,
             cached=False,
@@ -52,8 +54,9 @@ class FakeTokenizerCache:
 
 
 class FakeDatasetCache:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, revision: str = "resolved-dataset-commit"):
         self.path = path
+        self.revision = revision
         self.specs = []
 
     async def resolve(self, spec):
@@ -62,8 +65,8 @@ class FakeDatasetCache:
             source="huggingface",
             dataset_id=spec["id"],
             filename=spec["filename"],
-            revision="resolved-dataset-commit",
-            format=spec["format"],
+            revision=self.revision,
+            adapter=spec["adapter"],
             path=self.path,
             cached=False,
         )
@@ -72,16 +75,17 @@ class FakeDatasetCache:
 class ASGITestClient:
     """Small synchronous harness compatible with HTTPX 0.27 and 0.28."""
 
-    def __init__(self, app):
+    def __init__(self, app: Any):
         self.app = app
-        self.loop = None
-        self.client = None
-        self.lifespan = None
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.client: Optional[httpx.AsyncClient] = None
+        self.lifespan: Optional[AbstractAsyncContextManager[None]] = None
 
     def __enter__(self):
         self.loop = asyncio.new_event_loop()
-        self.lifespan = self.app.router.lifespan_context(self.app)
-        self.loop.run_until_complete(self.lifespan.__aenter__())
+        lifespan = self.app.router.lifespan_context(self.app)
+        self.lifespan = lifespan
+        self.loop.run_until_complete(lifespan.__aenter__())
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=self.app),
             base_url="http://testserver",
@@ -89,15 +93,34 @@ class ASGITestClient:
         return self
 
     def __exit__(self, exc_type, exc, traceback):
-        self.loop.run_until_complete(self.client.aclose())
-        self.loop.run_until_complete(self.lifespan.__aexit__(exc_type, exc, traceback))
-        self.loop.close()
+        loop = self._active_loop()
+        client = self._active_client()
+        lifespan = self.lifespan
+        if lifespan is None:
+            raise RuntimeError("ASGI lifespan was not started")
+        loop.run_until_complete(client.aclose())
+        loop.run_until_complete(lifespan.__aexit__(exc_type, exc, traceback))
+        loop.close()
 
     def get(self, path, **kwargs):
-        return self.loop.run_until_complete(self.client.get(path, **kwargs))
+        return self._active_loop().run_until_complete(
+            self._active_client().get(path, **kwargs)
+        )
 
     def post(self, path, **kwargs):
-        return self.loop.run_until_complete(self.client.post(path, **kwargs))
+        return self._active_loop().run_until_complete(
+            self._active_client().post(path, **kwargs)
+        )
+
+    def _active_loop(self) -> asyncio.AbstractEventLoop:
+        if self.loop is None:
+            raise RuntimeError("ASGI test client is not active")
+        return self.loop
+
+    def _active_client(self) -> httpx.AsyncClient:
+        if self.client is None:
+            raise RuntimeError("ASGI test client is not active")
+        return self.client
 
 
 def make_client(
@@ -153,9 +176,7 @@ def clean_postgres(postgresql_url):
 
 @pytest.fixture
 def client_factory(tmp_path: Path, postgresql_url):
-    def factory(
-        tokenizer_cache=None, dataset_cache=None, provider_environment=None
-    ):
+    def factory(tokenizer_cache=None, dataset_cache=None, provider_environment=None):
         return make_client(
             tmp_path,
             postgresql_url,
@@ -200,9 +221,10 @@ def test_provider_reload(client_factory):
         assert reloaded.json()["generation"] == 1
         assert reloaded.json()["changes"]["updated"] == ["test"]
         assert "new-secret" not in reloaded.text
-        assert client.app.state.scheduler.provider_registry.require(
-            "test"
-        ).api_base == "http://new.example/v1"
+        assert (
+            client.app.state.scheduler.provider_registry.require("test").api_base
+            == "http://new.example/v1"
+        )
 
         invalid_runner = client.post(
             "/api/v1/runners",
@@ -308,7 +330,7 @@ def test_runner_lifecycle(client_factory):
 
         exported = client.get(f"/api/v1/campaigns/{campaign_id}/export")
         assert exported.status_code == 200
-        assert exported.json()["version"] == 5
+        assert exported.json()["version"] == "1.0.0"
         assert exported.json()["aggregate"]["status"] == "cancelled"
         assert exported.json()["aggregate"]["outcome"] == "cancelled"
         assert exported.json()["aggregate"]["runner_count"] == 1
@@ -412,6 +434,80 @@ def test_atomic_campaign_start(client_factory):
         assert planned_status["runner_plan_count"] == 1
 
 
+def test_compiled_dataset(tmp_path: Path, client_factory):
+    tokenizer_directory = tmp_path / "tokenizer"
+    tokenizer_directory.mkdir()
+    dataset_path = tmp_path / "sharegpt.json"
+    dataset_path.write_text("[]", encoding="utf-8")
+    tokenizer_cache = FakeTokenizerCache(tokenizer_directory, revision="a" * 40)
+    dataset_cache = FakeDatasetCache(dataset_path, revision="b" * 40)
+    task = {
+        "name": "dataset-replay",
+        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "sequence": [
+            {
+                "kind": "invoke",
+                "id": "prime",
+                "role": "prime",
+                "payload": "replay",
+            }
+        ],
+        "runner": {
+            "benchmark": {
+                "provider": "test",
+                "model": "test-model",
+                "stddev_input_tokens": 0,
+                "stddev_output_tokens": 0,
+                "dataset": {
+                    "id": "organization/sharegpt",
+                    "filename": "sharegpt.json",
+                    "revision": "release",
+                    "adapter": "sharegpt",
+                },
+                "dataset_prompt_mode": "concatenate",
+                "tokenizer": {
+                    "id": "organization/model-tokenizer",
+                    "revision": "release",
+                },
+            }
+        },
+    }
+
+    with client_factory(
+        tokenizer_cache=tokenizer_cache, dataset_cache=dataset_cache
+    ) as client:
+        accepted = client.post(
+            "/api/v1/campaigns/start",
+            json={
+                "campaign": {"name": "immutable-dataset"},
+                "task_definitions": [task],
+            },
+        )
+
+    assert accepted.status_code == 202
+    assert (
+        accepted.json()["task_definitions"][0]["runner"]["benchmark"][
+            "dataset_prompt_mode"
+        ]
+        == "concatenate"
+    )
+
+    mutable_cache = FakeDatasetCache(dataset_path, revision="main")
+    with client_factory(
+        tokenizer_cache=tokenizer_cache, dataset_cache=mutable_cache
+    ) as client:
+        rejected = client.post(
+            "/api/v1/campaigns/start",
+            json={
+                "campaign": {"name": "mutable-dataset"},
+                "task_definitions": [task],
+            },
+        )
+
+    assert rejected.status_code == 422
+    assert "immutable Hugging Face commit" in rejected.json()["detail"]
+
+
 def test_scheduler_status(client_factory):
     with client_factory() as client:
         response = client.get("/api/v1/scheduler/status")
@@ -472,7 +568,7 @@ def test_runner_dataset(tmp_path: Path, client_factory):
                         "id": "organization/sharegpt",
                         "filename": "sharegpt.json",
                         "revision": "release",
-                        "format": "sharegpt",
+                        "adapter": "sharegpt",
                     },
                 }
             },
@@ -484,7 +580,7 @@ def test_runner_dataset(tmp_path: Path, client_factory):
             "id": "organization/sharegpt",
             "filename": "sharegpt.json",
             "revision": "resolved-dataset-commit",
-            "format": "sharegpt",
+            "adapter": "sharegpt",
         }
         assert cache.specs[0]["revision"] == "release"
 

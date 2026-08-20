@@ -113,14 +113,13 @@ def test_value_source_guard(tmp_path, monkeypatch, values):
         execute_config(_arguments("set", "VALID_NAME", *values))
 
 
-def test_legacy_env_fallback(tmp_path, monkeypatch):
+def test_no_cwd_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty-xdg"))
     monkeypatch.delenv("LLMPERF_ENV_FILE", raising=False)
     monkeypatch.chdir(tmp_path)
-    legacy = tmp_path / ".env"
-    legacy.write_text("LEGACY_TEST_VALUE=loaded\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("IGNORED_VALUE=ignored\n", encoding="utf-8")
 
-    assert resolve_environment_path() == legacy
+    assert resolve_environment_path() == backend_environment_path()
 
 
 @pytest.mark.parametrize(

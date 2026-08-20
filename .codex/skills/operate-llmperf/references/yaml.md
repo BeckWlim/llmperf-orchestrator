@@ -9,6 +9,7 @@
 One Campaign may contain all three. Do not create experiment-specific runtime protocols.
 
 ```yaml
+version: "1.0.0"
 campaign:
   name: experiment-name
   description: optional
@@ -30,7 +31,6 @@ and exact `model` IDs.
 benchmark:
   provider: aliyun
   model: deepseek-v4-pro
-  llm_api: openai
   tokenizer:
     id: deepseek-ai/DeepSeek-V3
     revision: main
@@ -41,16 +41,39 @@ benchmark:
   mean_input_tokens: 2048
   stddev_input_tokens: 0
   shared_prefix_tokens: 0
+  dataset:
+    source: huggingface
+    id: organization/sharegpt
+    filename: sharegpt.json
+    revision: 0123456789abcdef0123456789abcdef01234567
+    adapter: sharegpt
+  dataset_prompt_mode: concatenate
+  dataset_repeat_count: 1
+  dataset_seed: 11111
   mean_output_tokens: 8
   stddev_output_tokens: 0
   additional_sampling_params:
     temperature: 0
 ```
 
-For cross-Runner replay tasks, use generated prompts, fixed token lengths, OpenAI-compatible
-metrics, and an explicit/model-bound tokenizer resolved to an immutable revision. The
-compiler overwrites task nodes to one request at concurrency one. `task_request` is
-compiler-owned and must never appear in submitted YAML.
+`dataset.adapter` is required and independent from artifact `source`. Use `sharegpt` for
+`conversations[0].value` JSON arrays or `text` for one non-empty prompt per line. Omit
+`dataset` to select the bundled `src/llmperf/sonnet.txt` adapter. Bundled and external
+adapters are normalized into indexed text records, then pass through the same seeded
+construction and evidence pipeline. In `sample` mode, intact records must already fit the
+requested token range.
+`concatenate` deterministically shuffles first turns, consumes each record once before
+cycling, joins diverse records, and truncates only the final segment to the requested token
+budget. Concatenation requires `dataset_repeat_count: 1`; exact repetition belongs in a
+compiled task through a shared payload ID.
+
+For cross-Runner replay tasks, use fixed token lengths and an explicit tokenizer resolved
+to an immutable revision. Dataset-backed tasks are accepted only after the Backend resolves
+the dataset revision to a Hugging Face commit hash. All registered Provider adapters may
+execute compiled tasks; cache conclusions still require comparable Provider counter
+evidence. The compiler overwrites task nodes to one request at concurrency one. Its internal
+`adapter`, resolved tokenizer provenance, and `task_context` are Backend-owned execution
+fields. They are not part of submitted YAML, and unknown fields are rejected.
 
 ## Task definition grammar
 
@@ -145,15 +168,17 @@ Generated payload content is pseudo-random but reproducible. Its seed is derived
 global task seed + sorted matrix coordinates + trial index + payload seed_namespace
 ```
 
-Use cases include randomly generated prompt families, deterministic sampling from a future
-immutable dataset generator, and independent controls. Reusing one payload ID in
+Use cases include bundled-sonnet prompt families, deterministic sampling or concatenation
+from an immutable ShareGPT artifact, and independent controls. Reusing one payload ID in
 Prime/Warm/Probe guarantees the same derived seed; different namespace or trial produces an
-independent value. Persistence compares the actual `prompt_hash` on every replay and fails
-closed on mismatch.
+independent value. Persistence compares both the actual `prompt_hash` and the dataset
+selection evidence on every replay and fails closed on mismatch.
 
-Do not use nondeterministic random selection for causal experiments. If dataset sampling is
-added to the compiler later, it must record the immutable dataset identity, selected item,
-seed, and prompt hash.
+Prompt selection evidence contains the source adapter, seed, stable record indices,
+per-segment token/character counts, corpus cycle, and a manifest hash, but never prompt
+text. For external sources, the frozen Runner also keeps the dataset ID, filename, and
+resolved commit revision. Together these fields make every source auditable without copying
+dataset content into Campaign exports.
 
 ## Common compositions
 

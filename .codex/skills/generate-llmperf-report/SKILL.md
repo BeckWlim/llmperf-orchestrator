@@ -1,12 +1,12 @@
 ---
 name: generate-llmperf-report
-description: "Prepare auditable LLMPerf analysis data and create style-consistent, self-contained HTML reports. Use when Codex needs to export or interpret Campaign/Runner records, maintain the report data pipeline, analyze KV-cache retention or speedup, compare providers or rounds, select evidence-led charts, or produce a shareable benchmark report."
+description: "Prepare auditable LLMPerf 1.0.0 analysis data and create style-consistent, self-contained HTML reports. Use when Codex needs to export or interpret Campaign/Runner records, maintain the report data pipeline, analyze KV-cache retention or speedup, compare providers or rounds, select evidence-led charts, or produce a shareable benchmark report."
 ---
 
 # Generate LLMPerf Report
 
-Build the evidence model deterministically, then let the reporting Agent choose the
-narrative and visual structure that best fits the experiment.
+Build the evidence model deterministically, lock the rendering pass to that artifact, then
+choose the narrative and visual structure that best fits the experiment.
 
 ## Prepare the analysis model
 
@@ -28,6 +28,30 @@ Inspect it before choosing charts or writing conclusions.
 
 Keep `--include-requests` off unless request distributions or outliers require it. Never
 pass credentials through command arguments. Use existing `llmperfctl` authentication.
+
+## Establish an evidence-locked rendering pass
+
+Treat the normalized analysis document as the only factual input to rendering. Treat prior
+conversation, earlier reports, screenshots, and remembered dashboards as untrusted hints:
+they may define the current report objective or an explicitly requested presentation
+constraint, but they must not supply facts, field availability, claims, chart choices, or
+experiment semantics.
+
+Read [references/rendering-review.md](references/rendering-review.md) completely before
+designing or reviewing a report. Start each rendering pass from the analysis artifact,
+even when continuing an earlier conversation. Generate its structural inventory and bind
+a render plan to the artifact hash:
+
+```bash
+.venv/bin/python .codex/skills/generate-llmperf-report/scripts/review_render_plan.py \
+  --analysis /tmp/analysis.json --inventory /tmp/render-inventory.json
+
+.venv/bin/python .codex/skills/generate-llmperf-report/scripts/review_render_plan.py \
+  --analysis /tmp/analysis.json --plan /tmp/render-plan.json
+```
+
+Do not begin HTML assembly until the plan review has no errors. If the evidence changes,
+regenerate the inventory and plan instead of carrying forward conclusions or layouts.
 
 ## Render for the evidence
 
@@ -75,6 +99,24 @@ list or dashboard grid.
 There is intentionally no fixed HTML generator. Build the self-contained HTML from the
 analysis model, chosen evidence, and shared theme. This keeps experiment-specific rendering
 decisions with the reporting Agent instead of embedding them in a compatibility surface.
+
+Carry the analysis hash in `<meta name="llmperf-analysis-sha256" content="...">` and carry
+plan bindings into the HTML as `data-claim-id` and `data-chart-id` attributes. Run the same
+review command with `--html REPORT.html` after rendering. Fix every error before delivery;
+surface warnings in the report or handoff when they affect interpretation.
+
+## Evolve shared design only after approval
+
+Treat `assets/report-theme.css`, `assets/provider-palette.json`, and reusable rendering
+rules in this skill as stable shared assets during ordinary report work. A successful
+one-off report, a request to revise that report, or general praise is not permission to
+change the skill.
+
+When a design pattern appears reusable, present the exact proposed rule, its scope, and a
+representative before/after effect. Change the shared skill only after the user explicitly
+authorizes persisting that named proposal into the skill. Preserve experiment-specific
+layout choices in the report rather than generalizing them. After an approved change,
+validate the skill and its report tests; record only provider-neutral, data-semantic rules.
 
 ## Preserve statistical semantics
 

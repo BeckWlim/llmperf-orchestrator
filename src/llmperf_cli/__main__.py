@@ -15,6 +15,7 @@ import yaml
 from tqdm import tqdm
 
 from llmperf.logging import LOG_COLOR_MODES, LOG_LEVELS, configure_logging
+from llmperf.version import PROTOCOL_VERSION
 from llmperf.user_config import (
     UserConfigError,
     display_environment_value,
@@ -23,14 +24,13 @@ from llmperf.user_config import (
     unset_environment_value,
 )
 from llmperf_cli.client import ClientError, LLMPerfClient, write_json
-from llmperf_cli.compatibility import (
+from llmperf_cli.projections import (
     CLIProjection,
     adapt_cli_response,
     project_health,
     project_runner,
 )
 from llmperf_cli.environment import load_cli_environment, resolve_cli_environment_path
-
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 CAMPAIGN_TERMINAL_STATUSES = {"completed", "cancelled", "empty"}
@@ -57,7 +57,7 @@ Typical workflow:
   1. Inspect providers:  llmperfctl provider list
   2. Discover models:    llmperfctl provider models <provider-id>
   3. Submit a Runner:    llmperfctl runner start -f runner.yaml
-  4. Inspect results:    llmperfctl runner status <runner-id> --summary
+  4. Inspect results:    llmperfctl runner status <runner-id>
 
 Run "llmperfctl <command> --help" for command-specific examples.
 """
@@ -89,6 +89,8 @@ def load_yaml(path: Path) -> Dict[str, Any]:
         raise ClientError(f"Unable to read YAML plan {path}: {exc}") from exc
     if not isinstance(document, dict):
         raise ClientError(f"YAML document must be a mapping: {path}")
+    if document.get("version") != PROTOCOL_VERSION:
+        raise ClientError(f"YAML version must be {PROTOCOL_VERSION!r}: {path}")
     return document
 
 
@@ -97,6 +99,7 @@ def load_runner_plan(path: Path) -> Dict[str, Any]:
 
     document = load_yaml(path)
     if "runner_plans" not in document:
+        document.pop("version")
         return document
     plans = document["runner_plans"]
     if not isinstance(plans, list) or len(plans) != 1:
@@ -546,10 +549,10 @@ def print_runner_logs(document: Dict[str, Any]) -> None:
 
 
 def render_result(result: CLIProjection) -> None:
-    """Render only compatibility-layer projections; raw documents are rejected."""
+    """Render only registered projections; raw documents are rejected."""
 
     if not isinstance(result, CLIProjection):
-        raise ClientError("CLI renderer accepts only compatibility projections")
+        raise ClientError("CLI renderer accepts only registered projections")
     renderers = {
         "health": print_health,
         "campaign_status": print_campaign_status,
@@ -1087,7 +1090,7 @@ Examples:
         help="Check backend availability and component counts",
         description=(
             "Show a filtered Backend health projection. Use --json for the same "
-            "stable fields or --full for the detailed compatible projection."
+            "stable fields or --full for the detailed projection."
         ),
         epilog=(
             "Examples:\n"
@@ -1098,12 +1101,14 @@ Examples:
     )
     health_output = health.add_mutually_exclusive_group()
     health_output.add_argument(
-        "--json", action="store_true", help="Print the filtered health projection as JSON"
+        "--json",
+        action="store_true",
+        help="Print the filtered health projection as JSON",
     )
     health_output.add_argument(
         "--full",
         action="store_true",
-        help="Print the detailed compatibility projection (never the raw response)",
+        help="Print the detailed registered projection (never the raw response)",
     )
 
     scheduler = _command_parser(
@@ -1467,7 +1472,7 @@ Examples:
     campaign_status.add_argument(
         "--full",
         action="store_true",
-        help="Print a detailed compatibility projection; use export for raw results",
+        help="Print a detailed projection; use export for raw results",
     )
     campaign_status.add_argument(
         "--include-requests",
@@ -1550,7 +1555,7 @@ Examples:
         epilog="""\
 Examples:
   llmperfctl runner start -f runner.yaml --wait
-  llmperfctl runner status <runner-id> --summary
+  llmperfctl runner status <runner-id>
   llmperfctl runner list --status failed
   llmperfctl runner logs <runner-id>
   llmperfctl runner export <runner-id> -o result.json
@@ -1626,11 +1631,6 @@ Examples:
     )
     runner_status_output = runner_status.add_mutually_exclusive_group()
     runner_status_output.add_argument(
-        "--summary",
-        action="store_true",
-        help="Print the compact default view (compatibility alias)",
-    )
-    runner_status_output.add_argument(
         "--json",
         action="store_true",
         help="Print the compact Runner projection as JSON",
@@ -1638,7 +1638,7 @@ Examples:
     runner_status_output.add_argument(
         "--full",
         action="store_true",
-        help="Print a detailed compatibility projection; use logs/export for raw data",
+        help="Print a detailed projection; use logs/export for raw data",
     )
     runner_status.add_argument(
         "-w",
@@ -1665,7 +1665,7 @@ Examples:
         help="List and filter Runners",
         description=(
             "List Runners as a compact table by default. Use --json for the same "
-            "lightweight records or --full for detailed compatibility projections."
+            "lightweight records or --full for detailed projections."
         ),
         epilog="""\
 Examples:
@@ -1693,7 +1693,7 @@ Examples:
     runner_list_output.add_argument(
         "--full",
         action="store_true",
-        help="Request detailed records and print only their compatibility projections",
+        help="Request detailed records and print only registered projections",
     )
     runner_cancel = _command_parser(
         runner_commands,
@@ -1737,7 +1737,7 @@ Examples:
     runner_wait.add_argument(
         "--full",
         action="store_true",
-        help="Print detailed Runner compatibility projections",
+        help="Print detailed Runner projections",
     )
     runner_logs = _command_parser(
         runner_commands,

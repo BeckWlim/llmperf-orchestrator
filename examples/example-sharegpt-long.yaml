@@ -1,0 +1,50 @@
+version: "1.0.0"
+
+campaign:
+  name: example-sharegpt-long
+  description: Immutable ShareGPT-backed 64K Prime/Warm replay with a cold control.
+  tags:
+    experiment: sharegpt-long-context
+
+wait: true
+
+task_definitions:
+  - name: sharegpt-64k-replay
+    trials: 1
+    seed: 20260819
+    payloads:
+      replay: {seed_namespace: replay}
+      cold: {seed_namespace: cold-control}
+    sequence:
+      - {kind: invoke, id: prime, role: prime, payload: replay}
+      - kind: parallel
+        invokes:
+          - {kind: invoke, id: warm, role: warm, payload: replay}
+          - {kind: invoke, id: cold, role: cold_control, payload: cold}
+    runner:
+      label: sharegpt-64k-replay
+      metadata: {purpose: long-context-cache-replay}
+      benchmark:
+        provider: aliyun
+        model: deepseek-v4-pro
+        tokenizer:
+          id: deepseek-ai/DeepSeek-V3
+          revision: main
+          use_fast: true
+        dataset:
+          source: huggingface
+          id: learnanything/sharegpt_v3_unfiltered_cleaned_split
+          filename: ShareGPT_V3_unfiltered_cleaned_split.json
+          revision: ddc6e27875b7198a46702daec3e61a55e222fc14
+          adapter: sharegpt
+        dataset_prompt_mode: concatenate
+        dataset_repeat_count: 1
+        timeout_seconds: 600
+        concurrent_requests: 1
+        mean_input_tokens: 65536
+        stddev_input_tokens: 0
+        mean_output_tokens: 8
+        stddev_output_tokens: 0
+        additional_sampling_params:
+          temperature: 0
+          stream_options: {include_usage: true}

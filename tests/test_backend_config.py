@@ -3,6 +3,12 @@ import os
 
 import pytest
 
+from llmperf import __version__ as runtime_version
+from llmperf.user_config import backend_environment_path
+from llmperf.utils import RESULTS_VERSION
+from llmperf.version import PROTOCOL_VERSION, RELEASE_VERSION, TASK_FORMAT_VERSION
+from llmperf_cli import __version__ as cli_version
+
 from llmperf_backend.config import (
     ConfigError,
     ConfigStore,
@@ -12,16 +18,17 @@ from llmperf_backend.config import (
 from llmperf_backend.environment import load_environment
 from llmperf_backend.models import (
     AppConfig,
+    BenchmarkConfig,
     BenchmarkCampaignStart,
     DatabaseConfig,
+    DatasetSpec,
     PerformanceGuardConfig,
     SchedulerConfig,
     ServerConfig,
 )
 
-
 VALID_CONFIG = """
-version: 1
+version: "1.0.0"
 environment: test
 server:
   host: 127.0.0.1
@@ -29,7 +36,6 @@ server:
 benchmark:
   provider: test
   model: test-model
-  llm_api: openai
   concurrent_requests: 2
 """
 
@@ -41,8 +47,6 @@ def test_defaults():
     assert config.server.port == 9000
     assert config.benchmark.concurrent_requests == 2
     assert config.benchmark.timeout_seconds == 90
-    assert config.benchmark.tokenizer.selection == "global_default"
-    assert config.benchmark.tokenizer.accuracy == "approximate"
     assert config.planner.enabled is True
     assert config.planner.batch_size == 20
     assert config.scheduler.ray_num_cpus == 8
@@ -51,6 +55,63 @@ def test_defaults():
     assert config.scheduler.artifact_resolution_timeout_seconds == 60.0
     assert config.performance_guard.min_ray_object_store_available_ratio == 0.1
     assert config.performance_guard.resume_ray_object_store_available_ratio == 0.2
+
+
+def test_dataset_prompt_modes():
+    dataset_document = {
+        "id": "organization/sharegpt",
+        "filename": "sharegpt.json",
+        "revision": "a" * 40,
+        "adapter": "sharegpt",
+    }
+    benchmark = BenchmarkConfig(
+        provider="test",
+        model="model",
+        dataset=DatasetSpec.model_validate(dataset_document),
+        dataset_prompt_mode="concatenate",
+    )
+    assert benchmark.dataset_prompt_mode == "concatenate"
+    assert benchmark.dataset is not None
+    assert benchmark.dataset.adapter == "sharegpt"
+
+    text_benchmark = BenchmarkConfig(
+        provider="test",
+        model="model",
+        dataset=DatasetSpec.model_validate({**dataset_document, "adapter": "text"}),
+    )
+    assert text_benchmark.dataset is not None
+    assert text_benchmark.dataset.adapter == "text"
+
+    with pytest.raises(ValueError, match="extra_forbidden"):
+        BenchmarkConfig.model_validate(
+            {
+                "provider": "test",
+                "model": "model",
+                "dataset": {**dataset_document, "format": "sharegpt"},
+            }
+        )
+
+    with pytest.raises(ValueError, match="requires dataset"):
+        BenchmarkConfig(
+            provider="test",
+            model="model",
+            dataset_prompt_mode="concatenate",
+        )
+    with pytest.raises(ValueError, match="repeat_count=1"):
+        BenchmarkConfig(
+            provider="test",
+            model="model",
+            dataset=DatasetSpec.model_validate(dataset_document),
+            dataset_prompt_mode="concatenate",
+            dataset_repeat_count=2,
+        )
+    with pytest.raises(ValueError, match="shared_prefix_tokens"):
+        BenchmarkConfig(
+            provider="test",
+            model="model",
+            dataset=DatasetSpec.model_validate(dataset_document),
+            shared_prefix_tokens=1,
+        )
 
 
 def test_ray_runtime_config():
@@ -68,43 +129,53 @@ scheduler:
     assert SchedulerConfig(ray_address="").ray_address is None
 
 
-def test_worker_config_compatibility():
-    config = load_config_text(
-        VALID_CONFIG
-        + """
+def test_removed_worker_fields():
+    with pytest.raises(ConfigError, match="working_directory"):
+        load_config_text(
+            VALID_CONFIG
+            + """
 scheduler:
-  working_directory: /legacy/worker/path
-  worker_module: custom.worker.module
-  cancel_grace_seconds: 7
-  log_bytes_limit: 4096
+  working_directory: /removed
 """
-    )
+        )
 
-    assert config.scheduler.working_directory == "/legacy/worker/path"
-    assert config.scheduler.worker_module == "custom.worker.module"
-    assert config.scheduler.cancel_grace_seconds == 7
-    assert config.scheduler.log_bytes_limit == 4096
+
+def test_protocol_version():
+    assert {
+        runtime_version,
+        cli_version,
+        RELEASE_VERSION,
+        PROTOCOL_VERSION,
+        TASK_FORMAT_VERSION,
+        RESULTS_VERSION,
+    } == {"1.0.0"}
+    with pytest.raises(ConfigError, match="1.0.0"):
+        load_config_text(VALID_CONFIG.replace('version: "1.0.0"', "version: 1"))
+    with pytest.raises(ConfigError, match="version"):
+        load_config_text(VALID_CONFIG.replace('version: "1.0.0"\n', ""))
 
 
 def test_ray_worker_limit():
     with pytest.raises(ValueError, match="embedded Ray requires server.workers=1"):
         AppConfig(
+            version=PROTOCOL_VERSION,
             server=ServerConfig(workers=2),
             scheduler=SchedulerConfig(),
-            benchmark={"provider": "test", "model": "test"},
+            benchmark=BenchmarkConfig(provider="test", model="test"),
         )
 
 
 def test_ray_slot_capacity():
     with pytest.raises(ValueError, match="Ray actor capacity"):
         AppConfig(
+            version=PROTOCOL_VERSION,
             scheduler=SchedulerConfig(
                 max_concurrent_runners=3,
                 ray_num_cpus=2,
                 ray_actor_num_cpus=1,
             ),
             performance_guard=PerformanceGuardConfig(),
-            benchmark={"provider": "test", "model": "test"},
+            benchmark=BenchmarkConfig(provider="test", model="test"),
         )
 
 
@@ -214,6 +285,7 @@ def test_campaign_workload():
             }
         )
 
+
 def test_runner_tokenizer():
     config = load_config_text(
         VALID_CONFIG
@@ -228,20 +300,28 @@ def test_runner_tokenizer():
     assert config.benchmark.tokenizer.id == "Qwen/Qwen2.5-7B-Instruct"
     assert config.benchmark.tokenizer.revision == "tokenizer-release"
     assert config.benchmark.tokenizer.use_fast is False
-    assert config.benchmark.tokenizer.selection == "explicit"
-    assert config.benchmark.tokenizer.accuracy == "compatible"
 
 
-def test_probe_tokenizer_rejection():
-    with pytest.raises(ConfigError, match="allow_approximate_tokenizer"):
-        load_config_text(
-            VALID_CONFIG
-            + """
-  cache_probe:
-    mode: exact_repeat
-    trials: 2
-"""
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("llm_api", "openai"),
+        ("adapter", "openai"),
+        ("selection", "explicit"),
+        ("accuracy", "compatible"),
+        ("immutable_revision", True),
+        ("requested_revision", "main"),
+    ],
+)
+def test_internal_fields_rejected(field, value):
+    if field in {"llm_api", "adapter"}:
+        suffix = f"\n  {field}: {value}\n"
+    else:
+        suffix = (
+            f"\n  tokenizer:\n    id: organization/tokenizer\n    {field}: {value}\n"
         )
+    with pytest.raises(ConfigError, match=field):
+        load_config_text(VALID_CONFIG + suffix)
 
 
 def test_probe_tokenizer_acceptance():
@@ -257,8 +337,8 @@ def test_probe_tokenizer_acceptance():
 """
     )
 
+    assert config.benchmark.cache_probe is not None
     assert config.benchmark.cache_probe.trials == 2
-    assert config.benchmark.tokenizer.selection == "explicit"
 
 
 def test_environment_expansion(monkeypatch):
@@ -288,16 +368,17 @@ def test_missing_dotenv(tmp_path):
         load_environment(tmp_path / "missing.env")
 
 
-def test_default_dotenv(tmp_path, monkeypatch):
-    (tmp_path / ".env").write_text(
+def test_default_user_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    environment_path = backend_environment_path()
+    environment_path.parent.mkdir(parents=True)
+    environment_path.write_text(
         "LLMPERF_DEFAULT_MODEL=glm-from-dotenv\nLLMPERF_SERVER_PORT=8123\n",
         encoding="utf-8",
     )
     monkeypatch.delenv("LLMPERF_ENV_FILE", raising=False)
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty-xdg"))
     monkeypatch.delenv("LLMPERF_DEFAULT_MODEL", raising=False)
     monkeypatch.delenv("LLMPERF_SERVER_PORT", raising=False)
-    monkeypatch.chdir(tmp_path)
 
     config = load_config()
 

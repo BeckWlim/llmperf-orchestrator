@@ -43,7 +43,8 @@ sudo chmod 0644 /etc/systemd/system/llmperf-backend.service
 
 The unit intentionally contains no `Environment=` declarations. `User` selects the
 account whose `~/.config/llmperf/backend.env` is discovered by the Backend, while
-`WorkingDirectory` provides the project-local `.env` fallback and Worker directory.
+`WorkingDirectory` provides the project path used by the service and Worker process.
+The Backend does not load a project-local `.env` file.
 Backend defaults keep one Uvicorn process unless its own configuration overrides it.
 
 Review the installed unit before starting it:
@@ -85,7 +86,7 @@ hashes cannot be inferred reliably from the remaining files or blob contents, so
 a manifest on the healthy source before transfer:
 
 ```bash
-python deploy/huggingface_cache_links.py capture \
+llmperf-cache-links capture \
   --cache-root ~/.cache/llmperf/tokenizers/downloads \
   --manifest tokenizer-cache-links.json
 ```
@@ -95,7 +96,7 @@ with `rsync -a`, and exclude `.locks/`, `*.lock`, and `*.incomplete`. On the des
 audit first; this command is read-only:
 
 ```bash
-python deploy/huggingface_cache_links.py audit \
+llmperf-cache-links audit \
   --cache-root ~/.cache/llmperf/tokenizers/downloads \
   --manifest tokenizer-cache-links.json
 ```
@@ -103,7 +104,7 @@ python deploy/huggingface_cache_links.py audit \
 Repair only missing links whose referenced blobs are already present:
 
 ```bash
-python deploy/huggingface_cache_links.py repair \
+llmperf-cache-links repair \
   --cache-root ~/.cache/llmperf/tokenizers/downloads \
   --manifest tokenizer-cache-links.json
 ```

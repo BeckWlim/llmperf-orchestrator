@@ -15,7 +15,6 @@ from pydantic import ValidationError
 from llmperf_backend.environment import load_environment
 from llmperf_backend.models import AppConfig, dump_model, validate_app_config
 
-
 CONFIG_PATH = "LLMPERF_BACKEND_CONFIG"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "default.yaml"
 _ENV_PATTERN = re.compile(

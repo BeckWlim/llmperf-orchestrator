@@ -3,11 +3,11 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import requests
 
-from llmperf.ray_llm_client import LLMClient
+from llmperf.ray_llm_client import LLMClient, LLMResponse
 from llmperf.models import RequestConfig
 from llmperf import common_metrics
 from llmperf.usage import normalize_usage
@@ -58,7 +58,7 @@ def decode_sse_line(chunk: bytes) -> Dict[str, Any]:
     event_usage = usage if isinstance(usage, dict) else None
     choices = document.get("choices") or []
     if not choices:
-        event = {"kind": "metadata"}
+        event: Dict[str, Any] = {"kind": "metadata"}
         if event_usage is not None:
             event["usage"] = event_usage
         return event
@@ -85,7 +85,7 @@ def decode_sse_line(chunk: bytes) -> Dict[str, Any]:
 
 
 def cache_metrics_from_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
-    """Backward-compatible metric projection of typed usage normalization."""
+    """Project typed usage normalization into canonical cache metrics."""
 
     normalized = normalize_usage(usage)
     metrics = normalized.to_metrics()
@@ -116,7 +116,7 @@ def _safe_response_headers(headers: Any) -> Dict[str, str]:
 class OpenAIChatCompletionsClient(LLMClient):
     """Client for OpenAI Chat Completions API."""
 
-    def llm_request(self, request_config: RequestConfig) -> Dict[str, Any]:
+    def llm_request(self, request_config: RequestConfig) -> LLMResponse:
         prompt = request_config.prompt
         prompt, prompt_len = prompt
 
@@ -140,16 +140,16 @@ class OpenAIChatCompletionsClient(LLMClient):
         error_msg = ""
         output_throughput = 0
         total_request_time = 0
-        usage = {}
+        usage: Dict[str, Any] = {}
         request_metadata = dict(request_config.metadata or {})
-        response_headers = {}
+        response_headers: Dict[str, str] = {}
         response_headers_time = None
         first_sse_time = None
         first_text_time = None
         last_text_time = None
         completion_time = None
 
-        metrics = {}
+        metrics: Dict[str, Any] = {}
 
         metrics[common_metrics.ERROR_CODE] = None
         metrics[common_metrics.ERROR_MSG] = ""
@@ -178,7 +178,7 @@ class OpenAIChatCompletionsClient(LLMClient):
         progress_changed = threading.Event()
         progress_lock = threading.Lock()
         last_progress_time = [start_time]
-        response_holder = [None]
+        response_holder: list[Optional[requests.Response]] = [None]
 
         def watch_stream_progress() -> None:
             while not request_finished.is_set():
@@ -244,7 +244,7 @@ class OpenAIChatCompletionsClient(LLMClient):
                     with progress_lock:
                         last_progress_time[0] = received_at
                     progress_changed.set()
-                    if first_text_time is None:
+                    if last_text_time is None:
                         first_text_time = received_at
                         ttft = first_text_time - start_time
                     else:
@@ -254,8 +254,7 @@ class OpenAIChatCompletionsClient(LLMClient):
 
             if inactivity_expired.is_set():
                 raise StreamInactivityTimeout(
-                    "stream produced no text for "
-                    f"{stream_idle_timeout:g} seconds"
+                    "stream produced no text for " f"{stream_idle_timeout:g} seconds"
                 )
 
             if not generated_text:
@@ -274,8 +273,7 @@ class OpenAIChatCompletionsClient(LLMClient):
                 exc, StreamInactivityTimeout
             ):
                 exc = StreamInactivityTimeout(
-                    "stream produced no text for "
-                    f"{stream_idle_timeout:g} seconds"
+                    "stream produced no text for " f"{stream_idle_timeout:g} seconds"
                 )
             if not error_msg:
                 error_msg = f"{type(exc).__name__}: {exc}"
@@ -296,10 +294,6 @@ class OpenAIChatCompletionsClient(LLMClient):
                 tokens_received / total_request_time if total_request_time > 0 else 0
             )
 
-        # Retained for result-schema compatibility. This is based on SSE chunks,
-        # not provider token boundaries; new consumers must use the explicitly
-        # named inter_sse_chunk_latency_s and TPOT fields below.
-        metrics[common_metrics.INTER_TOKEN_LAT] = sum(inter_chunk_latencies)
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
         metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = output_throughput
@@ -329,7 +323,6 @@ class OpenAIChatCompletionsClient(LLMClient):
             "completed_utc": completed_utc,
         }
         metrics[common_metrics.STREAM_TIMING_SEMANTICS] = {
-            "legacy_inter_token_latency": "deprecated_inter_chunk_average",
             "inter_sse_chunk_latency": "time_between_text-bearing_sse_events",
             "ttft_in_decode_intervals": False,
             "timeout": "maximum_seconds_without_text-bearing_sse_event",

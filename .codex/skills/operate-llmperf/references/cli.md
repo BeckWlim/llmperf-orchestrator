@@ -20,7 +20,7 @@ larger workload. Do not mutate configuration unless requested and authorized.
 ```bash
 llmperfctl runner start -f examples/example-smoke.yaml
 llmperfctl runner start -f examples/example-smoke.yaml --wait
-llmperfctl runner status RUNNER_ID --summary
+llmperfctl runner status RUNNER_ID
 llmperfctl runner logs RUNNER_ID
 llmperfctl runner cancel RUNNER_ID
 llmperfctl runner export RUNNER_ID -o runner.json
@@ -44,13 +44,15 @@ llmperfctl campaign export CAMPAIGN_ID -o campaign.json
 Campaign YAML may contain immediate `runners`, bounded `runner_plans`, and compiled
 `task_definitions`. The CLI forwards task recipes; Backend validation, artifact resolution,
 safety assessment, compilation, and persistence remain authoritative.
+Every Runner or Campaign YAML document declares `version: "1.0.0"`; other or missing
+versions fail locally before submission.
 
 Campaign `status` describes lifecycle. `outcome` describes aggregate execution and is one
 of `pending`, `succeeded`, `partial_failed`, `failed`, `cancelled`, or `no_runs`. A completed
 Campaign may have `partial_failed` outcome. Wait commands return exit code 2 for an
 unsuccessful terminal outcome while preserving durable results.
 
-Campaign export version 6 contains `task_definitions`, `task_instances`, `dispatches`,
+Campaign export version 1.0.0 contains `task_definitions`, `task_instances`, `dispatches`,
 generic `task_analyses`, and `runners`. A Task Instance with completed parents and future
 children remains lifecycle `planned`. Experiment meaning comes from dimensions, role tags,
 payload identity, dependency topology, and actual timestamps—not fixed experiment names.
@@ -79,7 +81,7 @@ timeouts appropriate to the workload; a client timeout does not cancel the Campa
 Inspect the first failed Runner before editing the workload:
 
 ```bash
-llmperfctl runner status RUNNER_ID --summary
+llmperfctl runner status RUNNER_ID
 llmperfctl runner logs RUNNER_ID
 ```
 
@@ -95,24 +97,6 @@ Do not dump complete stdout/stderr through ordinary status commands.
 
 Operational progress and durable IDs go to stderr. Queries use stdout. Never parse the
 human table when `--json` or export is available.
-
-## Existing legacy Campaigns during task-graph cutover
-
-An already running Backend process continues using its loaded legacy code. Editing the
-checkout does not alter that process. Do not restart new task-graph code against a database
-with pending legacy Dispatches: the tables and Dispatch columns are incompatible.
-
-Before cutover:
-
-1. let all legacy Dispatches finish under the old process;
-2. export each Campaign, preferably with request records when future analysis needs them;
-3. back up PostgreSQL;
-4. perform an explicit one-way migration or rebuild into the new schema;
-5. start the new Backend and validate with a smoke.
-
-The edited CLI may still read basic legacy Campaign and Runner data from an old Backend,
-but task-instance summaries are not authoritative for legacy responses. Preserve the raw
-version 5 exports before cutover.
 
 ## Failure triage
 

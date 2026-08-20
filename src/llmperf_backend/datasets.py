@@ -5,30 +5,49 @@ from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path, PurePosixPath
+import re
 import threading
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Protocol, Tuple
 
 from huggingface_hub import hf_hub_download, try_to_load_from_cache
-from huggingface_hub.utils import HFValidationError, validate_repo_id
 
+from llmperf.prompt_datasets import (
+    validate_external_dataset_adapter,
+)
 from llmperf_backend.huggingface import (
     HUGGINGFACE_PROXY,
     HuggingFaceProxyError,
+    HuggingFaceRepositoryError,
     configure_huggingface_http,
     huggingface_proxy_label,
     resolve_huggingface_proxy,
+    validate_huggingface_repository_id,
 )
-
 
 DATASET_CACHE_DIRECTORY = "LLMPERF_DATASET_CACHE"
 DATASET_OFFLINE = "LLMPERF_DATASET_OFFLINE"
 WORKER_DATASET_PATH = "LLMPERF_DATASET_PATH"
 DEFAULT_DATASET_CACHE_DIRECTORY = Path("~/.cache/llmperf/datasets")
+IMMUTABLE_HUGGINGFACE_REVISION = re.compile(r"[0-9a-f]{40,64}\Z")
 LOGGER = logging.getLogger(__name__)
 
 
 class DatasetResolutionError(RuntimeError):
     """Raised when a submitted dataset cannot be resolved by the backend."""
+
+
+class DatasetResolver(Protocol):
+    """Capability required by request orchestration to resolve a dataset."""
+
+    async def resolve(self, spec: Mapping[str, Any]) -> "DatasetResolution": ...
+
+
+def is_immutable_dataset_revision(value: Any) -> bool:
+    """Return whether a resolved Hugging Face dataset revision is content-addressed."""
+
+    return isinstance(value, str) and bool(
+        IMMUTABLE_HUGGINGFACE_REVISION.fullmatch(value)
+    )
 
 
 def _environment_flag(name: str, default: bool = False) -> bool:
@@ -51,7 +70,7 @@ class DatasetResolution:
     dataset_id: str
     filename: str
     revision: str
-    format: str
+    adapter: str
     path: Path
     cached: bool
 
@@ -61,7 +80,7 @@ class DatasetResolution:
             "id": self.dataset_id,
             "filename": self.filename,
             "revision": self.revision,
-            "format": self.format,
+            "adapter": self.adapter,
         }
 
 
@@ -106,8 +125,8 @@ class DatasetCache:
             raise DatasetResolutionError("Only Hugging Face datasets are supported")
         dataset_id = str(spec.get("id", "")).strip()
         try:
-            validate_repo_id(dataset_id)
-        except HFValidationError as exc:
+            validate_huggingface_repository_id(dataset_id)
+        except HuggingFaceRepositoryError as exc:
             raise DatasetResolutionError(
                 f"Dataset id must be a Hugging Face repository ID: {exc}"
             ) from exc
@@ -115,11 +134,11 @@ class DatasetCache:
         revision = str(spec.get("revision") or "main").strip()
         if not revision:
             raise DatasetResolutionError("Dataset revision must not be empty")
-        dataset_format = str(spec.get("format", "sharegpt"))
-        if dataset_format != "sharegpt":
-            raise DatasetResolutionError(
-                f"Unsupported dataset format: {dataset_format}"
-            )
+        dataset_adapter = str(spec.get("adapter", "")).strip()
+        try:
+            dataset_adapter = validate_external_dataset_adapter(dataset_adapter)
+        except ValueError as exc:
+            raise DatasetResolutionError(str(exc)) from exc
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
@@ -127,7 +146,7 @@ class DatasetCache:
             dataset_id,
             filename,
             revision,
-            dataset_format,
+            dataset_adapter,
         )
 
     def _resolve_sync(
@@ -135,9 +154,9 @@ class DatasetCache:
         dataset_id: str,
         filename: str,
         revision: str,
-        dataset_format: str,
+        dataset_adapter: str,
     ) -> DatasetResolution:
-        key = (dataset_id, filename, revision, dataset_format)
+        key = (dataset_id, filename, revision, dataset_adapter)
         with self._lock:
             existing = self._entries.get(key)
             if existing is not None and existing.path.is_file():
@@ -164,7 +183,7 @@ class DatasetCache:
                 dataset_id=dataset_id,
                 filename=filename,
                 revision=self._resolved_revision(resolved_path, revision),
-                format=dataset_format,
+                adapter=dataset_adapter,
                 path=resolved_path,
                 cached=True,
             )
@@ -193,11 +212,6 @@ class DatasetCache:
                     repo_type="dataset",
                     revision=revision,
                     cache_dir=self.cache_directory,
-                    proxies=(
-                        {"http": self.proxy_url, "https": self.proxy_url}
-                        if self.proxy_url
-                        else None
-                    ),
                 )
             ).resolve()
         except Exception as exc:
@@ -214,7 +228,7 @@ class DatasetCache:
             dataset_id=dataset_id,
             filename=filename,
             revision=self._resolved_revision(resolved_path, revision),
-            format=dataset_format,
+            adapter=dataset_adapter,
             path=resolved_path,
             cached=False,
         )
@@ -279,7 +293,7 @@ class DatasetCache:
                     resolution.dataset_id,
                     resolution.filename,
                     resolution.revision,
-                    resolution.format,
+                    resolution.adapter,
                 )
             ] = resolution
 

@@ -4,7 +4,6 @@ import yaml
 
 from llmperf_backend.models import BenchmarkCampaignStart, BenchmarkRunnerCreate
 
-
 EXAMPLES = Path(__file__).parents[1] / "examples"
 
 

@@ -29,7 +29,7 @@ def llm_correctness(
     additional_sampling_params: Optional[Dict[str, Any]] = None,
     num_concurrent_requests: int = 1,
     max_num_completed_requests: int = 500,
-    test_timeout_s=90,
+    test_timeout_s: float = 90,
     llm_api="chat",
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Get the token throughput and latencies for the given model.
@@ -48,8 +48,7 @@ def llm_correctness(
 
     """
 
-    if not additional_sampling_params:
-        additional_sampling_params = {}
+    sampling_parameters = dict(additional_sampling_params or {})
 
     clients = construct_clients(llm_api=llm_api, num_clients=num_concurrent_requests)
     req_launcher = RequestsLauncher(clients)
@@ -60,15 +59,15 @@ def llm_correctness(
     num_completed_requests = 0
 
     sampling_params = {"temperature": 0.0}
-    sampling_params.update(additional_sampling_params)
+    sampling_params.update(sampling_parameters)
     completed_requests = []
-    iter = 0
+    iteration_count = 0
     pbar = tqdm(total=max_num_completed_requests)
     while (
         time.monotonic() - start_time < test_timeout_s
         and num_completed_requests < max_num_completed_requests
     ):
-        iter += 1
+        iteration_count += 1
         rnd_number = random.randint(0, MAX_RANDOM_NUMBER)
         rnd_num_words = num2words.num2words(rnd_number)
 
@@ -83,7 +82,7 @@ def llm_correctness(
         )
         req_launcher.launch_requests(request_config)
 
-        if not (iter % num_concurrent_requests):
+        if not (iteration_count % num_concurrent_requests):
             completed_requests.extend(req_launcher.get_next_ready())
         pbar.update(len(completed_requests) - num_completed_requests)
         num_completed_requests = len(completed_requests)
@@ -109,19 +108,18 @@ def llm_correctness(
 
         # if there were no errors when making request.
         if not metrics[common_metrics.ERROR_CODE]:
-            try:
-                commas_between_numbers_re = r"(\d+),(?=\d)"
-                gen_text_commas_removed = re.sub(
-                    commas_between_numbers_re, r"\1", generated_text
-                )
-                nums = re.findall(r"\d+", gen_text_commas_removed)
-                generated_text = gen_text_commas_removed.replace("\n", " ")
-
-                assert str(completed_request_config.metadata["rnd_number"]) in nums
-            except:
+            commas_between_numbers_re = r"(\d+),(?=\d)"
+            gen_text_commas_removed = re.sub(
+                commas_between_numbers_re, r"\1", generated_text
+            )
+            nums = re.findall(r"\d+", gen_text_commas_removed)
+            normalized_generated_text = gen_text_commas_removed.replace("\n", " ")
+            expected_number = str(completed_request_config.metadata["rnd_number"])
+            if expected_number not in nums:
                 num_mismatched_requests += 1
                 print(
-                    f"    mismatched request: {generated_text}, expected: {completed_request_config.metadata['rnd_number']}"
+                    f"    mismatched request: {normalized_generated_text}, "
+                    f"expected: {expected_number}"
                 )
         else:
             num_errored_requests += 1
@@ -145,7 +143,7 @@ def llm_correctness(
     # Metadata
     summary_metrics["model"] = model
     summary_metrics["num_concurrent_requests"] = num_concurrent_requests
-    summary_metrics["additional_sampling_params"] = additional_sampling_params
+    summary_metrics["additional_sampling_params"] = sampling_parameters
     summary_metrics["llm_api"] = llm_api
 
     return summary_metrics, raw_results
@@ -213,35 +211,39 @@ def run(
         individual_responses_filename = f"{file_name}_individual_responses"
         summary_metrics.update(user_metadata)
         results = LLMPerfResults(name=summary_file_name, metadata=summary_metrics)
-        results_dir = Path(results_dir)
-        if not results_dir.exists():
-            results_dir.mkdir(parents=True)
-        elif not results_dir.is_dir():
-            raise ValueError(f"{results_dir} is not a directory")
-        with open(results_dir / f"{summary_file_name}.json", "w") as f:
-            json.dump(results.to_dict(), f, indent=4)
-        with open(results_dir / f"{individual_responses_filename}.json", "w") as f:
-            json.dump(raw_results, f, indent=4)
+        results_directory = Path(results_dir)
+        if not results_directory.exists():
+            results_directory.mkdir(parents=True)
+        elif not results_directory.is_dir():
+            raise ValueError(f"{results_directory} is not a directory")
+        summary_path = results_directory / f"{summary_file_name}.json"
+        with summary_path.open("w", encoding="utf-8") as summary_stream:
+            json.dump(results.to_dict(), summary_stream, indent=4)
+        responses_path = results_directory / f"{individual_responses_filename}.json"
+        with responses_path.open("w", encoding="utf-8") as responses_stream:
+            json.dump(raw_results, responses_stream, indent=4)
 
 
-args = argparse.ArgumentParser(description="Run a correctness test for a given model.")
+parser = argparse.ArgumentParser(
+    description="Run a correctness test for a given model."
+)
 
-args.add_argument(
+parser.add_argument(
     "--model", type=str, required=True, help="The model to use for this load test."
 )
-args.add_argument(
+parser.add_argument(
     "--num-concurrent-requests",
     type=int,
     default=10,
     help=("The number of concurrent requests to send. (default: %(default)s)"),
 )
-args.add_argument(
+parser.add_argument(
     "--timeout",
     type=int,
     default=90,
     help="The amount of time to run the load test for. (default: %(default)s)",
 )
-args.add_argument(
+parser.add_argument(
     "--max-num-completed-requests",
     type=int,
     default=50,
@@ -250,7 +252,7 @@ args.add_argument(
         "that its possible for the test to timeout first. (default: %(default)s)"
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--additional-sampling-params",
     type=str,
     default="{}",
@@ -259,7 +261,7 @@ args.add_argument(
         "(default: %(default)s) No additional sampling params are sent."
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--results-dir",
     type=str,
     default="",
@@ -268,7 +270,7 @@ args.add_argument(
         "(`default: %(default)s`) No results are saved)"
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--llm-api",
     type=str,
     default="openai",
@@ -277,7 +279,7 @@ args.add_argument(
         " (`default: %(default)s`)"
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--metadata",
     type=str,
     default="",
@@ -288,24 +290,24 @@ args.add_argument(
 )
 
 if __name__ == "__main__":
-    args = args.parse_args()
+    arguments = parser.parse_args()
 
     env_vars = dict(os.environ)
     ray.init(runtime_env={"env_vars": env_vars})
     # Parse user metadata.
     user_metadata = {}
-    if args.metadata:
-        for item in args.metadata.split(","):
+    if arguments.metadata:
+        for item in arguments.metadata.split(","):
             key, value = item.split("=")
             user_metadata[key] = value
 
     run(
-        llm_api=args.llm_api,
-        model=args.model,
-        test_timeout_s=args.timeout,
-        max_num_completed_requests=args.max_num_completed_requests,
-        num_concurrent_requests=args.num_concurrent_requests,
-        additional_sampling_params=args.additional_sampling_params,
-        results_dir=args.results_dir,
+        llm_api=arguments.llm_api,
+        model=arguments.model,
+        test_timeout_s=arguments.timeout,
+        max_num_completed_requests=arguments.max_num_completed_requests,
+        num_concurrent_requests=arguments.num_concurrent_requests,
+        additional_sampling_params=arguments.additional_sampling_params,
+        results_dir=arguments.results_dir,
         user_metadata=user_metadata,
     )

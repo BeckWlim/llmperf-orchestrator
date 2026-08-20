@@ -1,11 +1,10 @@
-"""Version-tolerant, whitelist-only projections for every CLI response."""
+"""Strict, whitelist-only projections for every CLI response."""
 
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Sequence, Tuple
 
 from llmperf_cli.client import ClientError
 from llmperf.user_config import display_environment_value
-
 
 Projector = Callable[[Any, bool], Any]
 
@@ -27,6 +26,10 @@ def _object(document: Any, route: str) -> Mapping[str, Any]:
 
 def _pick(document: Mapping[str, Any], fields: Sequence[str]) -> Dict[str, Any]:
     return {field: document.get(field) for field in fields if field in document}
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
 
 
 def _items(
@@ -51,10 +54,10 @@ def _items(
 
 
 def project_health(document: Any, detailed: bool = False) -> Dict[str, Any]:
-    """Normalize old/new health shapes while excluding configuration internals."""
+    """Project the canonical health shape while excluding configuration internals."""
 
     source = _object(document, "health")
-    auth = source.get("auth") if isinstance(source.get("auth"), Mapping) else {}
+    auth = _mapping(source.get("auth"))
     enabled = bool(auth.get("enabled"))
     reload_error = bool(auth.get("reload_error"))
     return {
@@ -64,9 +67,7 @@ def project_health(document: Any, detailed: bool = False) -> Dict[str, Any]:
         "providers": source.get("providers"),
         "auth": {
             "status": (
-                "degraded"
-                if reload_error
-                else ("enabled" if enabled else "disabled")
+                "degraded" if reload_error else ("enabled" if enabled else "disabled")
             ),
             "enabled": enabled,
             "reload_error": reload_error,
@@ -76,17 +77,18 @@ def project_health(document: Any, detailed: bool = False) -> Dict[str, Any]:
 
 def project_runner(document: Any, detailed: bool = False) -> Dict[str, Any]:
     source = _object(document, "runner")
-    benchmark = (
-        source.get("benchmark") if isinstance(source.get("benchmark"), Mapping) else {}
+    benchmark = _mapping(source.get("benchmark"))
+    summary = _mapping(source.get("summary"))
+    results = _mapping(summary.get("results"))
+    outcome = _mapping(summary.get("outcome"))
+    requests = _mapping(source.get("requests"))
+    error = _mapping(source.get("error"))
+    first_error = outcome.get("first_error")
+    if not error and isinstance(first_error, Mapping):
+        error = first_error
+    message = (
+        outcome.get("message") or source.get("message") or source.get("error_message")
     )
-    summary = source.get("summary") if isinstance(source.get("summary"), Mapping) else {}
-    results = summary.get("results") if isinstance(summary.get("results"), Mapping) else {}
-    outcome = summary.get("outcome") if isinstance(summary.get("outcome"), Mapping) else {}
-    requests = source.get("requests") if isinstance(source.get("requests"), Mapping) else {}
-    error = source.get("error") if isinstance(source.get("error"), Mapping) else {}
-    if not error and isinstance(outcome.get("first_error"), Mapping):
-        error = outcome["first_error"]
-    message = outcome.get("message") or source.get("message") or source.get("error_message")
     if not error and source.get("error_message"):
         error = {"code": None, "message": source["error_message"]}
     projected = {
@@ -97,11 +99,14 @@ def project_runner(document: Any, detailed: bool = False) -> Dict[str, Any]:
         "model": source.get("model", benchmark.get("model")),
         "requests": {
             "started": requests.get(
-                "started", outcome.get("requests_started", results.get("num_requests_started"))
+                "started",
+                outcome.get("requests_started", results.get("num_requests_started")),
             ),
             "completed": requests.get(
                 "completed",
-                outcome.get("requests_completed", results.get("num_completed_requests")),
+                outcome.get(
+                    "requests_completed", results.get("num_completed_requests")
+                ),
             ),
             "failed": requests.get(
                 "failed", outcome.get("requests_failed", results.get("number_errors"))
@@ -112,7 +117,7 @@ def project_runner(document: Any, detailed: bool = False) -> Dict[str, Any]:
         "message": message,
         "scheduler_id": source.get("scheduler_id"),
         "worker": _pick(
-            source.get("worker") if isinstance(source.get("worker"), Mapping) else {},
+            _mapping(source.get("worker")),
             ("process_id", "exit_code"),
         ),
         "started_at": source.get("started_at"),
@@ -322,19 +327,12 @@ def _planner_runtime(document: Any, detailed: bool) -> Dict[str, Any]:
 
 def _provider(source: Mapping[str, Any]) -> Dict[str, Any]:
     raw_discovery = source.get("model_discovery")
-    if isinstance(raw_discovery, Mapping):
-        discovery = _pick(
-            raw_discovery,
-            ("mode", "path", "cache_ttl_seconds", "static_model_count"),
-        )
-    else:
-        discovery = {
-            "mode": source.get("discovery"),
-            "cache_ttl_seconds": source.get("model_cache_ttl_seconds"),
-            "static_model_count": source.get("static_model_count"),
-        }
-        if source.get("models_path") is not None:
-            discovery["path"] = source.get("models_path")
+    if not isinstance(raw_discovery, Mapping):
+        raise ClientError("provider profile must contain a model_discovery object")
+    discovery = _pick(
+        raw_discovery,
+        ("mode", "path", "cache_ttl_seconds", "static_model_count"),
+    )
     typical_models = source.get("typical_models", [])
     if not isinstance(typical_models, list) or not all(
         isinstance(model, str) for model in typical_models
@@ -342,11 +340,9 @@ def _provider(source: Mapping[str, Any]) -> Dict[str, Any]:
         raise ClientError("provider profile typical_models must be a string array")
     return {
         "id": source.get("id"),
-        "adapter": source.get("adapter", source.get("llm_api")),
-        "base_url": source.get("base_url", source.get("api_base")),
-        "api_key_configured": source.get(
-            "api_key_configured", source.get("has_api_key")
-        ),
+        "adapter": source.get("adapter"),
+        "base_url": source.get("base_url"),
+        "api_key_configured": source.get("api_key_configured"),
         "typical_models": list(typical_models[:3]),
         "model_discovery": discovery,
     }
@@ -372,9 +368,7 @@ def _provider_reload(document: Any, detailed: bool) -> Dict[str, Any]:
         if not isinstance(values, list) or not all(
             isinstance(value, str) for value in values
         ):
-            raise ClientError(
-                f"provider.reload changes.{field} must be a string array"
-            )
+            raise ClientError(f"provider.reload changes.{field} must be a string array")
         changes[field] = list(values)
     result["changes"] = changes
     return result
@@ -384,7 +378,9 @@ def _provider_models(document: Any, detailed: bool) -> Dict[str, Any]:
     source = _object(document, "provider.models")
     result = _pick(source, ("provider", "source", "cached", "fetched_at", "expires_at"))
     models = source.get("models")
-    if not isinstance(models, list) or not all(isinstance(model, str) for model in models):
+    if not isinstance(models, list) or not all(
+        isinstance(model, str) for model in models
+    ):
         raise ClientError("provider.models response must contain a models string array")
     result["models"] = list(models)
     return result
@@ -393,7 +389,15 @@ def _provider_models(document: Any, detailed: bool) -> Dict[str, Any]:
 def _auth_client(source: Mapping[str, Any]) -> Dict[str, Any]:
     return _pick(
         source,
-        ("username", "display_name", "email", "role", "enabled", "created_at", "updated_at"),
+        (
+            "username",
+            "display_name",
+            "email",
+            "role",
+            "enabled",
+            "created_at",
+            "updated_at",
+        ),
     )
 
 
@@ -447,8 +451,12 @@ def _campaign_start(document: Any, detailed: bool) -> Dict[str, Any]:
     source = _object(document, "campaign.start")
     result = _pick(source, ("campaign_id", "exported_to"))
     if detailed:
-        result["runners"] = [project_runner(item, True) for item in source.get("runners", [])]
-        result["runner_plans"] = [_plan(item) for item in source.get("runner_plans", [])]
+        result["runners"] = [
+            project_runner(item, True) for item in source.get("runners", [])
+        ]
+        result["runner_plans"] = [
+            _plan(item) for item in source.get("runner_plans", [])
+        ]
         if isinstance(source.get("campaign_status"), Mapping):
             result["campaign_status"] = _campaign(source["campaign_status"])
     return result

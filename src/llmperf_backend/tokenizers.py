@@ -10,15 +10,17 @@ import re
 import shutil
 import tempfile
 import threading
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Protocol, Tuple
 
 from llmperf.logging import route_library_logs
 from llmperf_backend.huggingface import (
     HUGGINGFACE_PROXY,
     HuggingFaceProxyError,
+    HuggingFaceRepositoryError,
     configure_huggingface_http,
     huggingface_proxy_label,
     resolve_huggingface_proxy,
+    validate_huggingface_repository_id,
 )
 
 # This backend intentionally uses Transformers without a model framework: only
@@ -27,9 +29,7 @@ from llmperf_backend.huggingface import (
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 from huggingface_hub import snapshot_download, try_to_load_from_cache
-from huggingface_hub.utils import HFValidationError, validate_repo_id
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
-
 
 route_library_logs("huggingface_hub", "transformers")
 
@@ -59,6 +59,12 @@ TOKENIZER_SNAPSHOT_ALLOW_PATTERNS = (
 
 class TokenizerResolutionError(RuntimeError):
     """Raised when a submitted tokenizer cannot be resolved by the backend."""
+
+
+class TokenizerResolver(Protocol):
+    """Capability required by request orchestration to resolve a tokenizer."""
+
+    async def resolve(self, spec: Mapping[str, Any]) -> "TokenizerResolution": ...
 
 
 def _environment_flag(name: str, default: bool = False) -> bool:
@@ -160,8 +166,8 @@ class TokenizerCache:
         if not tokenizer_id:
             raise TokenizerResolutionError("Tokenizer id must not be empty")
         try:
-            validate_repo_id(tokenizer_id)
-        except HFValidationError as exc:
+            validate_huggingface_repository_id(tokenizer_id)
+        except HuggingFaceRepositoryError as exc:
             raise TokenizerResolutionError(
                 f"Tokenizer id must be a Hugging Face repository ID: {exc}"
             ) from exc
@@ -169,12 +175,6 @@ class TokenizerCache:
         revision = str(raw_revision).strip() if raw_revision is not None else "main"
         if not revision:
             raise TokenizerResolutionError("Tokenizer revision must not be empty")
-        raw_requested_revision = spec.get("requested_revision")
-        requested_revision = (
-            str(raw_requested_revision).strip()
-            if raw_requested_revision is not None
-            else None
-        )
         use_fast = bool(spec.get("use_fast", True))
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -183,7 +183,6 @@ class TokenizerCache:
             tokenizer_id,
             revision,
             use_fast,
-            requested_revision,
         )
 
     def _resolve_sync(
@@ -191,7 +190,6 @@ class TokenizerCache:
         tokenizer_id: str,
         revision: str,
         use_fast: bool,
-        requested_revision: Optional[str] = None,
     ) -> TokenizerResolution:
         requested_key = (tokenizer_id, revision, use_fast)
         with self._lock:
@@ -230,17 +228,6 @@ class TokenizerCache:
             existing_target = self.resolved_directory / self._artifact_key(
                 tokenizer_id, resolved_revision, use_fast
             )
-            legacy_revisions = [revision]
-            if requested_revision and requested_revision not in legacy_revisions:
-                legacy_revisions.append(requested_revision)
-            if not existing_target.is_dir():
-                for legacy_revision in legacy_revisions:
-                    legacy_target = self.resolved_directory / self._artifact_key(
-                        tokenizer_id, legacy_revision, use_fast
-                    )
-                    if legacy_target.is_dir():
-                        existing_target = legacy_target
-                        break
             if not existing_target.is_dir() and self.local_files_only:
                 cached_snapshot = self._cached_snapshot(tokenizer_id, revision)
                 if cached_snapshot is None:
@@ -332,9 +319,7 @@ class TokenizerCache:
                             snapshot_path,
                         )
                     snapshot_path = self._download_snapshot(tokenizer_id, revision)
-                    snapshot_revision = self._snapshot_revision(
-                        snapshot_path, revision
-                    )
+                    snapshot_revision = self._snapshot_revision(snapshot_path, revision)
                     tokenizer = self._load_local_tokenizer(
                         tokenizer_id, revision, snapshot_path, use_fast
                     )
@@ -390,18 +375,12 @@ class TokenizerCache:
             return resolution
 
     def _download_snapshot(self, tokenizer_id: str, revision: str) -> Path:
-        proxy = (
-            {"http": self.proxy_url, "https": self.proxy_url}
-            if self.proxy_url
-            else None
-        )
         return Path(
             snapshot_download(
                 repo_id=tokenizer_id,
                 revision=revision,
                 cache_dir=str(self.download_directory),
                 local_files_only=self.local_files_only,
-                proxies=proxy,
                 allow_patterns=list(TOKENIZER_SNAPSHOT_ALLOW_PATTERNS),
             )
         )
@@ -545,9 +524,7 @@ class TokenizerCache:
                 / self._artifact_key(tokenizer_id, item[1], use_fast)
             ).is_dir()
         ]
-        exact_resolved = [
-            item for item in resolved if item[1] == requested_revision
-        ]
+        exact_resolved = [item for item in resolved if item[1] == requested_revision]
         if len(exact_resolved) == 1:
             return exact_resolved[0]
         exact_loadable = [

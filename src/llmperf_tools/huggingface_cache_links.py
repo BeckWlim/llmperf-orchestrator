@@ -16,8 +16,9 @@ import sys
 import tempfile
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
+from llmperf.version import PROTOCOL_VERSION
 
-MANIFEST_SCHEMA = "llmperf-huggingface-cache-links/v1"
+MANIFEST_SCHEMA = f"llmperf-huggingface-cache-links/{PROTOCOL_VERSION}"
 
 
 class CacheLinkError(RuntimeError):

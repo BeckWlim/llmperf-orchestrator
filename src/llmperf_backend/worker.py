@@ -69,29 +69,32 @@ def _calculate(
 ) -> Tuple[Dict[str, Any], Sequence[Dict[str, Any]]]:
     """Run one benchmark inside an already connected Ray worker process."""
 
+    from llmperf.prompt_datasets import PromptDatasetSource
     from llmperf.token_benchmark_ray import get_token_throughput_latencies
 
     dataset = benchmark.get("dataset")
-    dataset_path = None
-    dataset_format = "sharegpt"
-    if dataset is not None:
+    if dataset is None:
+        prompt_dataset_source = PromptDatasetSource.builtin_sonnet()
+    else:
         dataset_path = os.environ.get(WORKER_DATASET_PATH)
         if not dataset_path:
             raise RuntimeError(
                 f"{WORKER_DATASET_PATH} is required for dataset workloads"
             )
-        dataset_format = dataset["format"]
+        prompt_dataset_source = PromptDatasetSource.external(
+            dataset["adapter"], dataset_path
+        )
     summary, requests = get_token_throughput_latencies(
         model=benchmark["model"],
-        llm_api=benchmark["llm_api"],
+        llm_api=benchmark["adapter"],
         test_timeout_s=benchmark["timeout_seconds"],
         max_num_completed_requests=benchmark["max_completed_requests"],
         num_concurrent_requests=benchmark["concurrent_requests"],
         mean_input_tokens=benchmark["mean_input_tokens"],
         stddev_input_tokens=benchmark["stddev_input_tokens"],
         shared_prefix_tokens=benchmark.get("shared_prefix_tokens", 0),
-        dataset_path=dataset_path,
-        dataset_format=dataset_format,
+        prompt_dataset_source=prompt_dataset_source,
+        dataset_prompt_mode=benchmark.get("dataset_prompt_mode", "sample"),
         dataset_repeat_count=benchmark.get("dataset_repeat_count", 1),
         dataset_seed=benchmark.get("dataset_seed", 11111),
         mean_output_tokens=benchmark["mean_output_tokens"],
@@ -99,7 +102,7 @@ def _calculate(
         additional_sampling_params=benchmark["additional_sampling_params"],
         cache_probe=benchmark.get("cache_probe"),
         tokenizer_provenance=benchmark.get("tokenizer"),
-        task_request=benchmark.get("task_request"),
+        task_context=benchmark.get("task_context"),
     )
     runtime = dict(execution_runtime or {})
     runtime.setdefault("backend", "ray")

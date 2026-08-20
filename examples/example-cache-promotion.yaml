@@ -1,3 +1,5 @@
+version: "1.0.0"
+
 campaign:
   name: example-task-promotion
   description: Repeated deterministic hits followed by a bounded quiet probe.
@@ -34,7 +36,6 @@ task_definitions:
       benchmark:
         provider: aliyun
         model: deepseek-v4-pro
-        llm_api: openai
         tokenizer: {id: deepseek-ai/DeepSeek-V3, revision: main, use_fast: true}
         timeout_seconds: 60
         concurrent_requests: 1

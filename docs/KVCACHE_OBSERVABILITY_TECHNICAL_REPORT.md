@@ -155,6 +155,21 @@ Use enough independent trials for variability. A single point supports only a di
 observation. Record routing, time-of-day, concurrency, and failures that could affect cache
 affinity.
 
+## Boundary for more complex observers
+
+The current architecture is well suited to request-bound, statically planned observation:
+fixed probes, control cohorts, repeated trials, parallel provider comparisons, timed
+retention checks, and derived report metrics can all be expressed as a finite task graph.
+This covers the present KV-cache promotion, retention, and residency experiments without
+requiring cache-specific behavior in the Planner or Scheduler.
+
+It does not yet make continuous telemetry collectors, response-dependent probes, adaptive
+stopping, dynamic sampling rates, or provider-internal cache events first-class. Those
+experiments need a versioned observer-result contract and, where the next graph depends on
+previous evidence, bounded compilation epochs. Provider-private telemetry may strengthen
+an inference, but it must remain separately identified from portable request evidence and
+must not become an implicit requirement for the generic experiment model.
+
 ## Fine-grained hit analysis
 
 Use both accounting and TTFT:
@@ -202,7 +217,7 @@ unbounded loops or hidden retries.
 
 ## Export and audit
 
-Campaign export version 6 preserves task definitions, dimensions, trials, dependency
+Campaign export version 1.0.0 preserves task definitions, dimensions, trials, dependency
 topology, planned/actual timing, payload hashes, Runner summaries, and optional request
 records. The report preparation pipeline normalizes this evidence without imposing a fixed
 chart layout. Final HTML should emphasize the strongest conclusions, fold Runner detail,

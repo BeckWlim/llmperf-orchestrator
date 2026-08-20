@@ -6,7 +6,7 @@ from typing import Any, Dict
 
 import boto3
 
-from llmperf.ray_llm_client import LLMClient
+from llmperf.ray_llm_client import LLMClient, LLMResponse
 from llmperf.models import RequestConfig
 from llmperf import common_metrics
 from llmperf.utils import get_tokenizer
@@ -20,7 +20,7 @@ class SageMakerClient(LLMClient):
         # using the llama tokenizer.
         self.tokenizer = get_tokenizer()
 
-    def llm_request(self, request_config: RequestConfig) -> Dict[str, Any]:
+    def llm_request(self, request_config: RequestConfig) -> LLMResponse:
         if not os.environ.get("AWS_ACCESS_KEY_ID"):
             raise ValueError("AWS_ACCESS_KEY_ID must be set.")
         if not os.environ.get("AWS_SECRET_ACCESS_KEY"):
@@ -31,22 +31,18 @@ class SageMakerClient(LLMClient):
         prompt = request_config.prompt
         prompt, prompt_len = prompt
 
-        message = [
-            {"role": "system", "content": ""},
-            {"role": "user", "content": prompt},
-        ]
         model = request_config.model
         sm_runtime = boto3.client(
             "sagemaker-runtime", region_name=os.environ.get("AWS_REGION_NAME")
         )
 
-        sampling_params = request_config.sampling_params
+        sampling_params = dict(request_config.sampling_params or {})
 
         if "max_tokens" in sampling_params:
             sampling_params["max_new_tokens"] = sampling_params["max_tokens"]
             del sampling_params["max_tokens"]
 
-        message = {
+        request_body = {
             "inputs": [
                 [
                     {"role": "system", "content": ""},
@@ -54,7 +50,7 @@ class SageMakerClient(LLMClient):
                 ]
             ],
             "parameters": {
-                **request_config.sampling_params,
+                **sampling_params,
             },
         }
 
@@ -66,7 +62,7 @@ class SageMakerClient(LLMClient):
         error_msg = ""
         output_throughput = 0
         total_request_time = 0
-        metrics = {}
+        metrics: Dict[str, Any] = {}
 
         start_time = time.monotonic()
         most_recent_received_token_time = time.monotonic()
@@ -75,7 +71,7 @@ class SageMakerClient(LLMClient):
             response = sm_runtime.invoke_endpoint_with_response_stream(
                 EndpointName=model,
                 ContentType="application/json",
-                Body=json.dumps(message),
+                Body=json.dumps(request_body),
                 CustomAttributes="accept_eula=true",
             )
 
@@ -102,7 +98,6 @@ class SageMakerClient(LLMClient):
 
         metrics[common_metrics.ERROR_MSG] = error_msg
         metrics[common_metrics.ERROR_CODE] = error_response_code
-        metrics[common_metrics.INTER_TOKEN_LAT] = time_to_next_token
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
         metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = output_throughput

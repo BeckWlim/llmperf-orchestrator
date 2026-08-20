@@ -2,7 +2,11 @@ from datetime import datetime, timezone
 
 import pytest
 
-from llmperf_backend.models import BenchmarkConfig, TaskDefinitionCreate, dump_model
+from llmperf_backend.models import (
+    CompiledBenchmarkConfig,
+    TaskDefinitionCreate,
+    dump_model,
+)
 from llmperf_backend.task_compiler import (
     TaskCompileContext,
     compile_task_definition,
@@ -17,7 +21,17 @@ def _runner_template():
         "benchmark": {
             "provider": "test",
             "model": "cache-model",
-            "llm_api": "openai",
+            "adapter": "openai",
+            "tokenizer": {
+                "source": "huggingface",
+                "id": "organization/tokenizer",
+                "revision": "a" * 40,
+                "requested_revision": "main",
+                "use_fast": True,
+                "immutable_revision": True,
+                "selection": "explicit",
+                "accuracy": "compatible",
+            },
             "mean_input_tokens": 4096,
             "stddev_input_tokens": 0,
             "mean_output_tokens": 16,
@@ -45,15 +59,28 @@ def _definition():
                     "count": {"dimension": "warmup_count"},
                     "interval_seconds": 3,
                     "invoke": {
-                        "kind": "invoke", "id": "warmup", "role": "warmup", "payload": "replay"
+                        "kind": "invoke",
+                        "id": "warmup",
+                        "role": "warmup",
+                        "payload": "replay",
                     },
                 },
                 {
                     "kind": "parallel",
                     "after_seconds": {"dimension": "quiet_seconds"},
                     "invokes": [
-                        {"kind": "invoke", "id": "probe", "role": "probe", "payload": "replay"},
-                        {"kind": "invoke", "id": "cold", "role": "cold_control", "payload": "cold"},
+                        {
+                            "kind": "invoke",
+                            "id": "probe",
+                            "role": "probe",
+                            "payload": "replay",
+                        },
+                        {
+                            "kind": "invoke",
+                            "id": "cold",
+                            "role": "cold_control",
+                            "payload": "cold",
+                        },
                     ],
                 },
             ],
@@ -81,7 +108,11 @@ def test_graph_compilation():
     assert estimate_task_definition(definition) == {"instances": 2, "nodes": 8}
     repeated = next(item for item in instances if item.dimensions["warmup_count"] == 2)
     assert [node.node_id for node in repeated.nodes] == [
-        "prime", "warmups:1", "warmups:2", "probe", "cold"
+        "prime",
+        "warmups:1",
+        "warmups:2",
+        "probe",
+        "cold",
     ]
     assert repeated.nodes[1].dependencies == [repeated.nodes[0].dispatch_id]
     assert repeated.nodes[2].dependencies == [repeated.nodes[1].dispatch_id]
@@ -91,7 +122,7 @@ def test_graph_compilation():
     )
     assert all(node.after_seconds == 60 for node in repeated.nodes[3:])
     assert all(
-        BenchmarkConfig.model_validate(node.runner_template["benchmark"])
+        CompiledBenchmarkConfig.model_validate(node.runner_template["benchmark"])
         for node in repeated.nodes
     )
 
@@ -109,16 +140,53 @@ def test_payload_replay():
     )
     repeated = next(item for item in instances if item.dimensions["warmup_count"] == 2)
     seeds = {
-        node.payload_id: node.runner_template["benchmark"]["task_request"]["payload_seed"]
+        node.payload_id: node.runner_template["benchmark"]["task_context"][
+            "payload_seed"
+        ]
         for node in repeated.nodes
     }
     replay_seeds = {
-        node.runner_template["benchmark"]["task_request"]["payload_seed"]
+        node.runner_template["benchmark"]["task_context"]["payload_seed"]
         for node in repeated.nodes
         if node.payload_id == "replay"
     }
     assert len(replay_seeds) == 1
     assert seeds["cold"] not in replay_seeds
+
+
+def test_dataset_payload_replay():
+    runner = _runner_template()
+    runner["benchmark"].update(
+        {
+            "dataset": {
+                "id": "organization/sharegpt",
+                "filename": "sharegpt.json",
+                "revision": "a" * 40,
+                "adapter": "sharegpt",
+            },
+            "dataset_prompt_mode": "concatenate",
+        }
+    )
+    instances = compile_task_definition(
+        TaskCompileContext(
+            definition_id="definition-1",
+            definition_name="repeat-dose",
+            definition=_definition(),
+            runner_template=runner,
+            database_now=datetime(2026, 8, 18, tzinfo=timezone.utc),
+            created_by="test",
+        )
+    )
+    nodes = instances[0].nodes
+    replay = [node for node in nodes if node.payload_id == "replay"]
+
+    assert {node.runner_template["benchmark"]["dataset_seed"] for node in replay} == {
+        replay[0].runner_template["benchmark"]["task_context"]["payload_seed"]
+    }
+    assert all(
+        node.runner_template["benchmark"]["dataset_prompt_mode"] == "concatenate"
+        for node in nodes
+    )
 
 
 def test_task_span():

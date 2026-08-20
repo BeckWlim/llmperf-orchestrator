@@ -1,4 +1,6 @@
 # Minimal end-to-end request for the configured Aliyun Provider.
+version: "1.0.0"
+
 label: example-smoke
 
 metadata:

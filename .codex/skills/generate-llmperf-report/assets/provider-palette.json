@@ -1,0 +1,16 @@
+{
+  "assignment": {
+    "method": "sorted_identity_round_robin",
+    "identity": "normalized_provider"
+  },
+  "series": [
+    {"id": "series-1", "color": "#0072B2", "marker": "circle", "dash": "solid"},
+    {"id": "series-2", "color": "#E69F00", "marker": "square", "dash": "8 3"},
+    {"id": "series-3", "color": "#009E73", "marker": "diamond", "dash": "solid"},
+    {"id": "series-4", "color": "#CC79A7", "marker": "triangle", "dash": "3 2"},
+    {"id": "series-5", "color": "#D55E00", "marker": "cross", "dash": "10 3"},
+    {"id": "series-6", "color": "#6F4E7C", "marker": "plus", "dash": "5 3"},
+    {"id": "series-7", "color": "#56B4E9", "marker": "triangle-down", "dash": "2 2"},
+    {"id": "series-8", "color": "#8A7D00", "marker": "hexagon", "dash": "12 3 2 3"}
+  ]
+}

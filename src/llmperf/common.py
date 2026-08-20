@@ -1,6 +1,9 @@
 from functools import lru_cache
 import os
-from typing import Any, List, Type
+from typing import TYPE_CHECKING, List, Protocol, Type, TypeVar
+
+if TYPE_CHECKING:
+    from ray.actor import ActorProxy
 
 from llmperf.ray_clients.openai_chat_completions_client import (
     OpenAIChatCompletionsClient,
@@ -8,9 +11,17 @@ from llmperf.ray_clients.openai_chat_completions_client import (
 from llmperf.ray_clients.vertexai_client import VertexAIClient
 from llmperf.ray_llm_client import LLMClient
 
-
-SUPPORTED_APIS = ["openai", "anthropic", "litellm"]
+SUPPORTED_APIS = ["openai", "anthropic", "litellm", "sagemaker", "vertexai"]
+LITELLM_APIS = {"anthropic", "litellm"}
 RAY_ACTOR_CPUS_ENV = "LLMPERF_WORKER_RAY_ACTOR_CPUS"
+
+ClientT = TypeVar("ClientT")
+
+
+class _RemoteActorClass(Protocol[ClientT]):
+    """Public capability used from a configured Ray actor class."""
+
+    def remote(self) -> "ActorProxy[ClientT]": ...
 
 
 def _client_class(llm_api: str) -> Type[LLMClient]:
@@ -29,7 +40,7 @@ def _client_class(llm_api: str) -> Type[LLMClient]:
         return SageMakerClient
     if llm_api == "vertexai":
         return VertexAIClient
-    if llm_api in SUPPORTED_APIS:
+    if llm_api in LITELLM_APIS:
         try:
             __import__("litellm")
         except ModuleNotFoundError as exc:
@@ -46,10 +57,11 @@ def _client_class(llm_api: str) -> Type[LLMClient]:
 
 
 @lru_cache(maxsize=None)
-def _ray_client_class(llm_api: str, num_cpus: float) -> Any:
+def _ray_client_class(llm_api: str, num_cpus: float) -> _RemoteActorClass[LLMClient]:
     import ray
 
-    return ray.remote(
+    remote_class = ray.remote(_client_class(llm_api))
+    return remote_class.options(
         num_cpus=num_cpus,
         # A client actor is the atomic request-execution unit seen by the
         # Scheduler. Keep method execution serial even if Ray's defaults or
@@ -57,10 +69,10 @@ def _ray_client_class(llm_api: str, num_cpus: float) -> Any:
         max_concurrency=1,
         max_restarts=0,
         max_task_retries=0,
-    )(_client_class(llm_api))
+    )
 
 
-def construct_clients(llm_api: str, num_clients: int) -> List[LLMClient]:
+def construct_clients(llm_api: str, num_clients: int) -> "List[ActorProxy[LLMClient]]":
     """Construct LLMClients that will be used to make requests to the LLM API.
 
     Args:

@@ -1,3 +1,5 @@
+version: "1.0.0"
+
 campaign:
   name: example-runner-plan
   description: Materialize two small Runners one second apart.

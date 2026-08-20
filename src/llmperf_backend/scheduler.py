@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import socket
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 from uuid import uuid4
 
 from llmperf.utils import TOKENIZER_FAST, TOKENIZER_PATH
@@ -18,11 +18,10 @@ from llmperf_backend.persistence import (
     FAILED,
     SUCCEEDED,
     TERMINAL_STATUSES,
-    RunnerRepository,
 )
 from llmperf_backend.providers import ProviderRegistry
-from llmperf_backend.tokenizers import TokenizerCache
-from llmperf_backend.datasets import DatasetCache, WORKER_DATASET_PATH
+from llmperf_backend.tokenizers import TokenizerCache, TokenizerResolver
+from llmperf_backend.datasets import DatasetCache, DatasetResolver, WORKER_DATASET_PATH
 from llmperf_backend.safety import RuntimePerformanceGuard
 from llmperf_backend.worker import (
     Worker,
@@ -31,10 +30,45 @@ from llmperf_backend.worker import (
 )
 from llmperf.common import RAY_ACTOR_CPUS_ENV
 
-
 WORKER_DATABASE_URL = "LLMPERF_WORKER_DB"
 WORKER_RAY_ACTOR_CPUS = RAY_ACTOR_CPUS_ENV
 LOGGER = logging.getLogger(__name__)
+
+
+class SchedulerRepository(Protocol):
+    """Persistence operations required by Scheduler."""
+
+    async def requeue_stale(self, stale_after_seconds: int) -> int: ...
+
+    async def claim_next(self, scheduler_id: str) -> Optional[Dict[str, Any]]: ...
+
+    async def heartbeat(self, runner_id: str) -> bool: ...
+
+    async def complete_runner(
+        self,
+        runner_id: str,
+        summary: Dict[str, Any],
+        request_metrics: Sequence[Dict[str, Any]],
+        exit_code: int,
+        stdout: str,
+        stderr: str,
+        terminal_status: str = SUCCEEDED,
+        error_message: Optional[str] = None,
+    ) -> bool: ...
+
+    async def finish_runner(
+        self,
+        runner_id: str,
+        status: str,
+        message: str,
+        exit_code: Optional[int],
+        stdout: str,
+        stderr: str,
+    ) -> bool: ...
+
+    async def get_runner(self, runner_id: str) -> Optional[Dict[str, Any]]: ...
+
+    async def requeue_runner(self, runner_id: str, message: str) -> None: ...
 
 
 class Scheduler:
@@ -42,12 +76,12 @@ class Scheduler:
 
     def __init__(
         self,
-        repository: RunnerRepository,
+        repository: SchedulerRepository,
         config: SchedulerConfig,
         database_config: DatabaseConfig,
         provider_registry: ProviderRegistry,
-        tokenizer_cache: Optional[TokenizerCache] = None,
-        dataset_cache: Optional[DatasetCache] = None,
+        tokenizer_cache: Optional[TokenizerResolver] = None,
+        dataset_cache: Optional[DatasetResolver] = None,
         performance_guard_config: Optional[PerformanceGuardConfig] = None,
     ):
         self.repository = repository
@@ -129,7 +163,6 @@ class Scheduler:
             "max_concurrent_runners": self.config.max_concurrent_runners,
             "live_slots": sum(not slot.done() for slot in self._slots),
             "busy_slots": busy_slots,
-            "worker_module": self.config.worker_module,
             "worker_kind": "ray_task",
             "active_workers": len(self._active_workers),
             "ray_mode": self._ray_mode,
@@ -153,9 +186,7 @@ class Scheduler:
                 {
                     "include_dashboard": False,
                     "num_cpus": self.config.ray_num_cpus,
-                    "object_store_memory": (
-                        self.config.ray_object_store_memory_bytes
-                    ),
+                    "object_store_memory": (self.config.ray_object_store_memory_bytes),
                 }
             )
         self._ray_module = ray
@@ -220,9 +251,7 @@ class Scheduler:
             # node detail is best-effort to keep external runtimes compatible.
             try:
                 nodes = ray.nodes()
-                result["alive_nodes"] = sum(
-                    bool(node.get("Alive")) for node in nodes
-                )
+                result["alive_nodes"] = sum(bool(node.get("Alive")) for node in nodes)
             except Exception:
                 result["alive_nodes"] = None
             return result
@@ -235,9 +264,7 @@ class Scheduler:
             self._ray_healthy = (
                 float(self._ray_status["cluster_resources"].get("CPU", 0)) > 0
             )
-            object_store_ratio = self._ray_status.get(
-                "object_store_available_ratio"
-            )
+            object_store_ratio = self._ray_status.get("object_store_available_ratio")
             if isinstance(object_store_ratio, (int, float)):
                 guard_config = self.performance_guard.config
                 if self._ray_object_store_tripped:
@@ -520,7 +547,9 @@ class Scheduler:
                         stdout,
                         stderr,
                     )
-            LOGGER.info("Ray Worker completed Runner %s: %s", runner_id, terminal_status)
+            LOGGER.info(
+                "Ray Worker completed Runner %s: %s", runner_id, terminal_status
+            )
         except asyncio.CancelledError:
             if worker is not None:
                 worker.cancel(force=True)

@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Protocol, Tuple
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -17,8 +17,6 @@ from fastapi import HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from llmperf_backend.models import AuthConfig
-from llmperf_backend.persistence import RunnerRepository
-
 
 BEARER = HTTPBearer(auto_error=False)
 LOGGER = logging.getLogger(__name__)
@@ -29,6 +27,14 @@ class KeyMaterial:
     pem: bytes
     key_id: str
     file_signature: Tuple[int, int, int]
+
+
+class TrustedClientRepository(Protocol):
+    """Persistence capability needed by authentication."""
+
+    async def get_trusted_client_by_key_id(
+        self, key_id: str
+    ) -> Optional[Dict[str, Any]]: ...
 
 
 def _key_id(public_key: rsa.RSAPublicKey) -> str:
@@ -76,7 +82,7 @@ def normalize_public_key(public_key_text: str) -> Tuple[str, str]:
 class TokenVerifier:
     """Verify JWTs and atomically reload a rotating PEM/OpenSSH public key."""
 
-    def __init__(self, config: AuthConfig, repository: RunnerRepository):
+    def __init__(self, config: AuthConfig, repository: TrustedClientRepository):
         self.config = config
         self.repository = repository
         self._lock = threading.RLock()

@@ -6,7 +6,6 @@ from typing import Any, Dict, Mapping, Optional
 
 from llmperf import common_metrics
 
-
 RAW_USAGE_LIMIT = 16_384
 
 

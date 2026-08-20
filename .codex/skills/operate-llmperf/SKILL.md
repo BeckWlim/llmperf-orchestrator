@@ -111,6 +111,10 @@ Select the durable shape:
   `warmup_count × quiet_seconds` matrix. Role strings are analysis tags only.
 - Use the same payload ID for exact Prime/Warm/Probe replay and a different payload
   namespace for controls. Random sampling must be deterministic and hash-verified.
+- Treat the bundled sonnet file and downloaded ShareGPT artifacts as adapters to the same
+  prompt-dataset pipeline. Sonnet remains the zero-dependency fallback; for large or long-
+  context workloads, prefer a revision-pinned ShareGPT dataset. Use `sample` for intact
+  first turns and `concatenate` for seeded, no-replacement assembly to a token budget.
 
 ## Follow the end-to-end workflow
 
@@ -129,7 +133,7 @@ Select the durable shape:
    dataset artifacts before it accepts the complete workload.
 7. Run only when requested or clearly included in the task. Use `-w` for observation, retain
    the durable ID, and inspect the final `status` and `outcome`; CLI exit alone is not proof.
-8. On failure, inspect `runner status --summary` and dedicated `runner logs` from the first
+8. On failure, inspect `runner status` and dedicated `runner logs` from the first
    failed Runner before changing the workload.
 9. For implementation work, make the smallest coherent cross-layer change:
    model, persistence, API, CLI, docs, and focused tests as applicable.
@@ -161,7 +165,7 @@ Select the durable shape:
 
 ## Diagnose from the first concrete failure
 
-- Inspect `runner status --summary`, then `runner logs` for Worker/Ray exceptions.
+- Inspect `runner status`, then `runner logs` for Worker/Ray exceptions.
 - Treat HTTP status nested through the Backend as the provider response, not
   necessarily as a Backend authentication failure.
 - Treat `/models` discovery as catalog visibility only; prove inference support
@@ -182,7 +186,7 @@ Select the durable shape:
 ## Preserve the input-output boundary
 
 Apply the decode -> validate -> resolve -> persist input pipeline and the authoritative
-record -> command compatibility adapter -> whitelist projector -> render/export output
+record -> command response validator -> whitelist projector -> render/export output
 pipeline in [references/io.md](references/io.md). Register every CLI request explicitly;
 never use an identity adapter, a generic raw fallback, or let a renderer accept dict/list
 responses. Keep default views stable and filtered, make `--full` a larger whitelist rather

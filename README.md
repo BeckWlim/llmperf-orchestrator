@@ -78,7 +78,7 @@ and persisted before results are exported as JSON or professional HTML reports.
 
 ### 1. Install
 
-Requirements: Python 3.9 or newer and PostgreSQL.
+Requirements: Python 3.10 or newer and PostgreSQL.
 
 ```bash
 git clone git@github.com:BeckWlim/llmperf-orchestrator.git
@@ -110,8 +110,8 @@ createdb llmperf
 psql -v ON_ERROR_STOP=1 -d llmperf -f sql/postgresql/init.sql
 ```
 
-The task-graph schema is a compatibility break: existing `benchmark_protocol_*`
-tables are not migrated. Recreate the schema when upgrading from that design.
+Version 1.0.0 is the first supported schema. Initialize it from
+`sql/postgresql/init.sql`; pre-release database layouts are not accepted or migrated.
 
 ### 2. Configure a Provider and start the Backend
 
@@ -243,6 +243,7 @@ only when request-level distributions or outliers are needed.
 | [`examples/example-cache-retention.yaml`](examples/example-cache-retention.yaml) | Delay matrix with deterministic Prime/Warm replay and cold controls |
 | [`examples/example-cache-residency.yaml`](examples/example-cache-residency.yaml) | Fixed-interval repeated payload observations |
 | [`examples/example-cache-promotion.yaml`](examples/example-cache-promotion.yaml) | Repeated-hit count × quiet-window task matrix |
+| [`examples/example-sharegpt-long.yaml`](examples/example-sharegpt-long.yaml) | Immutable ShareGPT-backed 64K replay and cold control |
 
 Workload YAML selects stable Provider and model IDs only. Provider URLs, keys,
 artifact caches, and service settings belong to the Backend configuration.
@@ -254,6 +255,18 @@ the task seed, matrix coordinates, trial index, and payload namespace; runtime
 `prompt_hash` validation proves Prime/Warm replay identity. Planner sees only generic
 dependencies and due times and never branches on role or experiment names.
 
+Large-context workloads can use Backend-resolved Hugging Face artifacts instead of
+expanding the small bundled sonnet corpus. Artifact location and record schema are separate:
+`source: huggingface` resolves the immutable file, while the required `adapter` selects a
+prompt-record decoder. `sharegpt` extracts `conversations[0].value`; `text` treats each
+non-empty line as one prompt. The bundled sonnet is another explicit adapter, not an
+implicit ShareGPT fallback. All adapters feed the same indexed-record loading, seeded
+construction, and evidence pipeline. Set `dataset_prompt_mode: sample` to benchmark intact
+records, or `concatenate` to assemble diverse records to the requested token budget without
+reusing a record until the corpus is exhausted. A new seeded cycle begins only after
+exhaustion. Dataset-backed compiled tasks require an immutable resolved dataset revision and
+persist text-free selection evidence in addition to the prompt hash.
+
 ## Operational essentials
 
 ```bash
@@ -263,7 +276,7 @@ llmperfctl scheduler status
 llmperfctl planner runtime
 
 # Runners
-llmperfctl runner status RUNNER_ID --summary
+llmperfctl runner status RUNNER_ID
 llmperfctl runner logs RUNNER_ID
 llmperfctl runner list --status failed
 

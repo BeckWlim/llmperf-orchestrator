@@ -4,7 +4,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from llmperf_backend.datasets import DatasetCache, DatasetResolutionError
+from llmperf_backend.datasets import (
+    DatasetCache,
+    DatasetResolutionError,
+    is_immutable_dataset_revision,
+)
 
 
 DATASET_SPEC = {
@@ -12,8 +16,15 @@ DATASET_SPEC = {
     "id": "organization/sharegpt",
     "filename": "data/sharegpt.json",
     "revision": "release",
-    "format": "sharegpt",
+    "adapter": "sharegpt",
 }
+
+
+def test_immutable_revision():
+    assert is_immutable_dataset_revision("a" * 40)
+    assert is_immutable_dataset_revision("0123456789abcdef" * 4)
+    assert not is_immutable_dataset_revision("main")
+    assert not is_immutable_dataset_revision("g" * 40)
 
 
 def test_cache(tmp_path, monkeypatch):
@@ -42,14 +53,14 @@ def test_cache(tmp_path, monkeypatch):
         DATASET_SPEC["id"],
         DATASET_SPEC["filename"],
         DATASET_SPEC["revision"],
-        DATASET_SPEC["format"],
+        DATASET_SPEC["adapter"],
     )
     resolved_spec = first.benchmark_spec()
     second = cache._resolve_sync(
         resolved_spec["id"],
         resolved_spec["filename"],
         resolved_spec["revision"],
-        resolved_spec["format"],
+        resolved_spec["adapter"],
     )
 
     assert first.revision == "resolved-commit"
@@ -63,7 +74,6 @@ def test_cache(tmp_path, monkeypatch):
         repo_type="dataset",
         revision="release",
         cache_dir=tmp_path,
-        proxies=None,
     )
 
 
@@ -100,7 +110,7 @@ def test_offline_cache(tmp_path, monkeypatch):
         DATASET_SPEC["id"],
         DATASET_SPEC["filename"],
         DATASET_SPEC["revision"],
-        DATASET_SPEC["format"],
+        DATASET_SPEC["adapter"],
     )
 
     assert result.cached is True
@@ -126,7 +136,7 @@ def test_offline_miss(tmp_path, monkeypatch):
             DATASET_SPEC["id"],
             DATASET_SPEC["filename"],
             DATASET_SPEC["revision"],
-            DATASET_SPEC["format"],
+            DATASET_SPEC["adapter"],
         )
 
     downloader.assert_not_called()
@@ -158,7 +168,7 @@ def test_offline_fallback(tmp_path, monkeypatch):
         DATASET_SPEC["id"],
         DATASET_SPEC["filename"],
         DATASET_SPEC["revision"],
-        DATASET_SPEC["format"],
+        DATASET_SPEC["adapter"],
     )
 
     assert result.cached is True
@@ -194,13 +204,11 @@ def test_shared_huggingface_proxy(tmp_path, monkeypatch):
         DATASET_SPEC["id"],
         DATASET_SPEC["filename"],
         DATASET_SPEC["revision"],
-        DATASET_SPEC["format"],
+        DATASET_SPEC["adapter"],
     )
 
-    assert loader.call_args.kwargs["proxies"] == {
-        "http": "http://proxy.internal:3128",
-        "https": "http://proxy.internal:3128",
-    }
+    assert cache.proxy_url == "http://proxy.internal:3128"
+    assert "proxies" not in loader.call_args.kwargs
 
 
 def test_shared_proxy_env(tmp_path, monkeypatch):

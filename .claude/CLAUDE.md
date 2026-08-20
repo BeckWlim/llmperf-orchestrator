@@ -19,7 +19,7 @@ database models.
 - `src/llmperf_cli`: lightweight remote client. It may use the standard library
   and PyYAML, but must not import `llmperf_backend`, FastAPI, SQLAlchemy, Ray, or
   benchmark implementation modules.
-- `token_benchmark_ray.py`: legacy/manual benchmark entry and reusable metric
+- `token_benchmark_ray.py`: standalone benchmark entry and reusable metric
   calculation function. Backend Runners call the calculation function through
   `llmperf_backend.worker`; they do not use its file-output path.
 
@@ -106,8 +106,7 @@ authentication must continue to work with empty `users` and
 ## Validation commands
 
 ```bash
-python -m pip install -e .
-python -m pip install -r requirements-dev.txt
+python -m pip install -e '.[dev]'
 python -m pytest -q
 python -m py_compile src/llmperf_backend/*.py src/llmperf_cli/*.py
 python -m llmperf_cli --help

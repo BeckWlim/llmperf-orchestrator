@@ -32,10 +32,10 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, aliased, mapped_column
 
+from llmperf.version import PROTOCOL_VERSION, TASK_FORMAT_VERSION
 from llmperf_backend.models import DatabaseConfig
 from llmperf_backend.planner import as_utc, next_fire_details
 from llmperf_backend.task_compiler import TaskCompileContext, compile_task_definition
-
 
 QUEUED = "queued"
 RUNNING = "running"
@@ -135,7 +135,9 @@ class BenchmarkRunnerPlanRecord(Base):
     runner_template: Mapped[Dict[str, Any]] = mapped_column(
         JSON_DOCUMENT, nullable=False
     )
-    template_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    template_version: Mapped[str] = mapped_column(
+        String(16), default=PROTOCOL_VERSION, nullable=False
+    )
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     max_occurrences: Mapped[Optional[int]] = mapped_column(Integer)
@@ -169,7 +171,7 @@ class BenchmarkTaskDefinitionRecord(Base):
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
-    compiler: Mapped[str] = mapped_column(String(40), nullable=False)
+    format_version: Mapped[str] = mapped_column(String(16), nullable=False)
     config: Mapped[Dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
     runner_template: Mapped[Dict[str, Any]] = mapped_column(
         JSON_DOCUMENT, nullable=False
@@ -183,14 +185,12 @@ class BenchmarkTaskDefinitionRecord(Base):
 class BenchmarkTaskInstanceRecord(Base):
     __tablename__ = "benchmark_task_instances"
     __table_args__ = (
-        UniqueConstraint(
-            "definition_id", "instance_key", name="uq_task_instance_key"
-        ),
+        UniqueConstraint("definition_id", "instance_key", name="uq_task_instance_key"),
         CheckConstraint(
             "state IN ('planned', 'active', 'completed', 'failed', 'cancelled')",
             name="ck_task_instance_state",
         ),
-        Index("ix_task_instance_campaign", "campaign_id", "compiler", "state"),
+        Index("ix_task_instance_campaign", "campaign_id", "format_version", "state"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -204,7 +204,7 @@ class BenchmarkTaskInstanceRecord(Base):
         ForeignKey("benchmark_campaigns.id", ondelete="CASCADE"),
         nullable=False,
     )
-    compiler: Mapped[str] = mapped_column(String(40), nullable=False)
+    format_version: Mapped[str] = mapped_column(String(16), nullable=False)
     instance_key: Mapped[str] = mapped_column(String(512), nullable=False)
     state: Mapped[str] = mapped_column(String(20), default="planned", nullable=False)
     spec: Mapped[Dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
@@ -238,10 +238,6 @@ class BenchmarkRunnerDispatchRecord(Base):
             name="ck_runner_dispatch_state",
         ),
         CheckConstraint(
-            "parent_dispatch_id IS NULL OR parent_dispatch_id <> id",
-            name="ck_runner_dispatch_not_self_parent",
-        ),
-        CheckConstraint(
             "(runner_plan_id IS NOT NULL AND task_instance_id IS NULL AND "
             "dispatch_key IS NOT NULL AND node_id IS NULL) OR "
             "(runner_plan_id IS NULL AND task_instance_id IS NOT NULL AND "
@@ -254,7 +250,6 @@ class BenchmarkRunnerDispatchRecord(Base):
             postgresql_where=text("state = 'pending'"),
         ),
         Index("ix_runner_dispatch_campaign", "campaign_id", "created_at"),
-        Index("ix_runner_dispatch_parent", "parent_dispatch_id"),
         Index("ix_runner_dispatch_task", "task_instance_id", "node_id"),
     )
 
@@ -275,10 +270,6 @@ class BenchmarkRunnerDispatchRecord(Base):
     node_id: Mapped[Optional[str]] = mapped_column(String(80))
     due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     state: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
-    parent_dispatch_id: Mapped[Optional[str]] = mapped_column(
-        String(36),
-        ForeignKey("benchmark_runner_dispatches.id", ondelete="SET NULL"),
-    )
     runner_template: Mapped[Dict[str, Any]] = mapped_column(
         JSON_DOCUMENT, nullable=False
     )
@@ -324,7 +315,7 @@ class BenchmarkRunnerRecord(Base):
     )
     plan_occurrence: Mapped[Optional[int]] = mapped_column(Integer)
     scheduled_for: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    plan_template_version: Mapped[Optional[int]] = mapped_column(Integer)
+    plan_template_version: Mapped[Optional[str]] = mapped_column(String(16))
     label: Mapped[Optional[str]] = mapped_column(String(200))
     created_by: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -620,7 +611,7 @@ def _task_definition_dict(
         "task_definition_id": definition.id,
         "campaign_id": definition.campaign_id,
         "name": definition.name,
-        "compiler": definition.compiler,
+        "format_version": definition.format_version,
         "definition": definition.config,
         "runner": definition.runner_template,
         "created_by": definition.created_by,
@@ -635,7 +626,7 @@ def _task_instance_dict(
         "task_instance_id": instance.id,
         "task_definition_id": instance.definition_id,
         "campaign_id": instance.campaign_id,
-        "compiler": instance.compiler,
+        "format_version": instance.format_version,
         "instance_key": instance.instance_key,
         "state": instance.state,
         "spec": instance.spec,
@@ -657,7 +648,6 @@ def _dispatch_dict(dispatch: BenchmarkRunnerDispatchRecord) -> Dict[str, Any]:
         "node_id": dispatch.node_id,
         "due_at": dispatch.due_at,
         "state": dispatch.state,
-        "parent_dispatch_id": dispatch.parent_dispatch_id,
         "lineage": dispatch.lineage,
         "runner_id": dispatch.runner_id,
         "created_at": dispatch.created_at,
@@ -770,7 +760,6 @@ class RunnerRepository:
         runner_template: Dict[str, Any],
         lineage: Optional[Dict[str, Any]] = None,
         state: str = "pending",
-        parent_dispatch_id: Optional[str] = None,
         runner_plan_id: Optional[str] = None,
         dispatch_key: Optional[str] = None,
         task_instance_id: Optional[str] = None,
@@ -783,7 +772,6 @@ class RunnerRepository:
             dispatch_key=dispatch_key,
             due_at=as_utc(due_at) if due_at is not None else None,
             state=state,
-            parent_dispatch_id=parent_dispatch_id,
             task_instance_id=task_instance_id,
             node_id=node_id,
             runner_template=json_safe(runner_template),
@@ -931,7 +919,7 @@ class RunnerRepository:
                     id=str(uuid4()),
                     campaign_id=campaign.id,
                     name=definition_payload["name"],
-                    compiler="task-graph/v1",
+                    format_version=TASK_FORMAT_VERSION,
                     config=json_safe(definition_payload),
                     runner_template=json_safe(submitted["runner_template"]),
                     created_by=created_by,
@@ -954,7 +942,7 @@ class RunnerRepository:
                             id=blueprint.instance_id,
                             definition_id=definition.id,
                             campaign_id=campaign.id,
-                            compiler=definition.compiler,
+                            format_version=definition.format_version,
                             instance_key=blueprint.instance_key,
                             state="planned",
                             spec=json_safe(
@@ -970,26 +958,23 @@ class RunnerRepository:
                     for node in blueprint.nodes:
                         dispatch_records.append(
                             BenchmarkRunnerDispatchRecord(
-                            id=node.dispatch_id,
-                            campaign_id=campaign.id,
-                            due_at=database_now if not node.dependencies else None,
-                            state="pending" if not node.dependencies else "blocked",
-                            parent_dispatch_id=(
-                                node.dependencies[0] if node.dependencies else None
-                            ),
-                            task_instance_id=blueprint.instance_id,
-                            node_id=node.node_id,
-                            runner_template=json_safe(node.runner_template),
-                            lineage=json_safe(
-                                {
-                                    "created_by": created_by,
-                                    "dependencies": node.dependencies,
-                                    "after_seconds": node.after_seconds,
-                                    "role": node.role,
-                                    "payload_id": node.payload_id,
-                                }
-                            ),
-                        )
+                                id=node.dispatch_id,
+                                campaign_id=campaign.id,
+                                due_at=database_now if not node.dependencies else None,
+                                state="pending" if not node.dependencies else "blocked",
+                                task_instance_id=blueprint.instance_id,
+                                node_id=node.node_id,
+                                runner_template=json_safe(node.runner_template),
+                                lineage=json_safe(
+                                    {
+                                        "created_by": created_by,
+                                        "dependencies": node.dependencies,
+                                        "after_seconds": node.after_seconds,
+                                        "role": node.role,
+                                        "payload_id": node.payload_id,
+                                    }
+                                ),
+                            )
                         )
                 definition_records.append(definition)
             session.add_all(records)
@@ -1017,8 +1002,7 @@ class RunnerRepository:
             "items": [_runner_dict(runner) for runner in records],
             "runner_plans": [_runner_plan_dict(plan) for plan in plans],
             "task_definitions": [
-                _task_definition_dict(definition)
-                for definition in definition_records
+                _task_definition_dict(definition) for definition in definition_records
             ],
         }
 
@@ -1253,7 +1237,10 @@ class RunnerRepository:
         database_now: datetime,
         planner_id: Optional[str],
     ) -> int:
-        planned_for = as_utc(plan.next_fire_at)
+        next_fire_at = plan.next_fire_at
+        if next_fire_at is None:
+            raise RuntimeError(f"active RunnerPlan {plan.id} has no next_fire_at")
+        planned_for = as_utc(next_fire_at)
         grace_boundary = database_now - timedelta(seconds=plan.misfire_grace_seconds)
         skipped_start = plan.occurrence_cursor
         while planned_for < grace_boundary:
@@ -1484,9 +1471,7 @@ class RunnerRepository:
                         BenchmarkTaskInstanceRecord.state,
                         func.count(),
                     )
-                    .where(
-                        BenchmarkTaskInstanceRecord.campaign_id.in_(campaign_ids)
-                    )
+                    .where(BenchmarkTaskInstanceRecord.campaign_id.in_(campaign_ids))
                     .group_by(
                         BenchmarkTaskInstanceRecord.campaign_id,
                         BenchmarkTaskInstanceRecord.state,
@@ -1495,9 +1480,7 @@ class RunnerRepository:
                 for campaign_id, task_state, count in await session.execute(
                     task_statement
                 ):
-                    task_statuses[str(campaign_id)][str(task_state)] = int(
-                        count
-                    )
+                    task_statuses[str(campaign_id)][str(task_state)] = int(count)
                 dispatch_statement = (
                     select(
                         BenchmarkRunnerDispatchRecord.campaign_id,
@@ -1732,9 +1715,7 @@ class RunnerRepository:
                 .where(BenchmarkTaskInstanceRecord.campaign_id == campaign_id)
                 .with_for_update()
             )
-            instances = list(
-                (await session.execute(task_statement)).scalars().all()
-            )
+            instances = list((await session.execute(task_statement)).scalars().all())
             dispatch_statement = (
                 select(BenchmarkRunnerDispatchRecord)
                 .where(BenchmarkRunnerDispatchRecord.campaign_id == campaign_id)
@@ -1830,8 +1811,7 @@ class RunnerRepository:
                 select(func.count(running_runner.id))
                 .where(
                     running_runner.status == RUNNING,
-                    running_runner.campaign_id
-                    == BenchmarkRunnerRecord.campaign_id,
+                    running_runner.campaign_id == BenchmarkRunnerRecord.campaign_id,
                 )
                 .correlate(BenchmarkRunnerRecord)
                 .scalar_subquery()
@@ -1906,9 +1886,10 @@ class RunnerRepository:
             runner.cancel_requested = True
             if runner.status == QUEUED:
                 runner.status = CANCELLED
-                runner.finished_at = utcnow()
+                finished_at = utcnow()
+                runner.finished_at = finished_at
                 await self._advance_task_instance(
-                    session, runner, CANCELLED, runner.finished_at
+                    session, runner, CANCELLED, finished_at
                 )
                 session.add(
                     self._event(runner.id, CANCELLED, "Cancelled before execution")
@@ -1927,16 +1908,21 @@ class RunnerRepository:
         request_started_at: Optional[datetime] = None,
         request_completed_at: Optional[datetime] = None,
         request_prompt_hash: Optional[str] = None,
+        request_payload_evidence: Optional[Mapping[str, Any]] = None,
     ) -> None:
         """Advance a compiled invoke DAG without task-specific runtime branches."""
 
-        context = (runner.user_metadata or {}).get("task")
+        context = (runner.benchmark_config or {}).get("task_context")
         if not isinstance(context, Mapping):
             return
         instance_id = context.get("instance_id")
         node_id = context.get("node_id")
         payload_id = context.get("payload_id")
-        if not all(isinstance(value, str) for value in (instance_id, node_id, payload_id)):
+        if not isinstance(instance_id, str):
+            return
+        if not isinstance(node_id, str):
+            return
+        if not isinstance(payload_id, str):
             return
 
         instance = (
@@ -1975,6 +1961,11 @@ class RunnerRepository:
             "started_at": started_at.isoformat(),
             "completed_at": completed_at.isoformat(),
             "prompt_hash": request_prompt_hash,
+            "payload_evidence": (
+                dict(request_payload_evidence)
+                if request_payload_evidence is not None
+                else None
+            ),
             "status": terminal_status,
         }
         outcome["nodes"] = nodes
@@ -2004,6 +1995,21 @@ class RunnerRepository:
             return
         payload_hashes[payload_id] = request_prompt_hash
         checkpoint["payload_hashes"] = payload_hashes
+        payload_evidence = dict(checkpoint.get("payload_evidence") or {})
+        expected_evidence = payload_evidence.get(payload_id)
+        current_evidence = (
+            dict(request_payload_evidence)
+            if request_payload_evidence is not None
+            else None
+        )
+        if expected_evidence is not None and expected_evidence != current_evidence:
+            instance.state = "failed"
+            instance.error = f"payload {payload_id} replay changed selection evidence"
+            await self._cancel_task_dispatches(session, instance_id)
+            return
+        if current_evidence is not None:
+            payload_evidence[payload_id] = current_evidence
+            checkpoint["payload_evidence"] = payload_evidence
         instance.checkpoint = json_safe(checkpoint)
 
         rows = list(
@@ -2012,7 +2018,8 @@ class RunnerRepository:
                     select(BenchmarkRunnerDispatchRecord, BenchmarkRunnerRecord)
                     .outerjoin(
                         BenchmarkRunnerRecord,
-                        BenchmarkRunnerRecord.id == BenchmarkRunnerDispatchRecord.runner_id,
+                        BenchmarkRunnerRecord.id
+                        == BenchmarkRunnerDispatchRecord.runner_id,
                     )
                     .where(
                         BenchmarkRunnerDispatchRecord.task_instance_id == instance_id
@@ -2025,9 +2032,7 @@ class RunnerRepository:
             dispatch.id: (
                 terminal_status
                 if dispatch.id == source.id
-                else runner_record.status
-                if runner_record is not None
-                else None
+                else runner_record.status if runner_record is not None else None
             )
             for dispatch, runner_record in rows
         }
@@ -2050,11 +2055,14 @@ class RunnerRepository:
             if dispatch.state != "blocked":
                 continue
             dependencies = list((dispatch.lineage or {}).get("dependencies") or [])
-            if dependencies and all(statuses.get(item) == SUCCEEDED for item in dependencies):
+            if dependencies and all(
+                statuses.get(item) == SUCCEEDED for item in dependencies
+            ):
                 anchors = [completions.get(item) for item in dependencies]
-                if any(anchor is None for anchor in anchors):
+                resolved_anchors = [anchor for anchor in anchors if anchor is not None]
+                if len(resolved_anchors) != len(anchors):
                     continue
-                dispatch.due_at = max(anchors) + timedelta(
+                dispatch.due_at = max(resolved_anchors) + timedelta(
                     seconds=int((dispatch.lineage or {}).get("after_seconds", 0))
                 )
                 dispatch.state = "pending"
@@ -2063,8 +2071,7 @@ class RunnerRepository:
             "completed"
             if rows
             and all(
-                dispatch.state == "emitted"
-                and statuses.get(dispatch.id) == SUCCEEDED
+                dispatch.state == "emitted" and statuses.get(dispatch.id) == SUCCEEDED
                 for dispatch, _ in rows
             )
             else "active"
@@ -2082,6 +2089,7 @@ class RunnerRepository:
             )
             .values(state="cancelled")
         )
+
     async def complete_runner(
         self,
         runner_id: str,
@@ -2110,7 +2118,8 @@ class RunnerRepository:
             request_started_at = None
             request_completed_at = None
             request_prompt_hash = None
-            context = (runner.user_metadata or {}).get("task")
+            request_payload_evidence = None
+            context = (runner.benchmark_config or {}).get("task_context")
             if isinstance(context, Mapping) and safe_requests:
                 request_starts = []
                 request_completions = []
@@ -2120,6 +2129,11 @@ class RunnerRepository:
                     prompt_hash = request_metadata.get("prompt_hash")
                     if request_prompt_hash is None and isinstance(prompt_hash, str):
                         request_prompt_hash = prompt_hash
+                    payload_evidence = request_metadata.get("payload_evidence")
+                    if request_payload_evidence is None and isinstance(
+                        payload_evidence, Mapping
+                    ):
+                        request_payload_evidence = dict(payload_evidence)
                     for timestamp_name, target in (
                         ("client_start_utc", request_starts),
                         ("completed_utc", request_completions),
@@ -2172,6 +2186,7 @@ class RunnerRepository:
                 request_started_at=request_started_at,
                 request_completed_at=request_completed_at,
                 request_prompt_hash=request_prompt_hash,
+                request_payload_evidence=request_payload_evidence,
             )
             event_message = (
                 "Results persisted"
@@ -2231,8 +2246,9 @@ class RunnerRepository:
                     heartbeat_at=None,
                     started_at=None,
                 )
+                .returning(BenchmarkRunnerRecord.id)
             )
-            if result.rowcount:
+            if result.scalar_one_or_none() is not None:
                 session.add(self._event(runner_id, QUEUED, message))
 
     async def requeue_stale(self, stale_after_seconds: int) -> int:
@@ -2416,9 +2432,7 @@ class RunnerRepository:
                 task_status_counts,
                 dispatch_status_counts,
             )
-            instances = [
-                _task_instance_dict(instance) for instance in instance_records
-            ]
+            instances = [_task_instance_dict(instance) for instance in instance_records]
             dispatches = [_dispatch_dict(dispatch) for dispatch in dispatch_records]
             from llmperf.task_analysis import build_task_analyses
 
@@ -2428,7 +2442,7 @@ class RunnerRepository:
                 {runner.id: _runner_dict(runner) for runner in runner_records},
             )
             return {
-                "version": 6,
+                "version": PROTOCOL_VERSION,
                 "campaign": campaign,
                 "aggregate": {
                     **runtime,

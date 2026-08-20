@@ -9,6 +9,12 @@ import time
 from llmperf import token_benchmark_ray as benchmark_module
 from llmperf import common_metrics
 from llmperf.models import RequestConfig
+from llmperf.prompt_datasets import (
+    PromptDatasetSource,
+    concatenate_prompt_requests,
+    load_prompt_dataset,
+    sample_prompt_requests,
+)
 from llmperf.ray_clients.openai_chat_completions_client import (
     OpenAIStreamError,
     SSE_ITER_CHUNK_SIZE,
@@ -19,18 +25,12 @@ from llmperf.ray_clients.openai_chat_completions_client import (
 from llmperf.cache_analysis import analyze_cache_probe, summarize_cache_counters
 from llmperf.cache_probe import DependentPlanQueue, build_cache_probe_plan
 from llmperf.usage import normalize_usage
-from llmperf.token_benchmark_ray import (
-    metrics_summary,
-    normalize_request_metrics,
-    sample_sharegpt_requests,
-)
-
+from llmperf.token_benchmark_ray import metrics_summary, normalize_request_metrics
 
 NORMALIZATION_CASES = [
     pytest.param(
         {
             "metrics": {
-                common_metrics.INTER_TOKEN_LAT: 1.2,
                 common_metrics.E2E_LAT: 2.0,
                 common_metrics.NUM_INPUT_TOKENS: 10,
                 common_metrics.NUM_OUTPUT_TOKENS: 0,
@@ -39,7 +39,6 @@ NORMALIZATION_CASES = [
             "text": "generated",
             "tokens": 4,
             "expected": {
-                common_metrics.INTER_TOKEN_LAT: 0.3,
                 common_metrics.NUM_OUTPUT_TOKENS: 4,
                 common_metrics.NUM_TOTAL_TOKENS: 14,
                 common_metrics.REQ_OUTPUT_THROUGHPUT: 2.0,
@@ -50,7 +49,6 @@ NORMALIZATION_CASES = [
     pytest.param(
         {
             "metrics": {
-                common_metrics.INTER_TOKEN_LAT: 0,
                 common_metrics.E2E_LAT: 0,
                 common_metrics.NUM_INPUT_TOKENS: 10,
                 common_metrics.NUM_OUTPUT_TOKENS: 0,
@@ -59,7 +57,6 @@ NORMALIZATION_CASES = [
             "text": "",
             "tokens": 0,
             "expected": {
-                common_metrics.INTER_TOKEN_LAT: 0,
                 common_metrics.REQ_OUTPUT_THROUGHPUT: 0,
             },
         },
@@ -89,8 +86,8 @@ def test_sharegpt_sampling(tmp_path):
         encoding="utf-8",
     )
 
-    requests = sample_sharegpt_requests(
-        str(dataset_path),
+    requests, _ = sample_prompt_requests(
+        load_prompt_dataset(PromptDatasetSource.external("sharegpt", dataset_path)),
         num_requests=6,
         repeat_count=3,
         min_input_tokens=3,
@@ -120,14 +117,62 @@ def test_sharegpt_capacity(tmp_path):
     )
 
     with pytest.raises(ValueError, match="matching prompts"):
-        sample_sharegpt_requests(
-            str(dataset_path),
+        sample_prompt_requests(
+            load_prompt_dataset(PromptDatasetSource.external("sharegpt", dataset_path)),
             num_requests=2,
             repeat_count=1,
             min_input_tokens=100,
             max_input_tokens=200,
             get_token_length=lambda text: len(text.split()),
         )
+
+
+def test_sharegpt_concatenate(tmp_path):
+    dataset_path = tmp_path / "sharegpt.json"
+    dataset_path.write_text(
+        json.dumps(
+            [
+                {
+                    "conversations": [
+                        {"from": "human", "value": character * 10},
+                        {"from": "gpt", "value": "answer"},
+                    ]
+                }
+                for character in "ABCDE"
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    dataset = load_prompt_dataset(
+        PromptDatasetSource.external("sharegpt", dataset_path)
+    )
+    first = concatenate_prompt_requests(
+        dataset,
+        num_requests=2,
+        mean_input_tokens=24,
+        stddev_input_tokens=0,
+        mean_output_tokens=1,
+        get_token_length=len,
+        seed=7,
+    )
+    second = concatenate_prompt_requests(
+        dataset,
+        num_requests=2,
+        mean_input_tokens=24,
+        stddev_input_tokens=0,
+        mean_output_tokens=1,
+        get_token_length=len,
+        seed=7,
+    )
+
+    assert first == second
+    prompts, evidence = first
+    assert [length for _, length in prompts] == [24, 24]
+    selected = [index for item in evidence for index in item["record_indices"]]
+    assert len(selected[:5]) == len(set(selected[:5]))
+    assert all(item["manifest_hash"].startswith("sha256:") for item in evidence)
+    assert all("AAAA" not in json.dumps(item) for item in evidence)
 
 
 def test_stream():
@@ -219,7 +264,6 @@ def test_deepseek_usage():
 def test_summary():
     request_metrics = [
         {
-            common_metrics.INTER_TOKEN_LAT: 0.1,
             common_metrics.TTFT: 0.2,
             common_metrics.E2E_LAT: 1.0,
             common_metrics.REQ_OUTPUT_THROUGHPUT: 2.0,
@@ -232,23 +276,23 @@ def test_summary():
         for hit, miss in ((0, 100), (75, 25))
     ]
 
-    summary = metrics_summary(request_metrics, 1, 3)
+    summary = metrics_summary(request_metrics, 1.0, 3.0)
 
     cache = summary[common_metrics.KV_CACHE]
     assert cache["measured_requests"] == 2
-    assert cache["hit_tokens"] == 75
-    assert cache["miss_tokens"] == 125
-    assert cache["hit_ratio"] == 0.375
+    assert cache["complete_hit_tokens"] == 75
+    assert cache["complete_miss_tokens"] == 125
+    assert cache["weighted_token_hit_ratio"] == 0.375
     assert cache["counter_coverage"] == 1.0
 
 
 def test_incomplete_counters():
     cache = summarize_cache_counters([{common_metrics.KV_CACHE_HIT_TOKENS: 100}])
 
-    assert cache["hit_tokens"] == 100
-    assert cache["miss_tokens"] is None
-    assert cache["hit_ratio"] is None
-    assert cache["requests_with_complete_cache_counters"] == 0
+    assert cache["complete_hit_tokens"] == 0
+    assert cache["complete_miss_tokens"] == 0
+    assert cache["weighted_token_hit_ratio"] is None
+    assert cache["complete_counter_requests"] == 0
 
 
 def test_invalid_counters():
@@ -266,7 +310,7 @@ def test_invalid_counters():
         normalized.validation_error == "cache hit tokens exceed provider input tokens"
     )
     assert cache["invalid_counter_requests"] == 1
-    assert cache["hit_ratio"] is None
+    assert cache["weighted_token_hit_ratio"] is None
 
 
 @pytest.mark.parametrize("case", NORMALIZATION_CASES)
@@ -280,7 +324,7 @@ def test_normalization(case):
 
 
 def test_empty_summary():
-    summary = metrics_summary([], 1, 2)
+    summary = metrics_summary([], 1.0, 2.0)
 
     assert summary[common_metrics.NUM_REQ_STARTED] == 0
     assert summary[common_metrics.NUM_COMPLETED_REQUESTS] == 0
@@ -306,17 +350,13 @@ def test_thread_error_propagation(monkeypatch):
             raise ValueError("Ray Actor did not receive OPENAI_API_BASE")
 
     monkeypatch.setattr(benchmark_module, "get_tokenizer", FakeTokenizer)
-    monkeypatch.setattr(
-        benchmark_module,
-        "randomly_sample_sonnet_lines_prompt",
-        lambda **kwargs: ("synthetic prompt", 2),
-    )
     monkeypatch.setattr(benchmark_module, "construct_clients", lambda **kwargs: [])
     monkeypatch.setattr(benchmark_module, "RequestsLauncher", FailingLauncher)
 
     with pytest.raises(ValueError, match="OPENAI_API_BASE"):
         benchmark_module.get_token_throughput_latencies(
             model="glm-5.2",
+            prompt_dataset_source=PromptDatasetSource.builtin_sonnet(),
             mean_input_tokens=64,
             stddev_input_tokens=0,
             mean_output_tokens=1,
@@ -376,9 +416,11 @@ def test_prime_warm_release():
     queue = DependentPlanQueue(plan)
 
     prime = queue.claim()
+    assert prime is not None
     assert prime.role == "prime"
     queue.complete(prime, success=True)
     warm = queue.claim()
+    assert warm is not None
     assert warm.role == "warm"
     queue.complete(warm, success=True)
     assert queue.claim() is None
@@ -394,6 +436,7 @@ def test_prime_failure_skip():
     queue = DependentPlanQueue(plan)
 
     prime = queue.claim()
+    assert prime is not None
     queue.complete(prime, success=False)
 
     assert queue.claim() is None
@@ -425,7 +468,9 @@ def test_paired_verdict():
     assert analysis["verdict"] == "confirmed_external"
     assert analysis["paired_samples"] == 3
     assert analysis["paired_ttft_delta_s"]["median"] == pytest.approx(0.8)
-    assert analysis["cache"]["by_role"]["warm"]["hit_ratio"] == pytest.approx(0.8)
+    assert analysis["cache"]["by_role"]["warm"][
+        "weighted_token_hit_ratio"
+    ] == pytest.approx(0.8)
 
 
 def test_client_observability(monkeypatch):
@@ -491,10 +536,6 @@ def test_client_observability(monkeypatch):
     assert len(metrics[common_metrics.INTER_SSE_CHUNK_LAT]) == 1
     assert metrics[common_metrics.TPOT] >= 0
     assert metrics[common_metrics.REQUEST_TIMING]["first_sse_monotonic"] is not None
-    assert (
-        metrics[common_metrics.STREAM_TIMING_SEMANTICS]["legacy_inter_token_latency"]
-        == "deprecated_inter_chunk_average"
-    )
 
 
 def test_client_inactivity(monkeypatch):
@@ -614,10 +655,12 @@ def test_probe_execution_order(monkeypatch):
             launches.append(dict(request_config.metadata))
 
         def get_next_ready(self, block=False):
-            metadata = self.config.metadata
+            request_config = self.config
+            if request_config is None:
+                raise RuntimeError("launch_requests must run before get_next_ready")
+            metadata = request_config.metadata
             warm = metadata["role"] == "warm"
             metrics = {
-                common_metrics.INTER_TOKEN_LAT: 0.1,
                 common_metrics.TTFT: 0.2 if warm else 1.0,
                 common_metrics.E2E_LAT: 1.1,
                 common_metrics.REQ_OUTPUT_THROUGHPUT: 1.0,
@@ -634,14 +677,18 @@ def test_probe_execution_order(monkeypatch):
     monkeypatch.setattr(benchmark_module, "get_tokenizer", FakeMutationTokenizer)
     monkeypatch.setattr(
         benchmark_module,
-        "randomly_sample_sonnet_lines_prompt",
-        lambda **kwargs: (next(prompt_counter), 11),
+        "prepare_prompt_requests",
+        lambda **kwargs: (
+            [(next(prompt_counter), 11) for _ in range(2)],
+            [{"source": "test"}, {"source": "test"}],
+        ),
     )
     monkeypatch.setattr(benchmark_module, "construct_clients", lambda **kwargs: [])
     monkeypatch.setattr(benchmark_module, "RequestsLauncher", FakeLauncher)
 
     summary, requests = benchmark_module.get_token_throughput_latencies(
         model="model",
+        prompt_dataset_source=PromptDatasetSource.builtin_sonnet(),
         mean_input_tokens=64,
         stddev_input_tokens=0,
         mean_output_tokens=1,
@@ -669,6 +716,7 @@ def test_probe_execution_order(monkeypatch):
     for family in {item["family_id"] for item in launches}:
         roles = [item["role"] for item in launches if item["family_id"] == family]
         assert roles == ["prime", "warm"]
+    assert all(item["prompt_evidence"]["source"] == "test" for item in launches)
     assert {
         item[common_metrics.REQUEST_METADATA]["completion_index"] for item in requests
     } == {
@@ -694,7 +742,6 @@ def test_task_payload_replay(monkeypatch):
             if self.config is None:
                 return []
             metrics = {
-                common_metrics.INTER_TOKEN_LAT: 0.1,
                 common_metrics.TTFT: 0.2,
                 common_metrics.E2E_LAT: 0.3,
                 common_metrics.REQ_OUTPUT_THROUGHPUT: 1.0,
@@ -706,19 +753,13 @@ def test_task_payload_replay(monkeypatch):
             }
             return [(metrics, "x", self.config)]
 
-    def generated_prompt(**kwargs):
-        text = f"prompt-{benchmark_module.random.random()}"
-        return text, 64
-
     monkeypatch.setattr(benchmark_module, "get_tokenizer", FakeMutationTokenizer)
-    monkeypatch.setattr(
-        benchmark_module, "randomly_sample_sonnet_lines_prompt", generated_prompt
-    )
     monkeypatch.setattr(benchmark_module, "construct_clients", lambda **kwargs: [])
     monkeypatch.setattr(benchmark_module, "RequestsLauncher", FakeLauncher)
 
     base = {
         "model": "model",
+        "prompt_dataset_source": PromptDatasetSource.builtin_sonnet(),
         "mean_input_tokens": 64,
         "stddev_input_tokens": 0,
         "mean_output_tokens": 1,
@@ -736,14 +777,103 @@ def test_task_payload_replay(monkeypatch):
         "dimensions": {},
     }
     benchmark_module.get_token_throughput_latencies(
-        **base, task_request={**context, "node_id": "prime", "role": "prime"}
+        **base, task_context={**context, "node_id": "prime", "role": "prime"}
     )
     prime_prompt = launched[0].prompt[0]
     launched.clear()
     summary, _ = benchmark_module.get_token_throughput_latencies(
-        **base, task_request={**context, "node_id": "warm", "role": "warm"}
+        **base, task_context={**context, "node_id": "warm", "role": "warm"}
     )
 
     assert launched[0].prompt[0] == prime_prompt
     assert launched[0].metadata["payload_id"] == "replay"
-    assert summary["task_request"]["node_id"] == "warm"
+    assert launched[0].metadata["payload_evidence"]["source"] == "builtin-sonnet"
+    assert summary["task_context"]["node_id"] == "warm"
+
+
+def test_task_dataset_replay(monkeypatch, tmp_path):
+    launched = []
+
+    class FakeLauncher:
+        def __init__(self, clients):
+            self.config = None
+
+        def launch_requests(self, request_config):
+            self.config = request_config
+            launched.append(request_config)
+
+        def get_next_ready(self, block=False):
+            if self.config is None:
+                return []
+            metrics = {
+                common_metrics.TTFT: 0.2,
+                common_metrics.E2E_LAT: 0.3,
+                common_metrics.REQ_OUTPUT_THROUGHPUT: 1.0,
+                common_metrics.NUM_INPUT_TOKENS: 32,
+                common_metrics.NUM_OUTPUT_TOKENS: 1,
+                common_metrics.ERROR_CODE: None,
+                common_metrics.ERROR_MSG: "",
+                common_metrics.REQUEST_METADATA: self.config.metadata,
+            }
+            return [(metrics, "x", self.config)]
+
+    dataset_path = tmp_path / "sharegpt.json"
+    dataset_path.write_text(
+        json.dumps(
+            [
+                {
+                    "conversations": [
+                        {"from": "human", "value": character * 20},
+                        {"from": "gpt", "value": "answer"},
+                    ]
+                }
+                for character in "ABCDE"
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(benchmark_module, "get_tokenizer", FakeMutationTokenizer)
+    monkeypatch.setattr(benchmark_module, "construct_clients", lambda **kwargs: [])
+    monkeypatch.setattr(benchmark_module, "RequestsLauncher", FakeLauncher)
+    base = {
+        "model": "model",
+        "prompt_dataset_source": PromptDatasetSource.external("sharegpt", dataset_path),
+        "mean_input_tokens": 32,
+        "stddev_input_tokens": 0,
+        "mean_output_tokens": 1,
+        "stddev_output_tokens": 0,
+        "num_concurrent_requests": 1,
+        "max_num_completed_requests": 1,
+        "test_timeout_s": 10,
+        "dataset_prompt_mode": "concatenate",
+    }
+    context = {
+        "definition_id": "definition",
+        "instance_id": "instance",
+        "payload_id": "replay",
+        "payload_seed": 22,
+        "trial_index": 0,
+        "dimensions": {},
+    }
+
+    benchmark_module.get_token_throughput_latencies(
+        **base, task_context={**context, "node_id": "prime", "role": "prime"}
+    )
+    prime = launched.pop()
+    summary, _ = benchmark_module.get_token_throughput_latencies(
+        **base, task_context={**context, "node_id": "warm", "role": "warm"}
+    )
+    warm = launched.pop()
+
+    assert warm.prompt == prime.prompt
+    assert warm.metadata["prompt_hash"] == prime.metadata["prompt_hash"]
+    assert warm.metadata["payload_evidence"] == prime.metadata["payload_evidence"]
+    assert warm.metadata["payload_evidence"]["seed"] == 22
+    assert summary["prompt_dataset"] == {
+        "adapter": "sharegpt",
+        "source": "sharegpt",
+        "prompt_mode": "concatenate",
+        "repeat_count": 1,
+        "seed": 22,
+    }
+    assert "dataset_path" not in summary

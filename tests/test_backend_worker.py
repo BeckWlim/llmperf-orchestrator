@@ -9,7 +9,13 @@ from llmperf import common_metrics
 from llmperf.common import RAY_ACTOR_CPUS_ENV, _ray_client_class, construct_clients
 import llmperf_backend.worker as worker_module
 from llmperf_backend.models import BenchmarkConfig, dump_model
-from llmperf_backend.persistence import FAILED, SUCCEEDED, _runner_list_dict, json_safe
+from llmperf_backend.persistence import (
+    FAILED,
+    SUCCEEDED,
+    BenchmarkRunnerRecord,
+    _runner_list_dict,
+    json_safe,
+)
 from llmperf_backend.worker import (
     Worker,
     _calculate,
@@ -17,7 +23,6 @@ from llmperf_backend.worker import (
     runtime_environment,
     summarize_outcome,
 )
-
 
 OUTCOME_CASES = [
     pytest.param(
@@ -108,8 +113,10 @@ def test_shared_ray_options(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "llmperf.token_benchmark_ray", fake_benchmark)
 
+    benchmark = dump_model(BenchmarkConfig(provider="test", model="test"))
+    benchmark["adapter"] = "openai"
     result = _calculate(
-        dump_model(BenchmarkConfig(provider="test", model="test")),
+        benchmark,
         {
             "backend": "ray",
             "worker_kind": "ray_task",
@@ -189,9 +196,7 @@ def test_worker_handle():
     assert worker.ready() is True
     assert worker.result() == {"ok": True}
     assert worker.task_id() == "task-1"
-    assert calls["options"]["runtime_env"]["env_vars"] == {
-        "OPENAI_API_KEY": "key"
-    }
+    assert calls["options"]["runtime_env"]["env_vars"] == {"OPENAI_API_KEY": "key"}
     assert "scheduling_strategy" not in calls["options"]
     worker.close()
     assert worker.task_ref is None
@@ -216,13 +221,18 @@ def test_actor_resource_options(monkeypatch):
     captured = {}
 
     class RemoteClass:
+        @classmethod
+        def options(cls, **options):
+            captured.update(options)
+            return cls
+
         @staticmethod
         def remote():
             return "actor"
 
-    def remote(**options):
-        captured.update(options)
-        return lambda client_class: RemoteClass
+    def remote(client_class):
+        captured["client_class"] = client_class
+        return RemoteClass
 
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(remote=remote))
     monkeypatch.setenv(RAY_ACTOR_CPUS_ENV, "0.5")
@@ -231,6 +241,7 @@ def test_actor_resource_options(monkeypatch):
     clients = construct_clients("openai", 2)
 
     assert clients == ["actor", "actor"]
+    assert captured.pop("client_class").__name__ == "OpenAIChatCompletionsClient"
     assert captured == {
         "num_cpus": 0.5,
         "max_concurrency": 1,
@@ -242,7 +253,7 @@ def test_actor_resource_options(monkeypatch):
 
 def test_list_projection():
     created_at = datetime(2026, 8, 12, tzinfo=timezone.utc)
-    runner = SimpleNamespace(
+    runner = BenchmarkRunnerRecord(
         id="runner-1",
         campaign_id=None,
         runner_plan_id=None,
@@ -270,6 +281,9 @@ def test_list_projection():
         exit_code=1,
         stdout="large stdout",
         stderr="large stderr",
+        user_metadata={},
+        request_count=0,
+        cancel_requested=False,
     )
 
     listed = _runner_list_dict(runner)

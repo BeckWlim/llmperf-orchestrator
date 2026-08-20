@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 import requests
 
-from llmperf.ray_llm_client import LLMClient
+from llmperf.ray_llm_client import LLMClient, LLMResponse
 from llmperf.models import RequestConfig
 from llmperf import common_metrics
 from llmperf.utils import get_tokenizer
@@ -19,11 +19,11 @@ class VertexAIClient(LLMClient):
         # using the llama tokenizer.
         self.tokenizer = get_tokenizer()
 
-    def llm_request(self, request_config: RequestConfig) -> Dict[str, Any]:
+    def llm_request(self, request_config: RequestConfig) -> LLMResponse:
         project_id = os.environ.get("GCLOUD_PROJECT_ID")
         region = os.environ.get("GCLOUD_REGION")
         endpoint_id = os.environ.get("VERTEXAI_ENDPOINT_ID")
-        access_token = os.environ.get("GCLOUD_ACCESS_TOKEN").strip()
+        access_token = os.environ.get("GCLOUD_ACCESS_TOKEN")
         if not project_id:
             raise ValueError("the environment variable GCLOUD_PROJECT_ID must be set.")
         if not region:
@@ -32,6 +32,11 @@ class VertexAIClient(LLMClient):
             raise ValueError(
                 "the environment variable VERTEXAI_ENDPOINT_ID must be set."
             )
+        if not access_token:
+            raise ValueError(
+                "the environment variable GCLOUD_ACCESS_TOKEN must be set."
+            )
+        access_token = access_token.strip()
         if not access_token:
             raise ValueError(
                 "the environment variable GCLOUD_ACCESS_TOKEN must be set."
@@ -46,7 +51,8 @@ class VertexAIClient(LLMClient):
         output_throughput = 0
         total_request_time = 0
 
-        metrics = {}
+        metrics: Dict[str, Any] = {}
+        response_code = -1
 
         metrics[common_metrics.ERROR_CODE] = None
         metrics[common_metrics.ERROR_MSG] = ""
@@ -64,7 +70,7 @@ class VertexAIClient(LLMClient):
                 "Content-Type": "application/json",
             }
 
-            sampling_params = request_config.sampling_params
+            sampling_params = dict(request_config.sampling_params or {})
             if "max_new_tokens" in sampling_params:
                 sampling_params["maxOutputTokens"] = sampling_params.pop(
                     "max_new_tokens"
@@ -94,9 +100,7 @@ class VertexAIClient(LLMClient):
             metrics[common_metrics.ERROR_CODE] = response_code
             print(f"Warning Or Error: {e}")
             print(response_code)
-            print(response_code)
 
-        metrics[common_metrics.INTER_TOKEN_LAT] = time_to_next_token
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
         metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = output_throughput

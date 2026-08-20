@@ -144,6 +144,8 @@ def _plan_occurrences(plan: Mapping[str, Any], now: datetime) -> int:
     recurrence = plan["recurrence"]
     if recurrence["kind"] == "interval":
         if ends_at is None:
+            if maximum is None:
+                raise ValueError("runner plan requires ends_at or max_occurrences")
             return int(maximum)
         start_utc = starts_at.astimezone(UTC)
         end_utc = ends_at.astimezone(UTC)

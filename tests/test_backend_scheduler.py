@@ -51,7 +51,7 @@ class FakeDatasetCache:
             dataset_id=spec["id"],
             filename=spec["filename"],
             revision=spec["revision"],
-            format=spec["format"],
+            adapter=spec["adapter"],
             path=self.path,
             cached=True,
         )
@@ -60,9 +60,7 @@ class FakeDatasetCache:
 def test_worker_status(tmp_path: Path):
     scheduler = Scheduler(
         UnusedRepository(),
-        SchedulerConfig(
-            working_directory=str(tmp_path),
-        ),
+        SchedulerConfig(),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
         ProviderRegistry.from_environment(
             {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
@@ -71,7 +69,6 @@ def test_worker_status(tmp_path: Path):
 
     assert scheduler.status()["status"] == "stopped"
     assert scheduler.status()["worker_kind"] == "ray_task"
-    assert scheduler.status()["worker_module"] == "llmperf_backend.worker"
     assert scheduler.status()["active_workers"] == 0
     assert scheduler.status()["busy_slots"] == 0
     assert scheduler.status()["live_slots"] == 0
@@ -83,7 +80,7 @@ def test_tokenizer_injection(tmp_path: Path):
     cache = FakeTokenizerCache(tokenizer_directory)
     scheduler = Scheduler(
         UnusedRepository(),
-        SchedulerConfig(working_directory=str(tmp_path)),
+        SchedulerConfig(),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
         ProviderRegistry.from_environment(
             {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
@@ -116,7 +113,7 @@ def test_dataset_injection(tmp_path: Path):
     cache = FakeDatasetCache(dataset_path)
     scheduler = Scheduler(
         UnusedRepository(),
-        SchedulerConfig(working_directory=str(tmp_path)),
+        SchedulerConfig(),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
         ProviderRegistry.from_environment(
             {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
@@ -131,7 +128,7 @@ def test_dataset_injection(tmp_path: Path):
                 "id": "organization/sharegpt",
                 "filename": "sharegpt.json",
                 "revision": "commit-1",
-                "format": "sharegpt",
+                "adapter": "sharegpt",
             },
         }
     }
@@ -147,7 +144,6 @@ def test_actor_environment(tmp_path: Path):
     scheduler = Scheduler(
         UnusedRepository(),
         SchedulerConfig(
-            working_directory=str(tmp_path),
             max_concurrent_runners=4,
             ray_address="ray://127.0.0.1:10001",
         ),
@@ -192,7 +188,7 @@ def test_embedded_ray(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(asyncio, "to_thread", run_synchronously)
     scheduler = Scheduler(
         UnusedRepository(),
-        SchedulerConfig(working_directory=str(tmp_path)),
+        SchedulerConfig(),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
         ProviderRegistry.from_environment(
             {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
@@ -203,8 +199,11 @@ def test_embedded_ray(tmp_path: Path, monkeypatch):
         scheduler._stop = asyncio.Event()
         await scheduler._start_ray_runtime()
         status = scheduler.status()
-        scheduler._ray_monitor_task.cancel()
-        await asyncio.gather(scheduler._ray_monitor_task, return_exceptions=True)
+        monitor_task = scheduler._ray_monitor_task
+        if monitor_task is None:
+            raise RuntimeError("Ray monitor task was not started")
+        monitor_task.cancel()
+        await asyncio.gather(monitor_task, return_exceptions=True)
         scheduler._ray_monitor_task = None
         await scheduler._stop_ray_runtime()
         scheduler._stop = None
@@ -253,7 +252,7 @@ def _execution_runner():
         "benchmark": {
             "provider": "test",
             "model": "test-model",
-            "llm_api": "openai",
+            "adapter": "openai",
             "timeout_seconds": 10,
             "max_completed_requests": 1,
             "concurrent_requests": 1,
@@ -309,7 +308,7 @@ def test_worker_execution(tmp_path: Path, monkeypatch):
     repository = ExecutionRepository()
     scheduler = Scheduler(
         repository,
-        SchedulerConfig(working_directory=str(tmp_path), poll_interval_seconds=0.001),
+        SchedulerConfig(poll_interval_seconds=0.001),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
         ProviderRegistry.from_environment(
             {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
@@ -330,6 +329,7 @@ def test_worker_execution(tmp_path: Path, monkeypatch):
     assert calls["started"][2]["worker_kind"] == "ray_task"
     assert calls["started"][2]["resource_scheduling"] == "independent_actors"
     assert calls["started"][2]["campaign_id"] == "campaign-1"
+    assert repository.completed is not None
     assert repository.completed[0][0] == "runner-1"
     assert repository.completed[0][1]["execution_runtime"]["worker_id"] == "task-1"
     assert repository.finished is None
@@ -342,7 +342,6 @@ def test_preworker_cancel(tmp_path: Path, monkeypatch):
     scheduler = Scheduler(
         repository,
         SchedulerConfig(
-            working_directory=str(tmp_path),
             poll_interval_seconds=0.001,
             artifact_resolution_timeout_seconds=1,
         ),
@@ -359,6 +358,7 @@ def test_preworker_cancel(tmp_path: Path, monkeypatch):
 
     asyncio.run(scheduler._execute(_execution_runner()))
 
+    assert repository.finished is not None
     assert repository.finished[:3] == (
         "runner-1",
         "cancelled",
@@ -372,7 +372,6 @@ def test_artifact_timeout(tmp_path: Path, monkeypatch):
     scheduler = Scheduler(
         repository,
         SchedulerConfig(
-            working_directory=str(tmp_path),
             poll_interval_seconds=0.001,
             artifact_resolution_timeout_seconds=0.002,
         ),
@@ -389,6 +388,7 @@ def test_artifact_timeout(tmp_path: Path, monkeypatch):
 
     asyncio.run(scheduler._execute(_execution_runner()))
 
+    assert repository.finished is not None
     assert repository.finished[0] == "runner-1"
     assert repository.finished[1] == "failed"
     assert "artifact resolution exceeded" in repository.finished[2]

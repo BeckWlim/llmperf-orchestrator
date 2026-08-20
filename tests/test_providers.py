@@ -9,7 +9,6 @@ from llmperf_backend.providers import (
     ProviderRegistry,
 )
 
-
 PROVIDER_ENVIRONMENT = {
     "LLMPERF_PROVIDER_DEEPSEEK_URL": "https://models.example/v1",
     "LLMPERF_PROVIDER_DEEPSEEK_KEY": "deepseek-secret",
@@ -41,17 +40,19 @@ def test_public_profile():
     assert anthropic.model_cache_ttl_seconds == 300
 
     benchmark = registry.resolve_benchmark(
-        {"provider": "deepseek", "model": "deepseek-reasoner", "llm_api": "litellm"}
+        {"provider": "deepseek", "model": "deepseek-reasoner"}
     )
     assert benchmark["provider"] == "deepseek"
     assert benchmark["model"] == "deepseek-reasoner"
-    assert benchmark["llm_api"] == "openai"
+    assert benchmark["adapter"] == "openai"
 
     static_benchmark = registry.resolve_benchmark(
         {"provider": "catalog", "model": "static-a"}
     )
     assert static_benchmark["model"] == "static-a"
-    with pytest.raises(ProviderConfigError, match="configured models: static-b, static-a"):
+    with pytest.raises(
+        ProviderConfigError, match="configured models: static-b, static-a"
+    ):
         registry.resolve_benchmark({"provider": "catalog", "model": "static-c"})
 
 

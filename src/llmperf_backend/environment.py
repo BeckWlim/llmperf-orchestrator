@@ -8,9 +8,7 @@ from dotenv import load_dotenv
 
 from llmperf.user_config import backend_environment_path, read_environment_file
 
-
 ENV_FILE = "LLMPERF_ENV_FILE"
-DEFAULT_ENV_FILE = ".env"
 PROVIDER_PREFIX = "LLMPERF_PROVIDER_"
 
 # Capture the real process environment before ``load_environment`` adds dotenv
@@ -21,17 +19,14 @@ _PROCESS_ENVIRONMENT = dict(os.environ)
 
 
 def resolve_environment_path(path: Optional[Path] = None) -> Path:
-    """Resolve an explicit path, override, user config, or legacy local .env."""
+    """Resolve an explicit path, override, or the canonical user config path."""
 
     if path is not None:
         return Path(path).expanduser().resolve()
     configured_path = os.environ.get(ENV_FILE)
     if configured_path:
         return Path(configured_path).expanduser().resolve()
-    user_path = backend_environment_path()
-    if user_path.is_file():
-        return user_path
-    return (Path.cwd() / DEFAULT_ENV_FILE).resolve()
+    return backend_environment_path()
 
 
 def load_environment(
@@ -41,7 +36,7 @@ def load_environment(
 ) -> Optional[Path]:
     """Load a dotenv file, preserving process environment values by default.
 
-    A missing default ``.env`` is normal. An explicitly selected file must exist so
+    A missing default user file is normal. An explicitly selected file must exist so
     a misspelled production configuration does not fail silently.
     """
 
@@ -82,9 +77,7 @@ def load_provider_environment(
         if name.startswith(PROVIDER_PREFIX)
     }
     process_values = (
-        _PROCESS_ENVIRONMENT
-        if process_environment is None
-        else process_environment
+        _PROCESS_ENVIRONMENT if process_environment is None else process_environment
     )
     effective.update(
         {

@@ -60,10 +60,15 @@ Test function names contain at most three underscores. PostgreSQL tests request 
 `postgresql+asyncpg` URL whose database name contains `test`, and skip when absent.
 
 ```bash
+.venv/bin/python -m basedpyright
 .venv/bin/python -m compileall -q src tests
 .venv/bin/pytest -q tests/test_cli.py tests/test_planner.py
 .venv/bin/pytest -q
 ```
+
+Treat the BasedPyright result as required acceptance evidence for Python changes. Run it
+proactively before delivery and report its outcome alongside compile and test results; this
+is an Agent delivery check, not a requirement to add or maintain a CI workflow.
 
 Avoid duplicated assertions across pure logic, API contract, and real PostgreSQL tests.
 CLI tests verify the centralized projection/rendering boundary described in `io.md`.

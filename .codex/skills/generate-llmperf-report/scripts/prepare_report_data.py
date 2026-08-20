@@ -15,8 +15,9 @@ import subprocess
 import tempfile
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from llmperf.version import PROTOCOL_VERSION
 
-ANALYSIS_VERSION = 2
+ANALYSIS_VERSION = PROTOCOL_VERSION
 
 
 def get_path(document: Any, path: str, default: Any = None) -> Any:
@@ -55,10 +56,12 @@ def bounded_message(value: Any, limit: int = 280) -> Optional[str]:
 
 
 def normalize_document(document: Mapping[str, Any]) -> Dict[str, Any]:
-    if document.get("version") == 6 and isinstance(document.get("runners"), list):
+    if document.get("version") != PROTOCOL_VERSION:
+        raise ValueError(f"Unsupported JSON version: expected {PROTOCOL_VERSION!r}")
+    if isinstance(document.get("runners"), list):
         return {
             "kind": "campaign",
-            "version": 6,
+            "version": PROTOCOL_VERSION,
             "meta": dict(document.get("campaign") or {}),
             "aggregate": dict(document.get("aggregate") or {}),
             "runner_plans": list(document.get("runner_plans") or []),
@@ -69,7 +72,7 @@ def normalize_document(document: Mapping[str, Any]) -> Dict[str, Any]:
                 dict(item) for item in document["runners"] if isinstance(item, Mapping)
             ],
         }
-    if document.get("version") == 1 and isinstance(document.get("runner"), Mapping):
+    if isinstance(document.get("runner"), Mapping):
         runner = dict(document["runner"])
         persisted = document.get("results") or {}
         if isinstance(persisted, Mapping):
@@ -78,7 +81,7 @@ def normalize_document(document: Mapping[str, Any]) -> Dict[str, Any]:
             runner["requests"] = persisted.get("requests") or []
         return {
             "kind": "runner",
-            "version": 1,
+            "version": PROTOCOL_VERSION,
             "meta": runner,
             "aggregate": {},
             "runner_plans": [],
@@ -88,7 +91,7 @@ def normalize_document(document: Mapping[str, Any]) -> Dict[str, Any]:
             "runners": [runner],
         }
     raise ValueError(
-        "Unsupported JSON: expected Campaign export version 6 or Runner export version 1"
+        f"Unsupported JSON: expected a {PROTOCOL_VERSION} Campaign or Runner export"
     )
 
 
@@ -98,9 +101,12 @@ def runner_information(runner: Mapping[str, Any], index: int) -> Dict[str, Any]:
     outcome = summary.get("outcome") or {}
     probe = summary.get("cache_probe_analysis") or {}
     benchmark = runner.get("benchmark") or {}
-    task = benchmark.get("task_request") or summary.get("task_request") or {}
-    cache = (probe.get("cache") or results.get("kv_cache") or {})
-    first_error = get_path(outcome, "first_error.message") or runner.get("error_message")
+    task = benchmark.get("task_context") or summary.get("task_context") or {}
+    cache = probe.get("cache") or results.get("kv_cache") or {}
+    tokenizer = benchmark.get("tokenizer") or summary.get("tokenizer") or {}
+    first_error = get_path(outcome, "first_error.message") or runner.get(
+        "error_message"
+    )
     return {
         "order": index + 1,
         "runner_id": runner.get("runner_id"),
@@ -109,9 +115,17 @@ def runner_information(runner: Mapping[str, Any], index: int) -> Dict[str, Any]:
         "outcome": outcome.get("status"),
         "provider": benchmark.get("provider"),
         "model": benchmark.get("model") or summary.get("model"),
-        "mean_input_tokens": benchmark.get("mean_input_tokens") or summary.get("mean_input_tokens"),
-        "mean_output_tokens": benchmark.get("mean_output_tokens") or summary.get("mean_output_tokens"),
-        "concurrency": benchmark.get("concurrent_requests") or summary.get("num_concurrent_requests"),
+        "tokenizer": {
+            key: tokenizer.get(key)
+            for key in ("id", "source", "revision", "accuracy", "selection")
+            if tokenizer.get(key) is not None
+        },
+        "mean_input_tokens": benchmark.get("mean_input_tokens")
+        or summary.get("mean_input_tokens"),
+        "mean_output_tokens": benchmark.get("mean_output_tokens")
+        or summary.get("mean_output_tokens"),
+        "concurrency": benchmark.get("concurrent_requests")
+        or summary.get("num_concurrent_requests"),
         "task_definition_id": task.get("definition_id"),
         "task_instance_id": task.get("instance_id"),
         "node_id": task.get("node_id"),
@@ -132,10 +146,21 @@ def runner_information(runner: Mapping[str, Any], index: int) -> Dict[str, Any]:
         "e2e_p50": number(get_path(results, "end_to_end_latency_s.quantiles.p50")),
         "e2e_p95": number(get_path(results, "end_to_end_latency_s.quantiles.p95")),
         "output_tps": number(results.get("mean_output_throughput_token_per_s")),
-        "cache_hit_ratio": number(cache.get("weighted_token_hit_ratio", cache.get("hit_ratio"))),
+        "cache_hit_ratio": number(cache.get("weighted_token_hit_ratio")),
+        "cache_request_hit_probability": number(cache.get("request_hit_probability")),
         "cache_coverage": number(cache.get("counter_coverage")),
-        "cache_hit_tokens": number(cache.get("complete_hit_tokens", cache.get("hit_tokens"))),
-        "cache_miss_tokens": number(cache.get("complete_miss_tokens", cache.get("miss_tokens"))),
+        "cache_hit_tokens": number(cache.get("complete_hit_tokens")),
+        "cache_miss_tokens": number(cache.get("complete_miss_tokens")),
+        "cache_measured_requests": integer(cache.get("measured_requests")),
+        "cache_complete_counter_requests": integer(
+            cache.get("complete_counter_requests")
+        ),
+        "cache_invalid_counter_requests": integer(
+            cache.get("invalid_counter_requests")
+        ),
+        "cache_counter_schemas": sorted(
+            str(item) for item in cache.get("counter_schemas") or []
+        ),
         "cache_speedup": number(get_path(probe, "speedup.p50")),
         "paired_ttft_delta": number(get_path(probe, "paired_ttft_delta_s.p50")),
         "cache_verdict": probe.get("verdict"),
@@ -149,33 +174,51 @@ def build_cohorts(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     groups: Dict[Tuple[Any, ...], List[Mapping[str, Any]]] = {}
     for row in rows:
         key = (
-            row.get("provider"), row.get("model"), row.get("mean_input_tokens"),
-            row.get("mean_output_tokens"), row.get("concurrency"),
+            row.get("provider"),
+            row.get("model"),
+            row.get("mean_input_tokens"),
+            row.get("mean_output_tokens"),
+            row.get("concurrency"),
+            json.dumps(row.get("tokenizer") or {}, sort_keys=True),
         )
         groups.setdefault(key, []).append(row)
     result = []
     for key, members in groups.items():
-        result.append({
-            "key": "|".join(str(item) for item in key),
-            "provider": key[0], "model": key[1], "mean_input_tokens": key[2],
-            "mean_output_tokens": key[3], "concurrency": key[4],
-            "runner_count": len(members),
-            "successful_runners": sum(row.get("status") == "succeeded" for row in members),
-            "ttft_p50_median": median(row.get("ttft_p50") for row in members),
-            "cache_hit_ratio_median": median(row.get("cache_hit_ratio") for row in members),
-            "runner_ids": [row.get("runner_id") for row in members],
-        })
+        result.append(
+            {
+                "key": "|".join(str(item) for item in key),
+                "provider": key[0],
+                "model": key[1],
+                "mean_input_tokens": key[2],
+                "mean_output_tokens": key[3],
+                "concurrency": key[4],
+                "tokenizer": json.loads(key[5]),
+                "runner_count": len(members),
+                "successful_runners": sum(
+                    row.get("status") == "succeeded" for row in members
+                ),
+                "ttft_p50_median": median(row.get("ttft_p50") for row in members),
+                "cache_hit_ratio_median": median(
+                    row.get("cache_hit_ratio") for row in members
+                ),
+                "runner_ids": [row.get("runner_id") for row in members],
+            }
+        )
     return result
 
 
 def build_task_evidence(
     data: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]
 ) -> List[Dict[str, Any]]:
-    runner_by_id = {str(row.get("runner_id")): row for row in rows if row.get("runner_id")}
+    runner_by_id = {
+        str(row.get("runner_id")): row for row in rows if row.get("runner_id")
+    }
     dispatches: Dict[str, List[Mapping[str, Any]]] = {}
     for dispatch in data.get("dispatches") or []:
         if isinstance(dispatch, Mapping) and dispatch.get("task_instance_id"):
-            dispatches.setdefault(str(dispatch["task_instance_id"]), []).append(dispatch)
+            dispatches.setdefault(str(dispatch["task_instance_id"]), []).append(
+                dispatch
+            )
     evidence = []
     for instance in data.get("task_instances") or []:
         if not isinstance(instance, Mapping):
@@ -185,29 +228,36 @@ def build_task_evidence(
         for dispatch in dispatches.get(instance_id, []):
             lineage = dispatch.get("lineage") or {}
             runner = runner_by_id.get(str(dispatch.get("runner_id")))
-            nodes.append({
-                "node_id": dispatch.get("node_id"),
-                "role": lineage.get("role"),
-                "payload_id": lineage.get("payload_id"),
-                "dependencies": list(lineage.get("dependencies") or []),
-                "planned_after_seconds": integer(lineage.get("after_seconds")),
-                "due_at": dispatch.get("due_at"),
-                "actual_started_at": lineage.get("actual_started_at"),
-                "actual_completed_at": lineage.get("actual_completed_at"),
-                "state": dispatch.get("state"),
-                "runner": runner,
-            })
-        evidence.append({
-            "task_instance_id": instance_id,
-            "task_definition_id": instance.get("task_definition_id"),
-            "instance_key": instance.get("instance_key"),
-            "state": instance.get("state"),
-            "dimensions": get_path(instance, "spec.dimensions", {}),
-            "trial_index": get_path(instance, "spec.trial_index"),
-            "payload_hashes": get_path(instance, "checkpoint.payload_hashes", {}),
-            "error": bounded_message(instance.get("error")),
-            "nodes": nodes,
-        })
+            nodes.append(
+                {
+                    "node_id": dispatch.get("node_id"),
+                    "role": lineage.get("role"),
+                    "payload_id": lineage.get("payload_id"),
+                    "dependencies": list(lineage.get("dependencies") or []),
+                    "planned_after_seconds": integer(lineage.get("after_seconds")),
+                    "due_at": dispatch.get("due_at"),
+                    "actual_started_at": lineage.get("actual_started_at"),
+                    "actual_completed_at": lineage.get("actual_completed_at"),
+                    "state": dispatch.get("state"),
+                    "runner": runner,
+                }
+            )
+        evidence.append(
+            {
+                "task_instance_id": instance_id,
+                "task_definition_id": instance.get("task_definition_id"),
+                "instance_key": instance.get("instance_key"),
+                "state": instance.get("state"),
+                "dimensions": get_path(instance, "spec.dimensions", {}),
+                "trial_index": get_path(instance, "spec.trial_index"),
+                "payload_hashes": get_path(instance, "checkpoint.payload_hashes", {}),
+                "payload_evidence": get_path(
+                    instance, "checkpoint.payload_evidence", {}
+                ),
+                "error": bounded_message(instance.get("error")),
+                "nodes": nodes,
+            }
+        )
     return evidence
 
 
@@ -222,7 +272,11 @@ def prepare_analysis(document: Mapping[str, Any], source: str) -> Dict[str, Any]
     return {
         "analysis_version": ANALYSIS_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source": {"description": source, "kind": data["kind"], "version": data["version"]},
+        "source": {
+            "description": source,
+            "kind": data["kind"],
+            "version": data["version"],
+        },
         "meta": data["meta"],
         "overview": {
             "runner_count": len(rows),
@@ -235,7 +289,9 @@ def prepare_analysis(document: Mapping[str, Any], source: str) -> Dict[str, Any]
         "task_definitions": data["task_definitions"],
         "evidence": {
             "task_graphs": build_task_evidence(data, rows),
-            "runner_cache_probes": [row for row in rows if row.get("cache_verdict") is not None],
+            "runner_cache_probes": [
+                row for row in rows if row.get("cache_verdict") is not None
+            ],
         },
         "runners": rows,
     }
@@ -257,7 +313,10 @@ def export_document(arguments: argparse.Namespace) -> Tuple[Dict[str, Any], str]
     if arguments.input:
         path = Path(arguments.input).expanduser().resolve()
         return json.loads(path.read_text(encoding="utf-8")), str(path)
-    if any(item.startswith(("--token", "--private-key")) for item in arguments.llmperfctl_arg):
+    if any(
+        item.startswith(("--token", "--private-key"))
+        for item in arguments.llmperfctl_arg
+    ):
         raise ValueError("Do not pass credentials through --llmperfctl-arg")
     cli = find_llmperfctl(arguments.llmperfctl)
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as temporary:
@@ -282,7 +341,9 @@ def export_document(arguments: argparse.Namespace) -> Tuple[Dict[str, Any], str]
             keep = Path(arguments.keep_json).expanduser().resolve()
             keep.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(export_path, keep)
-        source = f"llmperfctl {'campaign' if arguments.campaign_id else 'runner'} export"
+        source = (
+            f"llmperfctl {'campaign' if arguments.campaign_id else 'runner'} export"
+        )
         return document, source
     finally:
         export_path.unlink(missing_ok=True)
@@ -309,7 +370,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         analysis = prepare_analysis(document, source)
         output = Path(arguments.output).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
+        output.write_text(
+            json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         print(output)
         return 0
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:

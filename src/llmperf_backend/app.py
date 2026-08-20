@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, 
 from fastapi.responses import JSONResponse
 from sqlalchemy.engine import make_url
 
+from llmperf.version import PROTOCOL_VERSION
 from llmperf_backend.auth import TokenVerifier, normalize_public_key
 from llmperf_backend.config import ConfigError, ConfigStore, ConfigSnapshot
 from llmperf_backend.environment import load_provider_environment
@@ -19,6 +20,7 @@ from llmperf_backend.models import (
     BenchmarkCampaignStart,
     BenchmarkRunnerBatchCreate,
     BenchmarkRunnerCreate,
+    ResolvedBenchmarkConfig,
     RunnerPlanCreate,
     RunnerPlanPreview,
     TrustedClientWrite,
@@ -46,9 +48,17 @@ from llmperf_backend.providers import (
 )
 from llmperf_backend.scheduler import Scheduler
 from llmperf_backend.safety import WorkloadSafetyError, assess_workload
-from llmperf_backend.tokenizers import TokenizerCache, TokenizerResolutionError
-from llmperf_backend.datasets import DatasetCache, DatasetResolutionError
-
+from llmperf_backend.tokenizers import (
+    TokenizerCache,
+    TokenizerResolutionError,
+    TokenizerResolver,
+)
+from llmperf_backend.datasets import (
+    DatasetCache,
+    DatasetResolver,
+    DatasetResolutionError,
+    is_immutable_dataset_revision,
+)
 
 RUNNER_STATUSES = {QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED}
 LOGGER = logging.getLogger(__name__)
@@ -82,8 +92,8 @@ def create_app(
     scheduler: Optional[Scheduler] = None,
     provider_registry: Optional[ProviderRegistry] = None,
     model_discovery: Optional[ProviderModelDiscovery] = None,
-    tokenizer_cache: Optional[TokenizerCache] = None,
-    dataset_cache: Optional[DatasetCache] = None,
+    tokenizer_cache: Optional[TokenizerResolver] = None,
+    dataset_cache: Optional[DatasetResolver] = None,
     planner: Optional[Planner] = None,
 ) -> FastAPI:
     store = config_store or ConfigStore()
@@ -124,7 +134,7 @@ def create_app(
     application = FastAPI(
         title="LLMPerf Backend",
         description="Backend runtime configuration for LLMPerf experiments.",
-        version="0.1.0",
+        version=PROTOCOL_VERSION,
         lifespan=lifespan,
     )
     application.state.config_store = store
@@ -154,7 +164,10 @@ def create_app(
         return str(principal["sub"])
 
     async def resolve_benchmark(
-        request: Request, benchmark: Dict[str, Any]
+        request: Request,
+        benchmark: Dict[str, Any],
+        *,
+        tokenizer_selection: str,
     ) -> Dict[str, Any]:
         try:
             resolved = request.app.state.provider_registry.resolve_benchmark(benchmark)
@@ -162,18 +175,26 @@ def create_app(
             if tokenizer is not None:
                 resolution = await request.app.state.tokenizer_cache.resolve(tokenizer)
                 tokenizer_spec = resolution.benchmark_spec(
-                    selection=tokenizer.get("selection", "global_default"),
-                    accuracy=tokenizer.get("accuracy", "approximate"),
-                    requested_revision=(
-                        tokenizer.get("requested_revision")
-                        or tokenizer.get("revision")
-                        or "main"
+                    selection=tokenizer_selection,
+                    accuracy=(
+                        "compatible"
+                        if tokenizer_selection == "explicit"
+                        else "approximate"
                     ),
+                    requested_revision=tokenizer.get("revision") or "main",
                 )
+                cache_probe = resolved.get("cache_probe")
                 if (
-                    resolved.get("cache_probe") is not None
-                    and not tokenizer_spec["immutable_revision"]
+                    cache_probe is not None
+                    and tokenizer_spec["accuracy"] == "approximate"
+                    and not cache_probe.get("allow_approximate_tokenizer", False)
                 ):
+                    raise TokenizerResolutionError(
+                        "cache_probe requires an explicit tokenizer; set "
+                        "allow_approximate_tokenizer=true to acknowledge the "
+                        "global default"
+                    )
+                if cache_probe is not None and not tokenizer_spec["immutable_revision"]:
                     LOGGER.warning(
                         "Rejected cache_probe tokenizer: id=%s requested=%s "
                         "resolved=%s immutable=false",
@@ -204,7 +225,7 @@ def create_app(
                     dataset
                 )
                 resolved["dataset"] = dataset_resolution.benchmark_spec()
-            return resolved
+            return dump_model(ResolvedBenchmarkConfig.model_validate(resolved))
         except (
             DatasetResolutionError,
             ProviderConfigError,
@@ -222,10 +243,20 @@ def create_app(
             if runner.benchmark is None
             else dump_model(runner.benchmark)
         )
+        tokenizer_selection = (
+            "explicit"
+            if runner.benchmark is not None
+            and "tokenizer" in runner.benchmark.model_fields_set
+            else "global_default"
+        )
         return {
             "label": runner.label,
             "metadata": runner.metadata,
-            "benchmark": await resolve_benchmark(request, benchmark),
+            "benchmark": await resolve_benchmark(
+                request,
+                benchmark,
+                tokenizer_selection=tokenizer_selection,
+            ),
         }
 
     async def resolve_plan(
@@ -350,9 +381,19 @@ def create_app(
         actor = require_role(request, "operator")
         if payload.benchmark is None:
             benchmark = request.app.state.config_store.snapshot().config["benchmark"]
+            tokenizer_selection = "global_default"
         else:
             benchmark = dump_model(payload.benchmark)
-        benchmark = await resolve_benchmark(request, benchmark)
+            tokenizer_selection = (
+                "explicit"
+                if "tokenizer" in payload.benchmark.model_fields_set
+                else "global_default"
+            )
+        benchmark = await resolve_benchmark(
+            request,
+            benchmark,
+            tokenizer_selection=tokenizer_selection,
+        )
         enforce_performance_guard(request, runners=[{"benchmark": benchmark}])
         runner = await request.app.state.runner_repository.create_runner(
             benchmark,
@@ -409,20 +450,16 @@ def create_app(
                     status_code=422,
                     detail="compiled task runner cannot define cache_probe",
                 )
-            if benchmark.get("task_request") is not None:
+            dataset = benchmark.get("dataset")
+            if dataset is not None and not is_immutable_dataset_revision(
+                dataset.get("revision")
+            ):
                 raise HTTPException(
                     status_code=422,
-                    detail="task_request is compiler-owned and cannot be submitted",
-                )
-            if benchmark.get("dataset") is not None:
-                raise HTTPException(
-                    status_code=422,
-                    detail="compiled tasks require generated deterministic prompts",
-                )
-            if benchmark.get("llm_api") != "openai":
-                raise HTTPException(
-                    status_code=422,
-                    detail="compiled tasks currently require llm_api=openai",
+                    detail=(
+                        "compiled task datasets must resolve to an immutable "
+                        "Hugging Face commit revision"
+                    ),
                 )
             if int(benchmark.get("stddev_input_tokens", 0)) != 0:
                 raise HTTPException(
@@ -797,7 +834,7 @@ def create_app(
             )
         results = await request.app.state.runner_repository.get_results(runner_id, True)
         document = {
-            "version": 1,
+            "version": PROTOCOL_VERSION,
             "runner": {
                 "runner_id": runner["runner_id"],
                 "campaign_id": runner["campaign_id"],

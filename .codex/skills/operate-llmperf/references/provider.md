@@ -41,7 +41,14 @@ URLs must be HTTP(S) without userinfo, query, or fragment. The default discovery
 the Backend default.
 
 Supported adapters are `openai`, `anthropic`, `litellm`, `sagemaker`, and `vertexai`.
-Profile adapter selection overrides workload `llm_api`.
+The Profile exclusively owns adapter selection; workload YAML does not expose `llm_api`.
+`LLMPERF_PROVIDER_<ID>_ADAPTER` selects it explicitly and defaults to `openai` when
+omitted. Adapter selection is never inferred from URL or model name. At submission, the
+Backend resolves the workload's `provider` ID, injects canonical `adapter` into the frozen
+Runner benchmark, and the Worker selects the corresponding client. `DISCOVERY` is an
+independent catalog policy and does not select or change the request adapter. The
+`anthropic` and `litellm` adapters require the `litellm` optional dependency; `sagemaker`
+requires its optional dependency.
 
 Use a static catalog when no compatible `/models` endpoint exists:
 
@@ -57,9 +64,10 @@ optional adapter.
 
 ## Reload and Worker injection
 
-Configuration precedence is process environment, `LLMPERF_ENV_FILE`, persisted user
-configuration, then working-directory `.env`. `llmperfctl provider reload` validates a
-complete candidate and atomically replaces only Provider Profiles and model caches. It does
+Configuration precedence is process environment, an explicit `LLMPERF_ENV_FILE`, then
+persisted user configuration. Working-directory `.env` files are not loaded.
+`llmperfctl provider reload` validates a complete candidate and atomically replaces only
+Provider Profiles and model caches. It does
 not reload PostgreSQL, Scheduler, Planner, Ray, auth, listen settings, or the default
 Provider. Running Runners keep their connection snapshot; later claims use the new
 generation.

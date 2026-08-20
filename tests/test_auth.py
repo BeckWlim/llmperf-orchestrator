@@ -13,7 +13,7 @@ from llmperf_cli.auth import PrivateKeyTokenProvider
 
 
 class UnusedRepository:
-    async def get_trusted_client_by_key_id(self, key_id):
+    async def get_trusted_client_by_key_id(self, key_id: str):
         return None
 
 

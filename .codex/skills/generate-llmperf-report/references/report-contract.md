@@ -8,10 +8,10 @@ experiment dashboards back into the pipeline.
 
 Accepted inputs:
 
-- Runner export version 1;
-- Campaign export version 6.
+- Runner export version `1.0.0`;
+- Campaign export version `1.0.0`.
 
-Campaign v6 includes `task_definitions`, `task_instances`, `dispatches`, `task_analyses`,
+Campaign 1.0.0 includes `task_definitions`, `task_instances`, `dispatches`, `task_analyses`,
 and `runners`. It deliberately has no protocol-specific analysis collection.
 
 The normalized document has:
@@ -26,6 +26,13 @@ The normalized document has:
 
 Missing values remain JSON null or absent. Never coerce missing counters to zero.
 
+Rendering has a separate review boundary. Bind each rendering pass to the exact normalized
+document hash and cite normalized data paths in its render plan. Conversation history,
+earlier reports, and screenshots are not evidence sources and must not introduce fields or
+claims absent from the current normalized document. See `rendering-review.md` for the
+complete sequence and approval boundary for shared design changes. Reject pre-1.0.0
+exports instead of translating or guessing their semantics.
+
 ## Generic task semantics
 
 One Task Instance represents one matrix coordinate and trial. Each node is one atomic
@@ -35,6 +42,7 @@ request Runner. Interpret fields as follows:
 - `payload_id`: logical generated input family;
 - `payload_seed`: deterministic materialization seed;
 - `payload_hashes`: runtime proof that repeated payload references were identical;
+- `payload_evidence`: non-text dataset selection manifests keyed by payload ID;
 - `dependencies`: causal predecessor Dispatch IDs;
 - `planned_after_seconds`: requested delay after all predecessors completed;
 - actual timestamps: observed request start/completion anchors;

@@ -33,7 +33,7 @@ from llmperf_cli.__main__ import (
 )
 from llmperf_cli.auth import discover_private_key_providers
 from llmperf_cli.client import ClientError, LLMPerfClient
-from llmperf_cli.compatibility import adapt_cli_response, registered_routes
+from llmperf_cli.projections import adapt_cli_response, registered_routes
 
 
 class FakeClient:
@@ -57,9 +57,7 @@ class FakeClient:
             payloads.append(self.start_runner(payload))
         return {"items": payloads}
 
-    def start_campaign(
-        self, campaign, runners, runner_plans, task_definitions=None
-    ):
+    def start_campaign(self, campaign, runners, runner_plans, task_definitions=None):
         assert campaign["name"] == "glm-study"
         payloads = []
         for runner in runners:
@@ -88,6 +86,7 @@ def test_campaign_start(tmp_path):
     plan = tmp_path / "plan.yaml"
     plan.write_text(
         """
+version: "1.0.0"
 campaign:
   name: glm-study
 runners:
@@ -118,6 +117,7 @@ def test_planned_campaign(tmp_path):
     plan = tmp_path / "planned.yaml"
     plan.write_text(
         """
+version: "1.0.0"
 campaign:
   name: glm-study
 runner_plans:
@@ -155,6 +155,7 @@ def test_sweep_campaign(tmp_path):
     plan = tmp_path / "sweep.yaml"
     plan.write_text(
         """
+version: "1.0.0"
 campaign:
   name: glm-study
 task_definitions:
@@ -171,8 +172,12 @@ task_definitions:
         encoding="utf-8",
     )
     arguments = Namespace(
-        file=str(plan), wait=False, poll_interval=0.01, timeout=None,
-        output=None, include_requests=False,
+        file=str(plan),
+        wait=False,
+        poll_interval=0.01,
+        timeout=None,
+        output=None,
+        include_requests=False,
     )
     result = start_campaign(FakeClient(), arguments)
 
@@ -183,6 +188,7 @@ def test_residency_campaign(tmp_path):
     plan = tmp_path / "residency.yaml"
     plan.write_text(
         """
+version: "1.0.0"
 campaign:
   name: glm-study
 task_definitions:
@@ -202,8 +208,12 @@ task_definitions:
         encoding="utf-8",
     )
     arguments = Namespace(
-        file=str(plan), wait=False, poll_interval=0.01, timeout=None,
-        output=None, include_requests=False,
+        file=str(plan),
+        wait=False,
+        poll_interval=0.01,
+        timeout=None,
+        output=None,
+        include_requests=False,
     )
     result = start_campaign(FakeClient(), arguments)
 
@@ -216,6 +226,7 @@ def test_promotion_campaign(tmp_path):
     plan = tmp_path / "promotion.yaml"
     plan.write_text(
         """
+version: "1.0.0"
 campaign:
   name: glm-study
 task_definitions:
@@ -238,14 +249,20 @@ task_definitions:
         encoding="utf-8",
     )
     arguments = Namespace(
-        file=str(plan), wait=False, poll_interval=0.01, timeout=None,
-        output=None, include_requests=False,
+        file=str(plan),
+        wait=False,
+        poll_interval=0.01,
+        timeout=None,
+        output=None,
+        include_requests=False,
     )
     result = start_campaign(FakeClient(), arguments)
 
     definition = result["task_definitions"][0]
     assert definition["matrix"]["warmup_count"] == [0, 1, 2, 4]
     assert definition["matrix"]["quiet_seconds"][-1] == 21600
+
+
 def test_campaign_export_status():
     class CampaignClient:
         def export_campaign(self, campaign_id, include_requests=False):
@@ -528,7 +545,6 @@ ARG_CASES = [
                 "0.25",
                 "--timeout",
                 "30",
-                "--summary",
             ],
             "expected": {
                 "runner_command": "status",
@@ -536,7 +552,6 @@ ARG_CASES = [
                 "wait": True,
                 "poll_interval": 0.25,
                 "timeout": 30,
-                "summary": True,
             },
         },
         id="runner-status-wait",
@@ -562,7 +577,7 @@ def test_args(case):
 def test_nonblocking_start(tmp_path, caplog):
     runner_file = tmp_path / "runner.yaml"
     runner_file.write_text(
-        "benchmark:\n  model: glm-test\n",
+        'version: "1.0.0"\nbenchmark:\n  model: glm-test\n',
         encoding="utf-8",
     )
     arguments = build_parser().parse_args(["runner", "start", "-f", str(runner_file)])
@@ -795,9 +810,7 @@ def test_log_request(monkeypatch):
     monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
     document = LLMPerfClient("http://127.0.0.1:8000").get_runner_logs("runner-1")
 
-    assert requested_urls == [
-        "http://127.0.0.1:8000/api/v1/runners/runner-1/logs"
-    ]
+    assert requested_urls == ["http://127.0.0.1:8000/api/v1/runners/runner-1/logs"]
     assert document["stderr"] == "failure\n"
 
 
@@ -813,7 +826,7 @@ def test_action_output(capsys):
 
     assert capsys.readouterr().out == ""
 
-    with pytest.raises(ClientError, match="compatibility projections"):
+    with pytest.raises(ClientError, match="registered projections"):
         render_result({"campaign_id": "campaign-1"})
 
 
@@ -892,9 +905,7 @@ def test_status_projection(capsys):
     assert "Runner: runner-1  Status: running" in default_output
     assert '"summary"' not in default_output
 
-    arguments = build_parser().parse_args(
-        ["runner", "status", "runner-1", "--json"]
-    )
+    arguments = build_parser().parse_args(["runner", "status", "runner-1", "--json"])
     result = execute(RunnerClient(), arguments)
     render_result(adapt_cli_response(arguments, result))
     json_output = json.loads(capsys.readouterr().out)
@@ -1116,9 +1127,7 @@ def test_provider_output(capsys):
     assert "glm5.2" in output
     assert not output.lstrip().startswith("{")
 
-    arguments = build_parser().parse_args(
-        ["provider", "models", "zhipu", "--json"]
-    )
+    arguments = build_parser().parse_args(["provider", "models", "zhipu", "--json"])
     render_result(adapt_cli_response(arguments, models))
     assert json.loads(capsys.readouterr().out)["models"] == ["glm5.2"]
 
@@ -1382,9 +1391,7 @@ def test_wait_runner_reconnect():
                 },
             }
 
-    arguments = build_parser().parse_args(
-        ["runner", "status", "runner-1", "--wait", "--summary"]
-    )
+    arguments = build_parser().parse_args(["runner", "status", "runner-1", "--wait"])
 
     result = execute(SucceededRunnerClient(), arguments)
 

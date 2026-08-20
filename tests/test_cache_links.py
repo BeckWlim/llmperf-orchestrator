@@ -1,22 +1,16 @@
-import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
-
-SCRIPT = Path(__file__).parents[1] / "deploy" / "huggingface_cache_links.py"
-SPEC = importlib.util.spec_from_file_location("huggingface_cache_links", SCRIPT)
-assert SPEC is not None and SPEC.loader is not None
-cache_links = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(cache_links)
-
-MANIFEST_SCHEMA = cache_links.MANIFEST_SCHEMA
-CacheLinkError = cache_links.CacheLinkError
-audit_links = cache_links.audit_links
-capture_manifest = cache_links.capture_manifest
-load_manifest = cache_links.load_manifest
+from llmperf_tools.huggingface_cache_links import (
+    MANIFEST_SCHEMA,
+    CacheLinkError,
+    audit_links,
+    capture_manifest,
+    load_manifest,
+)
 
 
 def _cache(tmp_path):
@@ -35,6 +29,7 @@ def _cache(tmp_path):
 def test_capture_repair(tmp_path):
     source, _, source_link = _cache(tmp_path / "source")
     manifest = capture_manifest(source)
+    assert manifest["schema"] == "llmperf-huggingface-cache-links/1.0.0"
     assert manifest["schema"] == MANIFEST_SCHEMA
     assert manifest["links"] == [
         {
@@ -46,7 +41,7 @@ def test_capture_repair(tmp_path):
     destination, _, destination_link = _cache(tmp_path / "destination")
     destination_link.unlink()
     entries = [
-        (Path(item["path"]), item["target"]) for item in manifest["links"]
+        (PurePosixPath(item["path"]), item["target"]) for item in manifest["links"]
     ]
 
     audit = audit_links(destination, entries)
@@ -62,7 +57,9 @@ def test_repair_conflict(tmp_path):
     root, _, link = _cache(tmp_path)
     link.unlink()
     link.write_text("materialized", encoding="utf-8")
-    entries = [(link.relative_to(root), "../../blobs/content-hash")]
+    entries = [
+        (PurePosixPath(link.relative_to(root).as_posix()), "../../blobs/content-hash")
+    ]
 
     result = audit_links(root, entries, repair=True)
 
@@ -78,8 +75,14 @@ def test_partial_repair(tmp_path):
     healthy_link = missing_link.parent / "tokenizer_config.json"
     healthy_link.symlink_to("../../blobs/config-hash")
     entries = [
-        (missing_link.relative_to(root), "../../blobs/content-hash"),
-        (healthy_link.relative_to(root), "../../blobs/config-hash"),
+        (
+            PurePosixPath(missing_link.relative_to(root).as_posix()),
+            "../../blobs/content-hash",
+        ),
+        (
+            PurePosixPath(healthy_link.relative_to(root).as_posix()),
+            "../../blobs/config-hash",
+        ),
     ]
     missing_link.unlink()
 
@@ -110,7 +113,7 @@ def test_manifest_traversal(tmp_path):
 def test_broken_blob(tmp_path):
     root, blob, link = _cache(tmp_path)
     blob.unlink()
-    entries = [(link.relative_to(root), os.readlink(link))]
+    entries = [(PurePosixPath(link.relative_to(root).as_posix()), os.readlink(link))]
 
     result = audit_links(root, entries, repair=True)
 

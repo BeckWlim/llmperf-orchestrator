@@ -19,17 +19,46 @@ YAML authoring syntax
   PostgreSQL Dispatch queue -> Planner -> Runner -> Worker -> Provider
                     │
                     ▼
-      export v6 -> normalized evidence -> autonomous HTML rendering
+    export 1.0.0 -> normalized evidence -> autonomous HTML rendering
 ```
 
-This is a deliberate compatibility break. The former protocol registry, per-experiment
-models, state machines, cache analyzer, and `benchmark_protocol_*` schema are removed.
+Version 1.0.0 defines the first supported task-graph, persistence, export, and analysis
+contract. Pre-release protocol registries and experiment-specific state machines are not
+part of the release surface.
+
+### 1.1 Versioned format inventory
+
+| Surface | Version marker | 1.0.0 contract |
+|---|---|---|
+| Python distribution and CLI | package `version` | `1.0.0` |
+| Backend configuration YAML | root `version` | string `"1.0.0"` |
+| Runner and Campaign YAML/JSON | root `version` | string `"1.0.0"` |
+| HTTP control plane | route prefix | `/api/v1` |
+| RunnerPlan persisted template | `template_version` / `plan_template_version` | string `"1.0.0"` |
+| Compiled task definition and instance | `format_version` | string `"1.0.0"` |
+| Runner and Campaign export | root `version` | string `"1.0.0"` |
+| Benchmark result envelope | root `version` | string `"1.0.0"` |
+| Normalized report evidence | `analysis_version` | string `"1.0.0"` |
+| Render plan and review | `render_plan_version` / `render_review_version` | string `"1.0.0"` |
+| Hugging Face cache-link manifest | `schema` suffix | `llmperf-huggingface-cache-links/1.0.0` |
+
+`llmperf.version` is the runtime authority for release, protocol, and compiled-task format
+identifiers. External YAML is strict: the version is mandatory, unknown fields are rejected,
+and pre-1.0.0 documents require an explicit offline migration rather than an in-process
+adapter. The `/api/v1` path is the HTTP major-version boundary; request models reject an
+explicit non-1.0.0 body version.
 
 ## 2. Control plane
 
 FastAPI validates operator input and resolves Backend-owned Provider Profiles. Provider
 URLs and credentials never enter task YAML. Campaign creation is atomic: invalid input or
 an admission failure creates no partial workload.
+
+Workload YAML selects only a stable Provider ID and model ID. The matching Backend Profile
+owns `adapter` (`openai`, `anthropic`, `litellm`, `sagemaker`, or `vertexai`) and injects it
+into the frozen Runner after validation; URLs, model names, and discovery modes never imply
+an adapter. All adapters can execute ordinary or compiled Runners. Cache-analysis claims
+remain conditional on the selected Provider returning comparable usage counters.
 
 The performance guard estimates the fully expanded graph before acceptance:
 
@@ -72,7 +101,8 @@ The compiler forces task Runners to `concurrent_requests: 1` and
 - `invoke` is the only runtime node type.
 
 The Planner receives only the resulting DAG and therefore does not change when new
-experiments are composed.
+experiments are composed, provided that the experiment stays inside the finite,
+admission-time-known execution envelope described below.
 
 ### 3.3 Deterministic payloads
 
@@ -88,8 +118,32 @@ reference the same payload share the same seed. The Worker records the actual
 later replay differs. Deterministic input does not assert Provider cache behavior—it only
 makes that behavior measurable.
 
-The payload boundary can later host other deterministic generators or immutable dataset
-samplers without changing graph or Planner semantics.
+The payload boundary resolves artifact location independently from record decoding. A
+dataset's required `adapter` names a registered prompt-record decoder: `sharegpt` extracts
+the first conversation value, `text` maps non-empty lines, and `builtin-sonnet` owns the
+packaged fallback and its instruction. No orchestration layer branches on ShareGPT. All
+adapters normalize into one indexed-record interface without changing graph or Planner
+semantics. Dataset `sample` mode preserves a whole record. `concatenate` mode walks a
+seeded shuffle without replacement until the corpus is exhausted, then starts a newly
+shuffled cycle only as needed to fill the requested token budget. A truncated final record
+is still consumed in that cycle. The Worker records a text-free selection manifest (source
+adapter, record indices, corpus cycles, segment sizes, seed, and manifest hash);
+persistence verifies that evidence alongside `prompt_hash` on replay.
+
+### 3.4 Supported experiment envelope
+
+The 1.0 task model natively supports finite, open-loop experiments whose complete graph
+is known before execution. This includes parameter matrices, repeated trials, ordered
+phases, fan-out/fan-in layouts, completion-anchored delays, deterministic payload replay,
+and provider or model comparison cohorts. A request-backed observer also fits this model
+when one bounded invocation can produce terminal evidence in the normal Runner result.
+
+The current model does not provide observation-conditioned branches, dynamic graph
+growth, adaptive or unbounded loops, quorum or optional dependencies, continuous
+side-channel sampling, or node kinds other than bounded invocation. Dependency release
+uses an all-predecessors-succeeded rule, and a failed predecessor cancels its descendants.
+Consequently, the statement that new experiments do not require Planner changes applies
+to new compositions within this envelope, not to every possible observer protocol.
 
 ## 4. Persistence model
 
@@ -143,9 +197,30 @@ Provider counters are accounting evidence. TTFT deltas and speedup are performan
 evidence. Reports must keep these concepts separate and expose counter coverage and sample
 size.
 
+### 6.1 Extension horizon for complex observers
+
+Future observer support should preserve the current separation between compilation,
+dependency planning, execution, and reporting instead of adding experiment-specific
+branches to the Planner. The intended extension seams are:
+
+- a versioned, provider-neutral observer evidence envelope containing the observer kind,
+  measurement interval, subject references, quality flags, and immutable artifact hashes;
+- a typed execution capability for observers that cannot be represented as a normal
+  request-backed Runner, while retaining one bounded unit of work per dispatch;
+- generic dependency completion policies for optional, quorum, or continue-on-error joins;
+- bounded compilation epochs for adaptive experiments, where a controller appends a
+  versioned graph fragment transactionally rather than running an implicit loop inside a
+  Worker or the Planner; and
+- immutable artifact references for carrying observations between epochs without
+  coupling orchestration state to provider-specific payloads.
+
+Any such extension must expose a worst-case node, request, token, duration, and resource
+budget to admission control. It must also retain deterministic identifiers and durable
+evidence so that restart, replay, and audit properties remain intact.
+
 ## 7. Export and reporting
 
-Campaign export v6 contains:
+Campaign export 1.0.0 contains:
 
 - `campaign` and `aggregate`;
 - `runner_plans`;

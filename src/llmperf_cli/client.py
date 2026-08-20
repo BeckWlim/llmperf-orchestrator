@@ -11,6 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+from llmperf.version import PROTOCOL_VERSION
 
 LOGGER = logging.getLogger("llmperfctl.http")
 ERROR_DETAIL_LIMIT = 8192
@@ -63,8 +64,7 @@ def _redact_error_value(value: Any, field: Optional[str] = None) -> Any:
         return "<redacted>"
     if isinstance(value, dict):
         return {
-            str(key): _redact_error_value(item, str(key))
-            for key, item in value.items()
+            str(key): _redact_error_value(item, str(key)) for key, item in value.items()
         }
     if isinstance(value, list):
         return [_redact_error_value(item) for item in value]
@@ -95,7 +95,9 @@ def _format_error_detail(value: Any) -> str:
         )
     if len(rendered) > ERROR_DETAIL_LIMIT:
         omitted = len(rendered) - ERROR_DETAIL_LIMIT
-        rendered = f"{rendered[:ERROR_DETAIL_LIMIT]}\n... <{omitted} characters omitted>"
+        rendered = (
+            f"{rendered[:ERROR_DETAIL_LIMIT]}\n... <{omitted} characters omitted>"
+        )
     return rendered
 
 
@@ -309,6 +311,7 @@ class LLMPerfClient:
             "POST",
             "/api/v1/campaigns/start",
             {
+                "version": PROTOCOL_VERSION,
                 "campaign": campaign,
                 "runners": runners,
                 "runner_plans": runner_plans,

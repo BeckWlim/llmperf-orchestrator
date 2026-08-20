@@ -1,7 +1,7 @@
 import time
 from typing import Any, Dict
 
-from llmperf.ray_llm_client import LLMClient
+from llmperf.ray_llm_client import LLMClient, LLMResponse
 from llmperf.models import RequestConfig
 from llmperf import common_metrics
 
@@ -9,7 +9,7 @@ from llmperf import common_metrics
 class LiteLLMClient(LLMClient):
     """Client for LiteLLM Completions API."""
 
-    def llm_request(self, request_config: RequestConfig) -> Dict[str, Any]:
+    def llm_request(self, request_config: RequestConfig) -> LLMResponse:
         # litellm package isn't serializable, so we import it within the function
         # to maintain compatibility with ray.
         from litellm import completion, validate_environment
@@ -51,7 +51,7 @@ class LiteLLMClient(LLMClient):
         output_throughput = 0
         total_request_time = 0
 
-        metrics = {}
+        metrics: Dict[str, Any] = {}
 
         metrics[common_metrics.ERROR_CODE] = None
         metrics[common_metrics.ERROR_MSG] = ""
@@ -63,6 +63,10 @@ class LiteLLMClient(LLMClient):
             response = completion(**body)
             ttft = 0
             for tok in response:
+                if isinstance(tok, tuple):
+                    raise TypeError(
+                        "LiteLLM returned a non-stream tuple while stream=True"
+                    )
                 if tok.choices[0].delta:
                     delta = tok.choices[0].delta
                     if delta.get("content", None):
@@ -88,7 +92,7 @@ class LiteLLMClient(LLMClient):
             print(f"Warning Or Error: {e}")
             print(error_response_code)
 
-        metrics[common_metrics.INTER_TOKEN_LAT] = sum(time_to_next_token)
+        metrics[common_metrics.INTER_SSE_CHUNK_LAT] = time_to_next_token
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
         metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = output_throughput

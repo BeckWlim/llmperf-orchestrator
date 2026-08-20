@@ -3,14 +3,14 @@ from typing import Any, Dict, Tuple
 
 from llmperf.models import RequestConfig
 
+LLMResponse = Tuple[Dict[str, Any], str, RequestConfig]
+
 
 class LLMClient:
     """A client for making requests to a LLM API e.g Anyscale Endpoints."""
 
     @abc.abstractmethod
-    def llm_request(
-        self, request_config: RequestConfig
-    ) -> Tuple[Dict[str, Any], str, RequestConfig]:
+    def llm_request(self, request_config: RequestConfig) -> LLMResponse:
         """Make a single completion request to a LLM API
 
         Returns:

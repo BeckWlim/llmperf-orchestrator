@@ -12,7 +12,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-
 PROVIDER_PREFIX = "LLMPERF_PROVIDER_"
 SUPPORTED_ADAPTERS = {"openai", "anthropic", "litellm", "sagemaker", "vertexai"}
 PROVIDER_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
@@ -88,7 +87,7 @@ def _validate_environment_name(provider_id: str, field: str, name: str) -> str:
 @dataclass(frozen=True)
 class ProviderProfile:
     provider_id: str
-    llm_api: str
+    adapter: str
     api_base: str
     api_key: str
     api_base_env: str
@@ -108,7 +107,7 @@ class ProviderProfile:
             discovery["path"] = self.models_path
         return {
             "id": self.provider_id,
-            "adapter": self.llm_api,
+            "adapter": self.adapter,
             "base_url": self.api_base or None,
             "api_key_configured": bool(self.api_key),
             "typical_models": list(self.static_models[:3]),
@@ -171,10 +170,10 @@ class ProviderRegistry:
     def _profile_from_values(
         provider_id: str, values: Mapping[str, str]
     ) -> ProviderProfile:
-        llm_api = values.get("ADAPTER", "openai").strip().lower()
-        if llm_api not in SUPPORTED_ADAPTERS:
+        adapter = values.get("ADAPTER", "openai").strip().lower()
+        if adapter not in SUPPORTED_ADAPTERS:
             raise ProviderConfigError(
-                f"Provider {provider_id!r} has unsupported ADAPTER {llm_api!r}"
+                f"Provider {provider_id!r} has unsupported ADAPTER {adapter!r}"
             )
         api_base = values.get("URL", "").strip().rstrip("/")
         _validate_api_base(provider_id, api_base)
@@ -218,19 +217,19 @@ class ProviderRegistry:
             provider_id,
             "URLVAR",
             values.get(
-                "URLVAR", DEFAULT_BASE_VARIABLES.get(llm_api, "OPENAI_API_BASE")
+                "URLVAR", DEFAULT_BASE_VARIABLES.get(adapter, "OPENAI_API_BASE")
             ).strip(),
         )
         api_key_env = _validate_environment_name(
             provider_id,
             "KEYVAR",
             values.get(
-                "KEYVAR", DEFAULT_KEY_VARIABLES.get(llm_api, "OPENAI_API_KEY")
+                "KEYVAR", DEFAULT_KEY_VARIABLES.get(adapter, "OPENAI_API_KEY")
             ).strip(),
         )
         return ProviderProfile(
             provider_id=provider_id,
-            llm_api=llm_api,
+            adapter=adapter,
             api_base=api_base,
             api_key=values.get("KEY", ""),
             api_base_env=api_base_env,
@@ -334,7 +333,7 @@ class ProviderRegistry:
         resolved = dict(benchmark)
         profile = self.require(str(resolved["provider"]))
         resolved["provider"] = profile.provider_id
-        resolved["llm_api"] = profile.llm_api
+        resolved["adapter"] = profile.adapter
         model = str(resolved.get("model") or "")
         if not model:
             raise ProviderConfigError("A benchmark model must be selected")
@@ -355,9 +354,7 @@ class ProviderRegistry:
             profile = self._profiles.get(_normalize_provider_id(provider_id))
             if profile is None:
                 raise ProviderConfigError(f"Unknown provider profile: {provider_id}")
-            credential_environment_names = tuple(
-                self._credential_environment_names
-            )
+            credential_environment_names = tuple(self._credential_environment_names)
         environment = {
             name: value
             for name, value in base_environment.items()

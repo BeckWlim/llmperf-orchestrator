@@ -1,4 +1,7 @@
-from typing import Any, List
+from typing import TYPE_CHECKING, Any, List
+
+if TYPE_CHECKING:
+    from ray.actor import ActorProxy
 
 from ray.util import ActorPool
 
@@ -9,7 +12,7 @@ from llmperf.models import RequestConfig
 class RequestsLauncher:
     """Launch requests from LLMClients to their respective LLM APIs."""
 
-    def __init__(self, llm_clients: List[LLMClient]):
+    def __init__(self, llm_clients: "List[ActorProxy[LLMClient]]"):
         if not llm_clients:
             raise ValueError("RequestsLauncher requires at least one LLM client")
         self._llm_client_pool = ActorPool(llm_clients)

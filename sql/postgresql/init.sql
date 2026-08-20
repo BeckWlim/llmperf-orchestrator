@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS benchmark_runner_plans (
     recurrence              JSONB NOT NULL,
     overlap_policy          VARCHAR(20) NOT NULL,
     runner_template         JSONB NOT NULL,
-    template_version        INTEGER NOT NULL DEFAULT 1,
+    template_version        VARCHAR(16) NOT NULL DEFAULT '1.0.0',
     starts_at               TIMESTAMPTZ NOT NULL,
     ends_at                 TIMESTAMPTZ,
     max_occurrences         INTEGER,
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS benchmark_task_definitions (
     campaign_id         VARCHAR(36) NOT NULL
                         REFERENCES benchmark_campaigns(id) ON DELETE CASCADE,
     name                VARCHAR(200) NOT NULL,
-    compiler            VARCHAR(40) NOT NULL,
+    format_version      VARCHAR(16) NOT NULL,
     config              JSONB NOT NULL,
     runner_template     JSONB NOT NULL,
     created_by          VARCHAR(64) NOT NULL,
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS benchmark_task_instances (
                             ON DELETE CASCADE,
     campaign_id             VARCHAR(36) NOT NULL
                             REFERENCES benchmark_campaigns(id) ON DELETE CASCADE,
-    compiler                VARCHAR(40) NOT NULL,
+    format_version          VARCHAR(16) NOT NULL,
     instance_key            VARCHAR(512) NOT NULL,
     state                   VARCHAR(20) NOT NULL DEFAULT 'planned',
     spec                    JSONB NOT NULL,
@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS benchmark_task_instances (
 );
 
 CREATE INDEX IF NOT EXISTS ix_task_instance_campaign
-    ON benchmark_task_instances (campaign_id, compiler, state);
+    ON benchmark_task_instances (campaign_id, format_version, state);
 
 CREATE TABLE IF NOT EXISTS benchmark_runner_dispatches (
     id                      VARCHAR(36) PRIMARY KEY,
@@ -119,7 +119,6 @@ CREATE TABLE IF NOT EXISTS benchmark_runner_dispatches (
     node_id                 VARCHAR(80),
     due_at                  TIMESTAMPTZ,
     state                   VARCHAR(20) NOT NULL DEFAULT 'pending',
-    parent_dispatch_id      VARCHAR(36),
     runner_template         JSONB NOT NULL,
     lineage                 JSONB NOT NULL DEFAULT '{}'::jsonb,
     runner_id               VARCHAR(36),
@@ -129,13 +128,8 @@ CREATE TABLE IF NOT EXISTS benchmark_runner_dispatches (
     CONSTRAINT uq_runner_dispatch_task_node
         UNIQUE (task_instance_id, node_id),
     CONSTRAINT uq_runner_dispatch_runner UNIQUE (runner_id),
-    CONSTRAINT fk_runner_dispatch_parent FOREIGN KEY (parent_dispatch_id)
-        REFERENCES benchmark_runner_dispatches(id) ON DELETE SET NULL,
     CONSTRAINT ck_runner_dispatch_state CHECK (
         state IN ('blocked', 'pending', 'emitted', 'cancelled')
-    ),
-    CONSTRAINT ck_runner_dispatch_not_self_parent CHECK (
-        parent_dispatch_id IS NULL OR parent_dispatch_id <> id
     ),
     CONSTRAINT ck_runner_dispatch_owner CHECK (
         (runner_plan_id IS NOT NULL AND task_instance_id IS NULL AND
@@ -150,8 +144,6 @@ CREATE INDEX IF NOT EXISTS ix_runner_dispatch_due
     WHERE state = 'pending';
 CREATE INDEX IF NOT EXISTS ix_runner_dispatch_campaign
     ON benchmark_runner_dispatches (campaign_id, created_at);
-CREATE INDEX IF NOT EXISTS ix_runner_dispatch_parent
-    ON benchmark_runner_dispatches (parent_dispatch_id);
 CREATE INDEX IF NOT EXISTS ix_runner_dispatch_task
     ON benchmark_runner_dispatches (task_instance_id, node_id);
 
@@ -163,7 +155,7 @@ CREATE TABLE IF NOT EXISTS benchmark_runners (
                         REFERENCES benchmark_runner_plans(id) ON DELETE SET NULL,
     plan_occurrence     INTEGER,
     scheduled_for       TIMESTAMPTZ,
-    plan_template_version INTEGER,
+    plan_template_version VARCHAR(16),
     label               VARCHAR(200),
     created_by          VARCHAR(64) NOT NULL,
     status              VARCHAR(20) NOT NULL,

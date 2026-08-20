@@ -19,7 +19,7 @@ def _benchmark(model):
     return {
         "provider": "test",
         "model": model,
-        "llm_api": "openai",
+        "adapter": "openai",
         "timeout_seconds": 10,
         "max_completed_requests": 1,
         "concurrent_requests": 1,
@@ -29,6 +29,8 @@ def _benchmark(model):
         "stddev_output_tokens": 0,
         "additional_sampling_params": {},
     }
+
+
 def test_postgres_lifecycle(postgresql_url):
     async def exercise_repository():
         database = Database(DatabaseConfig(url=postgresql_url))
@@ -44,10 +46,11 @@ def test_postgres_lifecycle(postgresql_url):
                 {"database": "postgresql"},
                 "bootstrap-test",
             )
+            assert campaign is not None
             runner = await repository.create_runner(
                 {
                     "model": "glm-test",
-                    "llm_api": "openai",
+                    "adapter": "openai",
                     "timeout_seconds": 10,
                     "max_completed_requests": 1,
                     "concurrent_requests": 1,
@@ -62,7 +65,9 @@ def test_postgres_lifecycle(postgresql_url):
                 campaign_id=campaign["campaign_id"],
                 label="postgres-runner",
             )
+            assert runner is not None
             claimed = await repository.claim_next("integration-scheduler")
+            assert claimed is not None
             assert claimed["runner_id"] == runner["runner_id"]
 
             committed = await repository.complete_runner(
@@ -75,6 +80,7 @@ def test_postgres_lifecycle(postgresql_url):
             )
             assert committed is True
             results = await repository.get_results(runner["runner_id"], True)
+            assert results is not None
             assert results["status"] == "succeeded"
             assert results["requests"][0]["kv_cache_hit_rate"] == 0.75
 
@@ -88,8 +94,10 @@ def test_postgres_lifecycle(postgresql_url):
                 "bootstrap-test",
                 120,
             )
+            assert user is not None
             assert user["role"] == "operator"
             trusted = await repository.get_trusted_client_by_key_id("0123456789abcdef")
+            assert trusted is not None
             assert trusted["username"] == "postgres-operator"
 
             plan = await repository.create_runner_plan(
@@ -110,11 +118,12 @@ def test_postgres_lifecycle(postgresql_url):
                     "benchmark": {
                         "provider": "test",
                         "model": "planned-model",
-                        "llm_api": "openai",
+                        "adapter": "openai",
                     },
                 },
                 "bootstrap-test",
             )
+            assert plan is not None
             assert plan["status"] == "active"
             emitted = await asyncio.gather(
                 repository.materialize_due_work(10),
@@ -123,6 +132,7 @@ def test_postgres_lifecycle(postgresql_url):
             emitted_count = sum(emitted) + await repository.materialize_due_work(10)
             assert emitted_count == 2
             persisted_plan = await repository.get_runner_plan(plan["runner_plan_id"])
+            assert persisted_plan is not None
             assert persisted_plan["status"] == "completed"
             assert persisted_plan["emitted_count"] == 2
             queued = await repository.list_runners("queued", 100, 0, full=True)
@@ -151,16 +161,18 @@ def test_postgres_lifecycle(postgresql_url):
                     "benchmark": {
                         "provider": "test",
                         "model": "planned-model",
-                        "llm_api": "openai",
+                        "adapter": "openai",
                     },
                 },
                 "bootstrap-test",
             )
+            assert skip_plan is not None
             assert await repository.materialize_due_work(10) == 1
             assert await repository.materialize_due_work(10) == 0
             persisted_skip = await repository.get_runner_plan(
                 skip_plan["runner_plan_id"]
             )
+            assert persisted_skip is not None
             assert persisted_skip["status"] == "completed"
             assert persisted_skip["emitted_count"] == 1
             assert persisted_skip["skipped_count"] == 1
@@ -170,6 +182,8 @@ def test_postgres_lifecycle(postgresql_url):
             await database.dispose()
 
     asyncio.run(exercise_repository())
+
+
 def test_campaign_claim_fairness(postgresql_url):
     async def exercise_repository():
         database = Database(DatabaseConfig(url=postgresql_url))
@@ -184,6 +198,8 @@ def test_campaign_claim_fairness(postgresql_url):
             campaign_b = await repository.create_campaign(
                 "campaign-b", "fairness B", {}, "bootstrap-test"
             )
+            assert campaign_a is not None
+            assert campaign_b is not None
             for index in range(2):
                 await repository.create_runner(
                     _benchmark(f"a-{index}"),
@@ -202,11 +218,17 @@ def test_campaign_claim_fairness(postgresql_url):
                 repository.claim_next("fair-slot-1"),
                 repository.claim_next("fair-slot-2"),
             )
-            assert {runner["campaign_id"] for runner in claimed} == {
+            first_claim, second_claim = claimed
+            assert first_claim is not None
+            assert second_claim is not None
+            assert {
+                runner["campaign_id"] for runner in (first_claim, second_claim)
+            } == {
                 campaign_a["campaign_id"],
                 campaign_b["campaign_id"],
             }
             remaining = await repository.claim_next("fair-slot-3")
+            assert remaining is not None
             assert remaining["campaign_id"] == campaign_a["campaign_id"]
         finally:
             async with database.engine.begin() as connection:

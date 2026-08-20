@@ -15,6 +15,7 @@ from llmperf_backend.models import (
     PerformanceGuardConfig,
     dump_model,
 )
+from llmperf.version import PROTOCOL_VERSION
 from llmperf_backend.safety import WorkloadSafetyError, assess_workload
 
 
@@ -50,6 +51,8 @@ def validate_document(
     ray_actor_capacity = int(ray_num_cpus / ray_actor_num_cpus)
     if ray_actor_capacity < 1:
         raise ValueError("Ray runtime cannot schedule even one configured actor")
+    if document.get("version") != PROTOCOL_VERSION:
+        raise ValueError(f"YAML version must be {PROTOCOL_VERSION!r}")
     if "campaign" not in document:
         runner = BenchmarkRunnerCreate.model_validate(document)
         benchmark = runner.benchmark

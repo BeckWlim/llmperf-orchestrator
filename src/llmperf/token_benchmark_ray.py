@@ -10,7 +10,6 @@ from pathlib import Path
 import re
 import time
 import random
-import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -26,10 +25,10 @@ from llmperf.cache_probe import (
 from llmperf.common import SUPPORTED_APIS, construct_clients
 
 from llmperf.models import RequestConfig
+from llmperf.prompt_datasets import PromptDatasetSource, prepare_prompt_requests
 from llmperf.requests_launcher import RequestsLauncher
 from llmperf.utils import (
     get_tokenizer,
-    randomly_sample_sonnet_lines_prompt,
     LLMPerfResults,
     sample_random_positive_int,
 )
@@ -46,10 +45,6 @@ def normalize_request_metrics(
 
     num_output_tokens = get_token_length(generated_text)
     request_metrics[common_metrics.LOCAL_OUTPUT_TOKENS] = num_output_tokens
-    inter_token_latency_sum = request_metrics.get(common_metrics.INTER_TOKEN_LAT, 0)
-    request_metrics[common_metrics.INTER_TOKEN_LAT] = (
-        inter_token_latency_sum / num_output_tokens if num_output_tokens else 0
-    )
     request_metrics[common_metrics.NUM_OUTPUT_TOKENS] = num_output_tokens
     request_metrics[common_metrics.NUM_TOTAL_TOKENS] = (
         request_metrics.get(common_metrics.NUM_INPUT_TOKENS, 0) + num_output_tokens
@@ -84,64 +79,6 @@ def normalize_request_metrics(
     return request_metrics
 
 
-def sample_sharegpt_requests(
-    dataset_path: str,
-    num_requests: int,
-    repeat_count: int,
-    min_input_tokens: int,
-    max_input_tokens: int,
-    get_token_length,
-    seed: int = 11111,
-) -> List[Tuple[str, int]]:
-    """Sample and repeat first-turn ShareGPT prompts like vLLM's APC benchmark."""
-
-    path = Path(dataset_path).expanduser()
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise ValueError(f"Unable to read ShareGPT dataset {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"ShareGPT dataset is not valid JSON: {path}") from exc
-    if not isinstance(document, list):
-        raise ValueError("ShareGPT dataset must be a JSON array")
-
-    candidates = []
-    for record in document:
-        if not isinstance(record, dict):
-            continue
-        conversations = record.get("conversations")
-        if not isinstance(conversations, list) or len(conversations) < 2:
-            continue
-        first_turn = conversations[0]
-        if not isinstance(first_turn, dict):
-            continue
-        prompt = first_turn.get("value")
-        if not isinstance(prompt, str) or not prompt:
-            continue
-        candidates.append(prompt)
-
-    rng = random.Random(seed)
-    rng.shuffle(candidates)
-    unique_request_count = math.ceil(num_requests / repeat_count)
-    sampled = []
-    for prompt in candidates:
-        prompt_len = get_token_length(prompt)
-        if min_input_tokens <= prompt_len <= max_input_tokens:
-            sampled.append((prompt, prompt_len))
-            if len(sampled) == unique_request_count:
-                break
-    if len(sampled) < unique_request_count:
-        raise ValueError(
-            "ShareGPT dataset has only "
-            f"{len(sampled)} matching prompts; {unique_request_count} required in "
-            f"token range {min_input_tokens}:{max_input_tokens}"
-        )
-
-    repeated = (sampled * repeat_count)[:num_requests]
-    rng.shuffle(repeated)
-    return repeated
-
-
 def _execute_cache_probe(
     plan: List[CacheProbeRequest],
     model: str,
@@ -152,8 +89,10 @@ def _execute_cache_probe(
     test_timeout_s: float,
     get_token_length,
     cache_probe: Dict[str, Any],
+    dataset_seed: int,
     tokenizer_provenance: Optional[Dict[str, Any]],
     benchmark_metadata: Dict[str, Any],
+    prompt_evidence: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Execute a dependency-aware probe without changing the global Scheduler."""
 
@@ -181,6 +120,9 @@ def _execute_cache_probe(
                     dispatch_counter += 1
                 dispatched_at = time.monotonic()
                 metadata = planned.metadata()
+                if prompt_evidence:
+                    family_index = int(planned.family_id.rsplit("-", 1)[-1])
+                    metadata["prompt_evidence"] = dict(prompt_evidence[family_index])
                 metadata["plan_index"] = planned.dispatch_index
                 metadata["dispatch_index"] = actual_dispatch_index
                 metadata["scheduled_monotonic"] = started
@@ -255,7 +197,7 @@ def _execute_cache_probe(
         completed,
         bootstrap_samples=int(cache_probe.get("bootstrap_samples", 2_000)),
         confidence_level=float(cache_probe.get("confidence_level", 0.95)),
-        seed=int(benchmark_metadata.get("dataset_seed") or 11111),
+        seed=dataset_seed,
         minimum_counter_coverage=float(
             cache_probe.get("minimum_counter_coverage", 0.8)
         ),
@@ -270,7 +212,7 @@ def _execute_cache_probe(
         analysis["verdict_before_quality_guard"] = analysis["verdict"]
         analysis["verdict"] = "inconclusive"
 
-    provenance = dict(tokenizer_provenance or {})
+    provenance: Dict[str, Any] = dict(tokenizer_provenance or {})
     if not provenance:
         provenance = {
             "id": "hf-internal-testing/llama-tokenizer",
@@ -309,19 +251,19 @@ def get_token_throughput_latencies(
     stddev_input_tokens: int,
     mean_output_tokens: int,
     stddev_output_tokens: int,
+    prompt_dataset_source: PromptDatasetSource,
     shared_prefix_tokens: int = 0,
-    dataset_path: Optional[str] = None,
-    dataset_format: str = "sharegpt",
+    dataset_prompt_mode: str = "sample",
     dataset_repeat_count: int = 1,
     dataset_seed: int = 11111,
     additional_sampling_params: Optional[Dict[str, Any]] = None,
     num_concurrent_requests: int = 1,
     max_num_completed_requests: int = 500,
-    test_timeout_s=90,
+    test_timeout_s: float = 90,
     llm_api="openai",
     cache_probe: Optional[Dict[str, Any]] = None,
     tokenizer_provenance: Optional[Dict[str, Any]] = None,
-    task_request: Optional[Dict[str, Any]] = None,
+    task_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Get the token throughput and latencies for the given model.
 
@@ -330,8 +272,9 @@ def get_token_throughput_latencies(
         mean_input_tokens: The mean number of tokens to send in the prompt for the request.
         stddev_input_tokens: The standard deviation of the number of tokens to send in the prompt for the request.
         shared_prefix_tokens: Number of leading prompt tokens reused by every request.
-        dataset_path: Optional path to a ShareGPT JSON dataset.
-        dataset_format: Dataset schema. Currently only ``sharegpt`` is supported.
+        prompt_dataset_source: Explicit prompt adapter and optional artifact path.
+        dataset_prompt_mode: Select whole prompts or concatenate diverse records to the
+            requested token budget.
         dataset_repeat_count: Number of times to issue every sampled dataset prompt.
         dataset_seed: Seed used to select and order dataset prompts.
         mean_output_tokens: The mean number of tokens to generate per request.
@@ -348,11 +291,14 @@ def get_token_throughput_latencies(
         (e.g. throughput, latencies, etc.)
         The individual metrics for each request.
     """
-    task_payload_seed = task_request.get("payload_seed") if task_request else None
+    task_payload_seed = task_context.get("payload_seed") if task_context else None
+    effective_dataset_seed = (
+        int(task_payload_seed) if task_payload_seed is not None else dataset_seed
+    )
     random.seed(
-        int(task_payload_seed)
-        if task_payload_seed is not None
-        else (dataset_seed if cache_probe else 11111)
+        effective_dataset_seed
+        if cache_probe or task_payload_seed is not None
+        else 11111
     )
 
     tokenizer = get_tokenizer()
@@ -360,8 +306,7 @@ def get_token_throughput_latencies(
         tokenizer.encode(text, add_special_tokens=False)
     )
 
-    if not additional_sampling_params:
-        additional_sampling_params = {}
+    sampling_parameters = dict(additional_sampling_params or {})
 
     completed_requests_lock = threading.Lock()
     completed_requests = []
@@ -371,14 +316,16 @@ def get_token_throughput_latencies(
     request_thread_errors_lock = threading.Lock()
     if shared_prefix_tokens >= mean_input_tokens:
         raise ValueError("shared_prefix_tokens must be less than mean_input_tokens")
-    if dataset_path and shared_prefix_tokens:
+    if prompt_dataset_source.is_external and shared_prefix_tokens:
         raise ValueError(
-            "dataset_path and shared_prefix_tokens cannot be used together"
+            "external prompt datasets and shared_prefix_tokens cannot be used together"
         )
-    if dataset_path and dataset_format != "sharegpt":
-        raise ValueError(f"Unsupported dataset format: {dataset_format}")
+    if dataset_prompt_mode not in {"sample", "concatenate"}:
+        raise ValueError(f"Unsupported dataset prompt mode: {dataset_prompt_mode}")
     if dataset_repeat_count < 1:
         raise ValueError("dataset_repeat_count must be at least 1")
+    if dataset_prompt_mode == "concatenate" and dataset_repeat_count != 1:
+        raise ValueError("concatenated dataset prompts require repeat_count=1")
 
     # Make up prompts outside of the send loop for faster benchmarking. A shared
     # prefix creates a controlled provider KV-cache workload while each suffix
@@ -392,47 +339,33 @@ def get_token_throughput_latencies(
     base_prompt_count = (
         int(cache_probe["trials"]) if cache_probe else max_num_completed_requests
     )
-    if task_request and base_prompt_count != 1:
+    if task_context and base_prompt_count != 1:
         raise ValueError("compiled task nodes must contain exactly one request")
     num_output_tokens_list = [
         sample_random_positive_int(mean_output_tokens, stddev_output_tokens)
         for _ in range(probe_request_count)
     ]
-    if dataset_path:
-        min_input_tokens = max(1, mean_input_tokens - stddev_input_tokens)
-        max_input_tokens = mean_input_tokens + stddev_input_tokens
-        prompts = sample_sharegpt_requests(
-            dataset_path=dataset_path,
-            num_requests=(
-                base_prompt_count if cache_probe else max_num_completed_requests
-            ),
-            repeat_count=1 if cache_probe else dataset_repeat_count,
-            min_input_tokens=min_input_tokens,
-            max_input_tokens=max_input_tokens,
-            get_token_length=get_token_length,
-            seed=dataset_seed,
-        )
-    else:
-        prompts = []
-        shared_prefix = ""
-        if shared_prefix_tokens:
-            shared_prefix, _ = randomly_sample_sonnet_lines_prompt(
-                prompt_tokens_mean=shared_prefix_tokens,
-                prompt_tokens_stddev=0,
-                expect_output_tokens=mean_output_tokens,
-                tokenizer=tokenizer,
-            )
-        for i in range(base_prompt_count):
-            if task_payload_seed is not None:
-                random.seed(int(task_payload_seed))
-            suffix = randomly_sample_sonnet_lines_prompt(
-                prompt_tokens_mean=mean_input_tokens - shared_prefix_tokens,
-                prompt_tokens_stddev=stddev_input_tokens,
-                expect_output_tokens=num_output_tokens_list[i],
-                tokenizer=tokenizer,
-            )[0]
-            prompt = shared_prefix + suffix
-            prompts.append((prompt, get_token_length(prompt)))
+    prompts, prompt_evidence = prepare_prompt_requests(
+        source=prompt_dataset_source,
+        prompt_mode=dataset_prompt_mode,
+        num_requests=base_prompt_count,
+        repeat_count=(1 if cache_probe else dataset_repeat_count),
+        mean_input_tokens=mean_input_tokens,
+        stddev_input_tokens=stddev_input_tokens,
+        mean_output_tokens=mean_output_tokens,
+        get_token_length=get_token_length,
+        seed=effective_dataset_seed,
+        shared_prefix_tokens=shared_prefix_tokens,
+    )
+    prompt_source = prompt_evidence[0]["source"]
+    effective_prompt_mode = prompt_evidence[0].get("mode", dataset_prompt_mode)
+    prompt_dataset_metadata = {
+        "adapter": prompt_dataset_source.adapter,
+        "source": prompt_source,
+        "prompt_mode": effective_prompt_mode,
+        "repeat_count": dataset_repeat_count,
+        "seed": effective_dataset_seed,
+    }
     if cache_probe:
         probe_config = dict(cache_probe)
         if probe_config.get("shared_prefix_tokens") is None:
@@ -441,7 +374,7 @@ def get_token_throughput_latencies(
             prompts,
             probe_config,
             tokenizer,
-            dataset_seed,
+            effective_dataset_seed,
         )
         return _execute_cache_probe(
             plan=plan,
@@ -449,22 +382,21 @@ def get_token_throughput_latencies(
             llm_api=llm_api,
             num_concurrent_requests=num_concurrent_requests,
             num_output_tokens_list=num_output_tokens_list,
-            additional_sampling_params=additional_sampling_params,
+            additional_sampling_params=sampling_parameters,
             test_timeout_s=test_timeout_s,
             get_token_length=get_token_length,
             cache_probe=probe_config,
+            dataset_seed=effective_dataset_seed,
             tokenizer_provenance=tokenizer_provenance,
             benchmark_metadata={
                 "mean_input_tokens": mean_input_tokens,
                 "stddev_input_tokens": stddev_input_tokens,
                 "shared_prefix_tokens": shared_prefix_tokens,
-                "dataset_path": dataset_path,
-                "dataset_format": dataset_format if dataset_path else None,
-                "dataset_repeat_count": dataset_repeat_count if dataset_path else None,
-                "dataset_seed": dataset_seed if dataset_path else None,
+                "prompt_dataset": dict(prompt_dataset_metadata),
                 "mean_output_tokens": mean_output_tokens,
                 "stddev_output_tokens": stddev_output_tokens,
             },
+            prompt_evidence=prompt_evidence,
         )
     start_time = time.monotonic()
     pbar = tqdm(total=max_num_completed_requests)
@@ -485,24 +417,29 @@ def get_token_throughput_latencies(
                 default_sampling_params = {
                     "max_tokens": num_output_tokens_list[request_index]
                 }
-                default_sampling_params.update(additional_sampling_params)
-                request_config = RequestConfig(
-                    model=model,
-                    prompt=prompts[request_index],
-                    sampling_params=default_sampling_params,
-                    llm_api=llm_api,
-                    metadata=(
+                default_sampling_params.update(sampling_parameters)
+                request_metadata: Dict[str, Any] = {
+                    "prompt_evidence": dict(prompt_evidence[request_index])
+                }
+                if task_context:
+                    request_metadata.update(
                         {
-                            **dict(task_request),
+                            **dict(task_context),
                             "prompt_hash": "sha256:"
                             + hashlib.sha256(
                                 prompts[request_index][0].encode("utf-8")
                             ).hexdigest(),
                             "local_input_tokens": prompts[request_index][1],
                         }
-                        if task_request
-                        else None
-                    ),
+                    )
+                    payload_evidence = prompt_evidence[request_index]
+                    request_metadata["payload_evidence"] = dict(payload_evidence)
+                request_config = RequestConfig(
+                    model=model,
+                    prompt=prompts[request_index],
+                    sampling_params=default_sampling_params,
+                    llm_api=llm_api,
+                    metadata=request_metadata,
                     timeout_seconds=test_timeout_s,
                 )
                 req_launcher.launch_requests(request_config)
@@ -564,14 +501,11 @@ def get_token_throughput_latencies(
         "mean_input_tokens": mean_input_tokens,
         "stddev_input_tokens": stddev_input_tokens,
         "shared_prefix_tokens": shared_prefix_tokens,
-        "dataset_path": dataset_path,
-        "dataset_format": dataset_format if dataset_path else None,
-        "dataset_repeat_count": dataset_repeat_count if dataset_path else None,
-        "dataset_seed": dataset_seed if dataset_path else None,
+        "prompt_dataset": dict(prompt_dataset_metadata),
         "mean_output_tokens": mean_output_tokens,
         "stddev_output_tokens": stddev_output_tokens,
         "num_concurrent_requests": num_concurrent_requests,
-        "additional_sampling_params": additional_sampling_params,
+        "additional_sampling_params": sampling_parameters,
         "tokenizer": dict(
             tokenizer_provenance
             or {
@@ -581,7 +515,7 @@ def get_token_throughput_latencies(
                 "warning": "Tokenizer was not explicitly selected for this model",
             }
         ),
-        "task_request": dict(task_request or {}),
+        "task_context": dict(task_context or {}),
         "timed_out": timed_out,
     }
 
@@ -591,14 +525,14 @@ def get_token_throughput_latencies(
 
 
 def metrics_summary(
-    metrics: List[Dict[str, Any]], start_time: int, end_time: int
+    metrics: List[Dict[str, Any]], started_at: float, finished_at: float
 ) -> Dict[str, Any]:
     """Generate a summary over metrics generated from potentially multiple instances of this client.
 
     Args:
         metrics: The metrics to summarize.
-        start_time: The time the test started.
-        end_time: The time the test ended.
+        started_at: Monotonic timestamp when the measurement started.
+        finished_at: Monotonic timestamp when the measurement finished.
 
     Returns:
         A summary with the following information:
@@ -607,16 +541,14 @@ def metrics_summary(
             - Error rate
             - Error code frequency
             - Quantiles (p25-p99) for the following metrics:
-                - Inter token latency
                 - Time to first token
                 - User total request time
                 - Number of tokens processed per request
                 - Number of tokens generated per request
                 - User throughput (tokens / s)
     """
-    ret = {}
+    ret: Dict[str, Any] = {}
     metric_keys = [
-        common_metrics.INTER_TOKEN_LAT,
         common_metrics.TTFT,
         common_metrics.E2E_LAT,
         common_metrics.REQ_OUTPUT_THROUGHPUT,
@@ -691,7 +623,7 @@ def metrics_summary(
         print(error_code_frequency)
     ret[common_metrics.ERROR_CODE_FREQ] = error_code_frequency
 
-    duration = end_time - start_time
+    duration = finished_at - started_at
     overall_output_throughput = (
         df_without_errored_req[common_metrics.NUM_OUTPUT_TOKENS].sum() / duration
         if duration > 0
@@ -711,9 +643,14 @@ def metrics_summary(
     ret[common_metrics.NUM_COMPLETED_REQUESTS] = num_completed_requests
     ret[common_metrics.COMPLETED_REQUESTS_PER_MIN] = num_completed_requests_per_min
 
-    ret[common_metrics.KV_CACHE] = summarize_cache_counters(
-        df_without_errored_req.to_dict(orient="records")
-    )
+    cache_records: List[Dict[str, Any]] = [
+        {
+            str(column): value
+            for column, value in zip(df_without_errored_req.columns, row)
+        }
+        for row in df_without_errored_req.itertuples(index=False, name=None)
+    ]
+    ret[common_metrics.KV_CACHE] = summarize_cache_counters(cache_records)
 
     return ret
 
@@ -757,6 +694,7 @@ def run_token_benchmark(
 
     summary, individual_responses = get_token_throughput_latencies(
         model=model,
+        prompt_dataset_source=PromptDatasetSource.builtin_sonnet(),
         llm_api=llm_api,
         test_timeout_s=test_timeout_s,
         max_num_completed_requests=max_num_completed_requests,
@@ -779,35 +717,29 @@ def run_token_benchmark(
         summary.update(user_metadata)
 
         results = LLMPerfResults(name=summary_filename, metadata=summary)
-        results_dir = Path(results_dir)
-        if not results_dir.exists():
-            results_dir.mkdir(parents=True)
-        elif not results_dir.is_dir():
-            raise ValueError(f"{results_dir} is not a directory")
+        results_directory = Path(results_dir)
+        if not results_directory.exists():
+            results_directory.mkdir(parents=True)
+        elif not results_directory.is_dir():
+            raise ValueError(f"{results_directory} is not a directory")
 
-        try:
-            with open(results_dir / f"{summary_filename}.json", "w") as f:
-                json.dump(results.to_dict(), f, indent=4, default=str)
-        except Exception as e:
-            print(results.to_dict())
-            raise e
+        summary_path = results_directory / f"{summary_filename}.json"
+        with summary_path.open("w", encoding="utf-8") as summary_stream:
+            json.dump(results.to_dict(), summary_stream, indent=4, default=str)
 
-        try:
-            with open(results_dir / f"{individual_responses_filename}.json", "w") as f:
-                json.dump(individual_responses, f, indent=4)
-        except Exception as e:
-            print(individual_responses)
-            raise e
+        responses_path = results_directory / f"{individual_responses_filename}.json"
+        with responses_path.open("w", encoding="utf-8") as responses_stream:
+            json.dump(individual_responses, responses_stream, indent=4)
 
 
-args = argparse.ArgumentParser(
+parser = argparse.ArgumentParser(
     description="Run a token throughput and latency benchmark."
 )
 
-args.add_argument(
+parser.add_argument(
     "--model", type=str, required=True, help="The model to use for this load test."
 )
-args.add_argument(
+parser.add_argument(
     "--mean-input-tokens",
     type=int,
     default=550,
@@ -816,7 +748,7 @@ args.add_argument(
         " (default: %(default)s)"
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--stddev-input-tokens",
     type=int,
     default=150,
@@ -825,7 +757,7 @@ args.add_argument(
         "(default: %(default)s)"
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--mean-output-tokens",
     type=int,
     default=150,
@@ -835,7 +767,7 @@ args.add_argument(
         "(default: %(default)s)"
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--stddev-output-tokens",
     type=int,
     default=80,
@@ -844,19 +776,19 @@ args.add_argument(
         "(default: %(default)s)"
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--num-concurrent-requests",
     type=int,
     default=10,
     help=("The number of concurrent requests to send (default: %(default)s)"),
 )
-args.add_argument(
+parser.add_argument(
     "--timeout",
     type=int,
     default=90,
     help="The amount of time to run the load test for. (default: %(default)s)",
 )
-args.add_argument(
+parser.add_argument(
     "--max-num-completed-requests",
     type=int,
     default=10,
@@ -865,7 +797,7 @@ args.add_argument(
         "that its possible for the test to timeout first. (default: %(default)s)"
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--additional-sampling-params",
     type=str,
     default="{}",
@@ -874,7 +806,7 @@ args.add_argument(
         "(default: %(default)s) No additional sampling params are sent."
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--results-dir",
     type=str,
     default="",
@@ -883,7 +815,7 @@ args.add_argument(
         "(`default: %(default)s`) No results are saved)"
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--llm-api",
     type=str,
     default="openai",
@@ -892,7 +824,7 @@ args.add_argument(
         " (default: %(default)s)"
     ),
 )
-args.add_argument(
+parser.add_argument(
     "--metadata",
     type=str,
     default="",
@@ -905,26 +837,26 @@ args.add_argument(
 if __name__ == "__main__":
     env_vars = dict(os.environ)
     ray.init(runtime_env={"env_vars": env_vars}, include_dashboard=False)
-    args = args.parse_args()
+    arguments = parser.parse_args()
 
     # Parse user metadata.
     user_metadata = {}
-    if args.metadata:
-        for item in args.metadata.split(","):
+    if arguments.metadata:
+        for item in arguments.metadata.split(","):
             key, value = item.split("=")
             user_metadata[key] = value
 
     run_token_benchmark(
-        llm_api=args.llm_api,
-        model=args.model,
-        test_timeout_s=args.timeout,
-        max_num_completed_requests=args.max_num_completed_requests,
-        mean_input_tokens=args.mean_input_tokens,
-        stddev_input_tokens=args.stddev_input_tokens,
-        mean_output_tokens=args.mean_output_tokens,
-        stddev_output_tokens=args.stddev_output_tokens,
-        num_concurrent_requests=args.num_concurrent_requests,
-        additional_sampling_params=args.additional_sampling_params,
-        results_dir=args.results_dir,
+        llm_api=arguments.llm_api,
+        model=arguments.model,
+        test_timeout_s=arguments.timeout,
+        max_num_completed_requests=arguments.max_num_completed_requests,
+        mean_input_tokens=arguments.mean_input_tokens,
+        stddev_input_tokens=arguments.stddev_input_tokens,
+        mean_output_tokens=arguments.mean_output_tokens,
+        stddev_output_tokens=arguments.stddev_output_tokens,
+        num_concurrent_requests=arguments.num_concurrent_requests,
+        additional_sampling_params=arguments.additional_sampling_params,
+        results_dir=arguments.results_dir,
         user_metadata=user_metadata,
     )

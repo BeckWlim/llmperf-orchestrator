@@ -245,8 +245,10 @@ dist/
 
 # results
 output/
-*.json
 result_outputs/
+
+# Keep JSON schemas, fixtures, and Skill assets versionable. Put generated benchmark
+# exports and analysis artifacts under the ignored output directories above.
 
 __pycache__
 **/__pycache__/

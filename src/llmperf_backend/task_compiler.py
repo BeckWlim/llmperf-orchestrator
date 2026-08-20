@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 from itertools import product
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 from uuid import uuid4
 
 from llmperf_backend.models import (
+    CompiledBenchmarkConfig,
     DimensionReference,
     InvokeStep,
     ParallelStep,
@@ -48,7 +49,9 @@ class TaskCompileContext:
 def _seed(
     seed: int, dimensions: Mapping[str, int], trial: int, seed_namespace: str
 ) -> int:
-    coordinates = ";".join(f"{key}={value}" for key, value in sorted(dimensions.items()))
+    coordinates = ";".join(
+        f"{key}={value}" for key, value in sorted(dimensions.items())
+    )
     value = f"{seed}\0{coordinates}\0{trial}\0{seed_namespace}".encode("utf-8")
     return int.from_bytes(hashlib.sha256(value).digest()[:4], "big") & 0x7FFFFFFF
 
@@ -87,15 +90,16 @@ def _runner(
             "max_completed_requests": 1,
             "concurrent_requests": 1,
             "dataset_seed": payload_seed,
-            "task_request": task_context,
+            "task_context": task_context,
         }
     )
-    metadata = dict(context.runner_template.get("metadata") or {})
-    metadata["task"] = task_context
+    benchmark = CompiledBenchmarkConfig.model_validate(benchmark).model_dump(
+        mode="json"
+    )
     prefix = context.runner_template.get("label") or context.definition_name
     return {
         "label": f"{prefix}:{node_id}"[:200],
-        "metadata": metadata,
+        "metadata": dict(context.runner_template.get("metadata") or {}),
         "benchmark": benchmark,
     }
 
@@ -140,7 +144,7 @@ def compile_task_definition(context: TaskCompileContext) -> List[TaskInstanceBlu
     definition = context.definition
     matrix = definition.get("matrix") or {}
     dimension_names = sorted(matrix)
-    combinations: Sequence[Sequence[int]] = (
+    combinations: Iterable[Sequence[int]] = (
         product(*(matrix[name] for name in dimension_names))
         if dimension_names
         else [()]
@@ -200,7 +204,9 @@ def compile_task_definition(context: TaskCompileContext) -> List[TaskInstanceBlu
                     count = _value(raw_step["count"], dimensions)
                     interval = _value(raw_step.get("interval_seconds", 0), dimensions)
                     if count < 0 or count > 100:
-                        raise ValueError("expanded repeat count must be between 0 and 100")
+                        raise ValueError(
+                            "expanded repeat count must be between 0 and 100"
+                        )
                     invoke = raw_step["invoke"]
                     invoke_delay = _value(invoke.get("after_seconds", 0), dimensions)
                     for index in range(1, count + 1):

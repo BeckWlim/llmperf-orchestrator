@@ -82,9 +82,13 @@ Repository releases a child only when all dependencies succeeded:
 child.due_at = max(dependency actual completion) + child.after_seconds
 ```
 
-The legacy single `parent_dispatch_id` field is not sufficient for joins; the new graph
-uses the complete dependency list. Parallel siblings share an incoming frontier, and the
-next sequential node depends on all siblings.
+Each node uses the complete dependency list rather than a single parent field. Parallel
+siblings share an incoming frontier, and the next sequential node depends on all siblings.
+
+In 1.0 this is deliberately an all-success completion policy. Optional predecessors,
+quorum joins, continue-on-error edges, and observation-conditioned activation are not
+encoded in Task Dispatches. They require a future generic dependency-policy extension;
+they should not be implemented as experiment-specific Planner branches.
 
 ## Persistence transactions
 
@@ -156,9 +160,8 @@ Planner and Scheduler restarts reconstruct state from PostgreSQL. Pending work r
 durable. Running Runners use heartbeat-based stale recovery. Cancellation propagates to
 queued/running Runners, active plans, pending/blocked Dispatches, and task instances.
 
-This task-graph release does not execute legacy protocol rows. A live old Backend must
-finish and export pending legacy Campaigns before schema cutover. Do not rely on
-`create_all` to rename existing Dispatch columns.
+Version 1.0.0 starts from the schema in `sql/postgresql/init.sql`. Pre-release rows and
+tables are outside the supported contract; do not rely on `create_all` to translate them.
 
 ## Operational checks
 
