@@ -37,7 +37,7 @@ MAX_REPEAT_COUNT = 100
 MAX_GRAPH_DEPTH = 20
 MAX_NODES_PER_INSTANCE = 10_000
 MAX_INSTANCES_PER_DEFINITION = 10_000
-MAX_PLANNED_SPAN_SECONDS = 21_600
+MAX_PLANNED_SPAN_SECONDS = 86_400
 DIMENSION_EXPRESSION = re.compile(r"\A\$(?P<name>[A-Za-z_][A-Za-z0-9_]*)\Z")
 
 
@@ -731,7 +731,7 @@ class TaskCompiler:
             compiled_nodes = graph.expand(instance_context, validation_key)
             planned_span_seconds = _planned_span(compiled_nodes)
             if planned_span_seconds > MAX_PLANNED_SPAN_SECONDS:
-                raise ValueError("task planned span cannot exceed six hours")
+                raise ValueError("task planned span cannot exceed 24 hours")
 
     @classmethod
     def estimate(

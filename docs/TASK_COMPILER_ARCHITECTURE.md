@@ -207,7 +207,7 @@ left to make.
 - Every expression references a declared dimension.
 - Repeat counts are resolved and bounded before persistence.
 - Graph nesting, instances, and nodes per instance have explicit hard limits.
-- Longest dependency-path delay cannot exceed six hours.
+- Longest dependency-path delay cannot exceed 24 hours.
 - All compiled Runner nodes force one request at concurrency one.
 - A parallel join depends on every outgoing branch frontier.
 - UUID assignment cannot change graph shape, node order, seeds, or planned delays.

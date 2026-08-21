@@ -423,22 +423,43 @@ def test_invalid_primitive():
         TaskDefinitionCreate.model_validate(payload)
 
 
-def test_task_span():
-    payload = {
-        "name": "too-long",
+def test_task_span_boundary():
+    boundary_payload = {
+        "name": "boundary",
         "payloads": {"replay": {"seed_namespace": "replay"}},
         "workflow": [
             {
-                "repeat": {
-                    "name": "waits",
-                    "count": 7,
-                    "every_seconds": 3600,
-                    "node": {"invoke": {"name": "warm", "payload": "replay"}},
+                "invoke": {
+                    "name": "probe",
+                    "payload": "replay",
+                    "after_seconds": 86_400,
                 }
             }
         ],
         "runner": {},
     }
 
-    with pytest.raises(ValueError, match="six hours"):
-        TaskDefinitionCreate.model_validate(payload)
+    definition = TaskDefinitionCreate.model_validate(boundary_payload)
+
+    assert definition.workflow[0].invoke is not None
+    assert definition.workflow[0].invoke.after_seconds == 86_400
+
+
+def test_task_span_limit():
+    excessive_payload = {
+        "name": "too-long",
+        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "workflow": [
+            {
+                "invoke": {
+                    "name": "probe",
+                    "payload": "replay",
+                    "after_seconds": 86_401,
+                }
+            }
+        ],
+        "runner": {},
+    }
+
+    with pytest.raises(ValueError, match="24 hours"):
+        TaskDefinitionCreate.model_validate(excessive_payload)
