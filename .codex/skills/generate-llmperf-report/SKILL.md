@@ -8,6 +8,33 @@ description: "Prepare auditable LLMPerf 1.0.0 analysis data and create style-con
 Build the evidence model deterministically, lock the rendering pass to that artifact, then
 choose the narrative and visual structure that best fits the experiment.
 
+## Confirm the destination and package the deliverable
+
+Before writing any persistent report artifact, resolve the intended report directory and
+entry-point path to absolute paths. Show those paths to the user and wait for explicit
+confirmation. If the user already supplied a path, repeat the resolved path and still wait
+for acknowledgement. Until confirmed, perform preparation only in a temporary directory;
+do not create, overwrite, move, or reorganize files in the final destination.
+
+Organize multi-file report deliverables by responsibility instead of placing every file at
+the report root. Keep only intentional user entry points such as `report.html`, `README.md`,
+and `MANIFEST.sha256` at the root. Create only the subdirectories required by the artifacts:
+
+- `analysis/` for per-campaign or per-cohort normalized analysis.
+- `data/` for the combined evidence model and derived tables.
+- `raw/` for retained source exports.
+- `plans/` for follow-up experiment plans and workload definitions.
+- `provenance/` for render plans, inventories, and validation records.
+- `tools/` for report-specific build or rendering scripts.
+- `backups/` for superseded revisions and legacy artifacts.
+- `metadata/` for sidecars that are not report content.
+
+Use the smallest applicable hierarchy and preserve a compatible existing layout. After any
+reorganization, update relative references, add or refresh `README.md` and
+`MANIFEST.sha256` when the bundle has supporting files, verify every manifest entry, and
+rerun report validation from the final paths. Never delete or collapse historical artifacts
+merely to make the package look cleaner unless the user explicitly authorizes deletion.
+
 ## Prepare the analysis model
 
 Use [scripts/prepare_report_data.py](scripts/prepare_report_data.py) as the deterministic
