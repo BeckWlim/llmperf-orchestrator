@@ -437,20 +437,30 @@ class Scheduler:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
-    async def _wait_worker(self, worker: Worker, runner_id: str) -> bool:
+    async def _wait_worker(
+        self, worker: Worker, runner_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Listen for one Worker result while polling durable cancellation state."""
+
         if self._stop is None:
             raise RuntimeError("Scheduler must be started before supervising Workers")
-        while not worker.ready():
-            try:
-                await asyncio.wait_for(
-                    self._stop.wait(), self.config.poll_interval_seconds
+        result_task = asyncio.create_task(
+            worker.result_async(), name=f"llmperf-worker-result-{runner_id}"
+        )
+        try:
+            while not self._stop.is_set():
+                completed_tasks, _ = await asyncio.wait(
+                    {result_task}, timeout=self.config.poll_interval_seconds
                 )
-            except asyncio.TimeoutError:
+                if completed_tasks:
+                    return result_task.result()
                 if await self.repository.heartbeat(runner_id):
-                    return True
-                continue
+                    return None
             raise asyncio.CancelledError
-        return False
+        finally:
+            if not result_task.done():
+                result_task.cancel()
+                await asyncio.gather(result_task, return_exceptions=True)
 
     async def _cancel_worker(self, worker: Worker) -> None:
         worker.cancel(force=False)
@@ -504,8 +514,8 @@ class Scheduler:
                 runner_id,
                 actor_count,
             )
-            cancelled = await self._wait_worker(worker, runner_id)
-            if cancelled:
+            payload = await self._wait_worker(worker, runner_id)
+            if payload is None:
                 await self._cancel_worker(worker)
                 await self.repository.finish_runner(
                     runner_id,
@@ -518,7 +528,6 @@ class Scheduler:
                 LOGGER.info("Runner %s cancelled", runner_id)
                 return
 
-            payload = worker.result()
             stdout = str(payload.get("stdout") or "")
             stderr = str(payload.get("stderr") or "")
             if not payload.get("ok"):

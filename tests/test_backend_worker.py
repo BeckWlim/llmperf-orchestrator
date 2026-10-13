@@ -1,6 +1,8 @@
 """Worker/Ray execution, resource isolation, environment, and outcome tests."""
 
+import asyncio
 from datetime import datetime, timezone
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -205,6 +207,7 @@ def test_worker_handle():
     )
     assert worker.ready() is True
     assert worker.result() == {"ok": True}
+    assert asyncio.run(worker.result_async()) == {"ok": True}
     assert worker.task_id() == "task-1"
     assert calls["options"]["runtime_env"]["env_vars"] == {"OPENAI_API_KEY": "key"}
     assert "scheduling_strategy" not in calls["options"]
@@ -223,6 +226,60 @@ def test_worker_task_failure(monkeypatch):
     assert result["ok"] is False
     assert result["error"] == "RuntimeError: benchmark failed"
     assert "RuntimeError: benchmark failed" in result["stderr"]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_listener_shutdown(monkeypatch, fails):
+    listener_started = threading.Event()
+    release_listener = threading.Event()
+    listeners = []
+    thread_errors = []
+    monkeypatch.setattr(threading, "excepthook", thread_errors.append)
+
+    def get_result(_task_ref):
+        listeners.append(threading.current_thread())
+        listener_started.set()
+        release_listener.wait(timeout=5)
+        if fails:
+            raise RuntimeError("Ray task failed")
+        return {"ok": True}
+
+    worker = Worker(SimpleNamespace(get=get_result), object(), "runner-1", 1, 1.0)
+    worker.task_ref = object()
+
+    async def exercise():
+        result_task = asyncio.create_task(worker.result_async())
+        while not listener_started.is_set():
+            await asyncio.sleep(0.001)
+        result_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await result_task
+
+    try:
+        asyncio.run(asyncio.wait_for(exercise(), timeout=2))
+    finally:
+        release_listener.set()
+        for listener in listeners:
+            listener.join(timeout=2)
+
+    assert listeners and not listeners[0].is_alive()
+    assert thread_errors == []
+
+
+def test_async_result_failure():
+    error = RuntimeError("Ray task failed")
+
+    def get_result(_task_ref):
+        raise error
+
+    worker = Worker(SimpleNamespace(get=get_result), object(), "runner-1", 1, 1.0)
+    with pytest.raises(RuntimeError, match="has not started"):
+        asyncio.run(worker.result_async())
+
+    worker.task_ref = object()
+    with pytest.raises(RuntimeError, match="Ray task failed") as caught:
+        asyncio.run(worker.result_async())
+    assert caught.value is error
 
 
 def test_actor_resource_options(monkeypatch):

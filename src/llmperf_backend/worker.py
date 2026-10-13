@@ -1,5 +1,7 @@
 """Ray-backed execution abstraction for one durable benchmark Runner."""
 
+import asyncio
+from concurrent.futures import Future
 from contextlib import redirect_stderr, redirect_stdout
 import os
 import threading
@@ -193,6 +195,33 @@ class Worker:
         if self.task_ref is None:
             raise RuntimeError(f"Worker {self.runner_id} has not started")
         return self.ray.get(self.task_ref)
+
+    async def result_async(self) -> Dict[str, Any]:
+        """Wait for the Ray result without blocking the Scheduler event loop."""
+
+        task_ref = self.task_ref
+        if task_ref is None:
+            raise RuntimeError(f"Worker {self.runner_id} has not started")
+        result_future: Future[Dict[str, Any]] = Future()
+
+        def wait_for_result() -> None:
+            if not result_future.set_running_or_notify_cancel():
+                return
+            try:
+                result = self.ray.get(task_ref)
+            except Exception as exc:
+                result_future.set_exception(exc)
+            else:
+                result_future.set_result(result)
+
+        result_listener = threading.Thread(
+            target=wait_for_result,
+            name=f"llmperf-worker-result-{self.runner_id}",
+            daemon=True,
+        )
+        result_listener.start()
+        # The bridge safely ignores late results after cancellation or loop closure.
+        return await asyncio.wrap_future(result_future)
 
     def task_id(self) -> Optional[str]:
         if self.task_ref is None:

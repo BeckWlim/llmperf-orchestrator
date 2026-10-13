@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+import threading
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from llmperf import common_metrics
@@ -19,7 +20,7 @@ from llmperf_backend.scheduler import (
 )
 from llmperf_backend.artifacts import DatasetResolution
 from llmperf_backend.artifacts import TokenizerResolution
-from llmperf_backend.worker import WORKER_DATASET_PATH
+from llmperf_backend.worker import Worker, WORKER_DATASET_PATH
 
 
 class UnusedRepository:
@@ -363,7 +364,8 @@ def test_worker_execution(tmp_path: Path, monkeypatch):
         def ready(self):
             return self.task_ref is not None
 
-        def result(self):
+        async def result_async(self):
+            await asyncio.sleep(0)
             return {
                 "ok": True,
                 "summary": {
@@ -418,6 +420,41 @@ def test_worker_execution(tmp_path: Path, monkeypatch):
     assert repository.finished is None
     assert calls["closed"] is True
     assert scheduler.status()["active_workers"] == 0
+
+
+def test_async_worker_wait():
+    listener_started = threading.Event()
+    release_listener = threading.Event()
+
+    def get_result(_task_ref):
+        listener_started.set()
+        release_listener.wait(timeout=1)
+        return {"ok": True}
+
+    repository = ExecutionRepository(cancel=True)
+    scheduler = Scheduler(
+        repository,
+        SchedulerConfig(poll_interval_seconds=0.001),
+        DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
+        ProviderRegistry.from_environment(
+            {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
+        ),
+    )
+    worker = Worker(SimpleNamespace(get=get_result), object(), "runner-1", 1, 1.0)
+    worker.task_ref = object()
+
+    async def exercise():
+        scheduler._stop = asyncio.Event()
+        payload = await scheduler._wait_worker(worker, "runner-1")
+        release_listener.set()
+        await asyncio.sleep(0)
+        scheduler._stop = None
+        return payload
+
+    payload = asyncio.run(exercise())
+
+    assert payload is None
+    assert listener_started.is_set()
 
 
 def test_preworker_cancel(tmp_path: Path, monkeypatch):
