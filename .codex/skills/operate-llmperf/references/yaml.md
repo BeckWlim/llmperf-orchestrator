@@ -113,6 +113,20 @@ resolved tokenizer provenance and `task_context` are Backend-owned fields.
 
 ## Task definition grammar
 
+Use `run: {name: batch}` for a whole multi-request Runner. It inherits the definition's
+`runner` settings, including `max_completed_requests` and `concurrent_requests`. Put it
+inside `repeat` for serial batches and use independent `instances.matrix` families for
+independent progression. Batch-only definitions omit `payloads`; `invoke` still requires
+an explicit payload and always sends one request. `run` supports `role` and `after_seconds`,
+but not conversation or payload fields. Both node kinds advance on committed success.
+
+Batch dataset seeds use `batch-v1`: task seed, sorted matrix coordinates, trial index,
+and expanded node path (including repeat indices). Task seeds accept unsigned 64-bit
+integers. Legacy invoke payload seeds remain unchanged. See
+`examples/example-batch-sequence.yaml`. Eight families with 100 batches of 256 requests
+compile to 800 nodes and 204,800 target requests, with peak concurrency 64 when each batch
+allows eight requests. Counts inside a Runner must be included in safety estimates.
+
 `benchmark.concurrent_requests` bounds requests within an ordinary Runner. Backend
 `scheduler.ray_actor_max_concurrency` bounds each shared actor (default eight). Eight actors
 provide 64 slots; `LLMPERF_RUNNERS_MAX=64` allows 64 atomic Runners to fill them. Dependencies

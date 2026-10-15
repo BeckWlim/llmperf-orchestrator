@@ -386,7 +386,12 @@ def get_token_throughput_latencies(
         raise ValueError(
             "grouped task contexts require one concurrent request per node"
         )
-    task_payload_seed = task_context.get("payload_seed") if task_context else None
+    atomic_context = (
+        task_context
+        if task_context and task_context.get("execution_kind", "atomic") == "atomic"
+        else None
+    )
+    task_payload_seed = atomic_context.get("payload_seed") if atomic_context else None
     effective_dataset_seed = (
         int(task_payload_seed) if task_payload_seed is not None else dataset_seed
     )
@@ -441,7 +446,7 @@ def get_token_throughput_latencies(
     base_prompt_count = (
         int(cache_probe["trials"]) if cache_probe else max_num_completed_requests
     )
-    if task_context and base_prompt_count != 1:
+    if atomic_context and base_prompt_count != 1:
         raise ValueError("compiled task nodes must contain exactly one request")
     num_output_tokens_list = [
         sample_random_positive_int(mean_output_tokens, stddev_output_tokens)
@@ -456,7 +461,7 @@ def get_token_throughput_latencies(
     if preparation_actors and not (
         (prompt_dataset_source.is_external and dataset_prompt_mode != "concatenate")
         or cache_probe
-        or task_context
+        or atomic_context
         or task_contexts
         or dataset_repeat_count != 1
     ):
@@ -498,8 +503,8 @@ def get_token_throughput_latencies(
         if prompt_stream is not None
         else prompt_evidence[0]["source"]
     )
-    if task_context and task_context.get("prompt_text") is not None:
-        literal_prompt = str(task_context["prompt_text"])
+    if atomic_context and atomic_context.get("prompt_text") is not None:
+        literal_prompt = str(atomic_context["prompt_text"])
         prompts = [(literal_prompt, get_token_length(literal_prompt))]
         prompt_evidence = [
             {

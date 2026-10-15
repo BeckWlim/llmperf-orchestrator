@@ -10,12 +10,16 @@ configurable concurrency, and per-request results stored in PostgreSQL.
 - **Flexible concurrency:** a shared Ray actor pool serves independent requests across
   Runners; eight actors support 64 request slots by default.
 - **Composable experiments:** combine sequences, parallel branches, repeats, delay
-  matrices, and deterministic payload replay.
+  matrices, and deterministic payload replay. Task `run` steps execute multi-request
+  Runners, letting families advance through independent batch sequences.
 - **Multi-turn conversations:** pass committed message history between ordered invokes.
 - **Performance evidence:** measure latency, throughput, errors, and available cache
   counters; export JSON and prepare HTML reports.
 - **Controlled execution:** admission limits and runtime resource guards bound load;
   Provider credentials stay in Backend configuration.
+- **Provider configuration isolation:** define `api_key` or `api_key_env` in
+  `providers.yaml`, including empty keys. Invalid Provider configuration leaves the
+  control plane available; failed reloads retain the active profiles.
 
 Tokenization runs during prompt preparation. By default, output token counts come from
 server usage; missing counts remain unavailable.

@@ -586,6 +586,8 @@ class Scheduler:
                     self._atomic_executor,
                 )
                 if runner["benchmark"].get("task_context")
+                and runner["benchmark"]["task_context"].get("execution_kind", "atomic")
+                == "atomic"
                 and self._request_router is not None
                 else Worker(
                     self._ray_module,

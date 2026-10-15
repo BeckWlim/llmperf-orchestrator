@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 import threading
+import pytest
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from llmperf import common_metrics
@@ -374,7 +375,8 @@ def _execution_runner():
     }
 
 
-def test_worker_execution(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("batch", [False, True])
+def test_worker_execution(tmp_path: Path, monkeypatch, batch):
     calls = {}
 
     class FakeWorker:
@@ -429,10 +431,16 @@ def test_worker_execution(tmp_path: Path, monkeypatch):
     scheduler._ray_module = object()
     scheduler._worker_remote = object()
     monkeypatch.setattr(scheduler_module, "Worker", FakeWorker)
+    if batch:
+        # A non-null router enables the atomic path; batch lineage must still select Worker.
+        monkeypatch.setattr(scheduler, "_request_router", SimpleNamespace())
 
     async def exercise():
         scheduler._stop = asyncio.Event()
-        await scheduler._execute(_execution_runner())
+        runner = _execution_runner()
+        if batch:
+            runner["benchmark"]["task_context"] = {"execution_kind": "batch"}
+        await scheduler._execute(runner)
         scheduler._stop = None
 
     asyncio.run(exercise())

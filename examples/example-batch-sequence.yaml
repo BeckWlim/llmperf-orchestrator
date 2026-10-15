@@ -1,0 +1,40 @@
+version: "1.0.0"
+wait: true
+campaign:
+  name: independent-family-batches
+  description: Two families advance independently through two four-request batches.
+task_definitions:
+  - name: families
+    instances:
+      matrix:
+        family: [1, 2]
+      trials: 1
+      seed: 20261014174544
+    workflow:
+      - repeat:
+          name: rounds
+          count: 2
+          node:
+            run:
+              name: batch
+    runner:
+      label: family
+      benchmark:
+        # Choose a configured Provider and model before submission.
+        provider: dfs-chat
+        model: spark-x2.5-1.7b-L4
+        tokenizer:
+          id: hf-internal-testing/llama-tokenizer
+          revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0
+          use_fast: true
+        timeout_seconds: 60
+        max_completed_requests: 4
+        concurrent_requests: 2
+        mean_input_tokens: 128
+        stddev_input_tokens: 0
+        shared_prefix_tokens: 96
+        mean_output_tokens: 8
+        stddev_output_tokens: 0
+        output_token_count: provider
+        additional_sampling_params:
+          temperature: 0

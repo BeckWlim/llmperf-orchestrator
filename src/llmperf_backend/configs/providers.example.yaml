@@ -3,7 +3,7 @@ providers:
   aliyun:
     adapter: openai
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    # Read from backend.env or the Backend process environment; no inline keys.
+    # Read from backend.env/process environment, or replace this field with api_key.
     api_key_env: LLMPERF_PROVIDER_ALIYUN_KEY
     discovery:
       mode: openai
@@ -12,6 +12,7 @@ providers:
   local:
     adapter: openai
     base_url: http://127.0.0.1:8001/v1
+    api_key: ""  # A keyless endpoint; a private Provider file may hold an actual key.
     models: [local-model]
     discovery:
       mode: static

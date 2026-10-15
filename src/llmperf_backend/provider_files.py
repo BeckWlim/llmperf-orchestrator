@@ -1,10 +1,17 @@
-"""Strict YAML/JSON Provider documents with environment-backed credentials."""
+"""Strict YAML/JSON Provider documents with optional inline or environment credentials."""
 
 import json
 from pathlib import Path
 from typing import Dict, List, Literal, Mapping, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    model_validator,
+)
 import yaml
 
 from llmperf.version import ProtocolVersion
@@ -34,11 +41,18 @@ class ProviderFileProfile(_StrictDocument):
         "openai"
     )
     base_url: str = ""
+    api_key: Optional[SecretStr] = None
     api_key_env: Optional[str] = None
     models: List[str] = Field(default_factory=list)
     discovery: ProviderDiscoveryConfig = Field(default_factory=ProviderDiscoveryConfig)
     worker_api_base_env: Optional[str] = None
     worker_api_key_env: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_credentials(self) -> "ProviderFileProfile":
+        if self.api_key is not None and self.api_key_env is not None:
+            raise ValueError("Specify api_key or api_key_env, not both")
+        return self
 
     def resolve(
         self, provider_id: str, environment: Mapping[str, str]
@@ -64,28 +78,37 @@ class ProviderFileProfile(_StrictDocument):
         source_env = self.api_key_env
         if source_env is not None:
             _validate_environment_name(provider_id, "api_key_env", source_env)
-            if source_env not in environment or not environment[source_env]:
-                raise ProviderConfigError(
-                    f"Provider {provider_id!r} credential environment variable {source_env!r} is not set"
-                )
+        if self.api_key is not None:
+            raw_key = self.api_key.get_secret_value()
+        elif source_env is not None:
+            raw_key = environment.get(source_env, "")
+        else:
+            raw_key = ""
         base_env = _validate_environment_name(
             provider_id,
             "worker_api_base_env",
-            self.worker_api_base_env
-            or DEFAULT_BASE_VARIABLES.get(self.adapter, "OPENAI_API_BASE"),
+            (
+                self.worker_api_base_env
+                if self.worker_api_base_env is not None
+                else DEFAULT_BASE_VARIABLES.get(self.adapter, "OPENAI_API_BASE")
+            ),
         )
         key_env = _validate_environment_name(
             provider_id,
             "worker_api_key_env",
-            self.worker_api_key_env
-            or DEFAULT_KEY_VARIABLES.get(self.adapter, "OPENAI_API_KEY"),
+            (
+                self.worker_api_key_env
+                if self.worker_api_key_env is not None
+                else DEFAULT_KEY_VARIABLES.get(self.adapter, "OPENAI_API_KEY")
+            ),
         )
-        models_path = "/" + self.discovery.path.strip().lstrip("/")
+        discovery_path = self.discovery.path.strip() or "/models"
+        models_path = "/" + discovery_path.lstrip("/")
         return ProviderProfile(
             provider_id=provider_id,
             adapter=self.adapter,
             api_base=api_base,
-            api_key=environment[source_env] if source_env is not None else "",
+            api_key=raw_key.strip(),
             api_base_env=base_env,
             api_key_env=key_env,
             discovery=discovery_mode,
@@ -147,7 +170,7 @@ def load_provider_file(
         else:
             raise ProviderConfigError("Provider file must use .yaml, .yml, or .json")
         document = ProviderFileDocument.model_validate(raw_document)
-    except (yaml.YAMLError, json.JSONDecodeError) as exc:
+    except (yaml.YAMLError, json.JSONDecodeError):
         # Parser context can contain credentials accidentally pasted into a file.
         raise ProviderConfigError(
             f"Invalid Provider document syntax in {path}"

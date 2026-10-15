@@ -93,16 +93,23 @@ Edit the single `~/.config/llmperf/providers.yaml` file to define all Provider P
 `providers.json` is also supported with the same structure. Fields include `adapter`,
 `base_url`, `api_key_env` (a credential variable name), `models` (a list), and nested
 `discovery` settings. Optional `worker_api_base_env` and `worker_api_key_env` select the
-adapter's destination environment variables. Omit `api_key_env` for an unauthenticated
-endpoint; if specified, its variable must exist and be nonempty. Credential values stay
-in `backend.env` or the Backend process environment, with process values taking precedence.
+adapter's destination environment variables. Set `api_key` directly in this Backend-owned
+file, or use `api_key_env` to reference `backend.env` or the process environment. These two
+fields are mutually exclusive. Empty keys and unset referenced variables are allowed;
+OpenAI-compatible requests omit Authorization when no key is configured. Process values
+take precedence for environment references. Protect Provider files containing keys like
+other credential files; keys are excluded from public Provider responses.
 
 Set `LLMPERF_PROVIDERS_FILE` to select another YAML/JSON file; relative paths resolve beside
 `backend.env`. Otherwise the Backend finds one `providers.yaml`, `providers.yml`, or
 `providers.json` beside that environment file. Multiple matches require explicit selection.
 A selected file owns all profiles, so legacy `LLMPERF_PROVIDER_*` definition fields do not
 override it. Without a Provider file, legacy environment profiles still work. Invalid files,
-unknown fields, duplicate IDs/keys, and missing referenced credentials reject the candidate.
+unknown fields, and duplicate IDs/keys reject the candidate. At startup, Provider loading
+errors leave the control plane available with no active profiles and a configuration error
+visible in `llmperfctl provider list`. Fix the file and run `llmperfctl provider reload`.
+A failed reload keeps the previously active profiles. Core database and authentication
+configuration still require valid settings.
 
 Start the service:
 
@@ -163,6 +170,13 @@ llmperfctl runner start -f examples/example-smoke.yaml --wait
 ```
 
 ### 3. Run a multi-round Campaign
+
+For independent family sequences, use the bounded
+[`example-batch-sequence.yaml`](../examples/example-batch-sequence.yaml). Each `run` step
+dispatches a whole Runner with its configured request count and concurrency. A repeated
+step waits for the preceding Runner's committed success, while other family instances
+advance independently. This differs from `campaign.rounds`, which retains a barrier
+across every family. Batch-only task definitions do not need `payloads`.
 
 Preview and submit the bounded two-round RunnerPlan example:
 

@@ -1446,6 +1446,12 @@ class RunnerRepository:
                                         "after_seconds": node.after_seconds,
                                         "role": node.role,
                                         "payload_id": node.payload_id,
+                                        "execution_kind": node.runner_template[
+                                            "benchmark"
+                                        ]["task_context"]["execution_kind"],
+                                        "dataset_seed": node.runner_template[
+                                            "benchmark"
+                                        ]["dataset_seed"],
                                         "parallel_leader": node.parallel_leader,
                                         "parallel_size": node.parallel_size,
                                     }
@@ -2399,11 +2405,12 @@ class RunnerRepository:
         instance_id = context.get("instance_id")
         node_id = context.get("node_id")
         payload_id = context.get("payload_id")
+        batch_execution = context.get("execution_kind", "atomic") == "batch"
         if not isinstance(instance_id, str):
             return
         if not isinstance(node_id, str):
             return
-        if not isinstance(payload_id, str):
+        if not batch_execution and not isinstance(payload_id, str):
             return
 
         instance = (
@@ -2428,8 +2435,14 @@ class RunnerRepository:
             instance.error = f"task node {node_id} has no originating Dispatch"
             return
 
-        started_at = request_started_at or runner.started_at or occurred_at
-        completed_at = request_completed_at or occurred_at
+        started_at = (
+            (runner.started_at or occurred_at)
+            if batch_execution
+            else (request_started_at or runner.started_at or occurred_at)
+        )
+        completed_at = (
+            occurred_at if batch_execution else (request_completed_at or occurred_at)
+        )
         source_lineage = dict(source.lineage or {})
         source_lineage["actual_started_at"] = started_at.isoformat()
         source_lineage["actual_completed_at"] = completed_at.isoformat()
@@ -2440,6 +2453,7 @@ class RunnerRepository:
         nodes = dict(outcome.get("nodes") or {})
         nodes[node_id] = {
             "role": context.get("role"),
+            "execution_kind": context.get("execution_kind", "atomic"),
             "payload_id": payload_id,
             "started_at": started_at.isoformat(),
             "completed_at": completed_at.isoformat(),
@@ -2462,38 +2476,41 @@ class RunnerRepository:
             instance.error = f"task node {node_id} ended as {terminal_status}"
             await self._cancel_task_dispatches(session, instance_id)
             return
-        if not request_prompt_hash:
-            instance.state = "failed"
-            instance.error = f"task node {node_id} omitted prompt_hash"
-            await self._cancel_task_dispatches(session, instance_id)
-            return
+        if not batch_execution:
+            if not request_prompt_hash:
+                instance.state = "failed"
+                instance.error = f"task node {node_id} omitted prompt_hash"
+                await self._cancel_task_dispatches(session, instance_id)
+                return
 
-        checkpoint = dict(instance.checkpoint or {})
-        payload_hashes = dict(checkpoint.get("payload_hashes") or {})
-        expected_hash = payload_hashes.get(payload_id)
-        if expected_hash is not None and expected_hash != request_prompt_hash:
-            instance.state = "failed"
-            instance.error = f"payload {payload_id} replay changed prompt_hash"
-            await self._cancel_task_dispatches(session, instance_id)
-            return
-        payload_hashes[payload_id] = request_prompt_hash
-        checkpoint["payload_hashes"] = payload_hashes
-        payload_evidence = dict(checkpoint.get("payload_evidence") or {})
-        expected_evidence = payload_evidence.get(payload_id)
-        current_evidence = (
-            dict(request_payload_evidence)
-            if request_payload_evidence is not None
-            else None
-        )
-        if expected_evidence is not None and expected_evidence != current_evidence:
-            instance.state = "failed"
-            instance.error = f"payload {payload_id} replay changed selection evidence"
-            await self._cancel_task_dispatches(session, instance_id)
-            return
-        if current_evidence is not None:
-            payload_evidence[payload_id] = current_evidence
-            checkpoint["payload_evidence"] = payload_evidence
-        instance.checkpoint = json_safe(checkpoint)
+            checkpoint = dict(instance.checkpoint or {})
+            payload_hashes = dict(checkpoint.get("payload_hashes") or {})
+            expected_hash = payload_hashes.get(payload_id)
+            if expected_hash is not None and expected_hash != request_prompt_hash:
+                instance.state = "failed"
+                instance.error = f"payload {payload_id} replay changed prompt_hash"
+                await self._cancel_task_dispatches(session, instance_id)
+                return
+            payload_hashes[payload_id] = request_prompt_hash
+            checkpoint["payload_hashes"] = payload_hashes
+            payload_evidence = dict(checkpoint.get("payload_evidence") or {})
+            expected_evidence = payload_evidence.get(payload_id)
+            current_evidence = (
+                dict(request_payload_evidence)
+                if request_payload_evidence is not None
+                else None
+            )
+            if expected_evidence is not None and expected_evidence != current_evidence:
+                instance.state = "failed"
+                instance.error = (
+                    f"payload {payload_id} replay changed selection evidence"
+                )
+                await self._cancel_task_dispatches(session, instance_id)
+                return
+            if current_evidence is not None:
+                payload_evidence[payload_id] = current_evidence
+                checkpoint["payload_evidence"] = payload_evidence
+            instance.checkpoint = json_safe(checkpoint)
 
         dispatch_rows_statement = self._task_dispatch_rows_statement(instance_id)
         rows = list((await session.execute(dispatch_rows_statement)).all())
@@ -2588,7 +2605,11 @@ class RunnerRepository:
             if runner is None or runner.status != RUNNING or runner.cancel_requested:
                 return False
             completed_at = utcnow()
-            if runner.benchmark_config.get("task_context") and len(safe_requests) != 1:
+            context = runner.benchmark_config.get("task_context") or {}
+            atomic_execution = (
+                bool(context) and context.get("execution_kind", "atomic") == "atomic"
+            )
+            if atomic_execution and len(safe_requests) != 1:
                 raise ValueError(
                     "Atomic invocation requires exactly one request result"
                 )
@@ -2607,8 +2628,7 @@ class RunnerRepository:
             request_completed_at = None
             request_prompt_hash = None
             request_payload_evidence = None
-            context = (runner.benchmark_config or {}).get("task_context")
-            if isinstance(context, Mapping) and safe_requests:
+            if atomic_execution and safe_requests:
                 request_starts = []
                 request_completions = []
                 for request in safe_requests:

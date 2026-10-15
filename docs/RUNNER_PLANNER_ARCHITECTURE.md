@@ -2,13 +2,13 @@
 
 ## Purpose
 
-Planner turns durable, time-qualified work into ordinary queued Runners. It supports both
-recurring RunnerPlans and dependency-based task Dispatches without owning execution.
+Planner turns recurring RunnerPlan occurrences into durable pending work. The runtime
+coordinator materializes ready task nodes, including atomic `invoke` and batch `run`, as
+queued Runners. A batch node owns one whole Runner and advances after committed success.
 
 ```text
-RunnerPlan cursor ──┐
-                    ├─> Planner transaction -> queued Runner -> Scheduler -> Worker
-Task Dispatch DAG ──┘
+RunnerPlan cursor → Planner → pending occurrence → Runner → Scheduler → Worker
+Task Dispatch DAG → Runtime coordinator → eligible Runner → Scheduler → Worker
 ```
 
 Scheduler remains the execution owner. Waiting schedules and dependency delays consume no

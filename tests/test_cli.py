@@ -1741,6 +1741,18 @@ def test_provider_output(capsys):
     assert "glm-5.2, glm-5.3, glm-5.4" in output
     assert not output.lstrip().startswith("{")
 
+    error_arguments = build_parser().parse_args(["provider", "list"])
+    render_result(
+        adapt_cli_response(
+            error_arguments,
+            {
+                "items": [],
+                "configuration_error": "Correct configuration and reload Providers.",
+            },
+        )
+    )
+    assert "Configuration error: Correct configuration" in capsys.readouterr().out
+
     models = {
         "provider": "zhipu",
         "source": "static",

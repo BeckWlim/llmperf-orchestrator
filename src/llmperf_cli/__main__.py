@@ -421,12 +421,21 @@ def print_task_preview(document: Dict[str, Any]) -> None:
                     f"    {graph_line}  "
                     f"+{_table_value(node.get('after_seconds'), '0')}s "
                     f"role={_table_value(node.get('role'))} "
-                    f"payload={_table_value(node.get('payload_id'))}"
+                    f"payload={_table_value(node.get('payload_id'))} "
+                    f"execution={_table_value(node.get('execution_kind'), 'atomic')}"
                 )
                 if "payload_seed" in node:
                     print(
                         "      debug: "
                         f"payload_seed={_table_value(node.get('payload_seed'))}"
+                    )
+                if "dataset_seed" in node:
+                    print(
+                        f"      debug: dataset_seed={_table_value(node.get('dataset_seed'))}"
+                    )
+                if node.get("execution_kind") == "batch":
+                    print(
+                        f"      batch: requests={_table_value(node.get('max_completed_requests'))} concurrency={_table_value(node.get('concurrent_requests'))}"
                     )
                 if int(node.get("group_size") or 1) > 1:
                     print(
@@ -559,6 +568,8 @@ def _compact_timestamp(value: Any) -> str:
 
 
 def print_provider_table(document: Dict[str, Any]) -> None:
+    if document.get("configuration_error"):
+        print(f"Configuration error: {document['configuration_error']}")
     print(
         f"{'ID':<16} {'ADAPTER':<10} {'KEY':<5} {'DISCOVERY':<11} "
         f"{'TYPICAL MODELS (UP TO 3)':<46} BASE URL"

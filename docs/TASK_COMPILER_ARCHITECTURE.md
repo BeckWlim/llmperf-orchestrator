@@ -7,6 +7,19 @@ It does not schedule work, wait for time to pass, call Providers, or persist aut
 state. Its output is a deterministic intermediate table that can be inspected before any
 runtime UUID or database record exists.
 
+Each execution node dispatches one Runner. `invoke` emits a single-request Runner with
+atomic payload replay and optional conversation history. `run` emits a batch Runner using
+the definition's `runner` template, preserving its request target and concurrency. Both
+compose with `sequence`, `repeat`, and `parallel`; dependency release follows committed
+Runner success. See [the batch sequence example](../examples/example-batch-sequence.yaml).
+
+Batch-only recipes may omit `payloads`. A batch's `batch-v1` dataset seed hashes the task
+seed, sorted instance dimensions, trial index, and expanded node path, including repeat
+positions. Task seeds accept unsigned 64-bit integers; legacy atomic payload seeds retain
+their existing derivation. Batch seeds are reproducible but differ from the old Campaign
+round seed algorithm. Compiler estimates count requests inside batches and weight peak
+request capacity separately from peak active Runners.
+
 The primary design goals are:
 
 1. make the YAML hierarchy match the task primitive hierarchy;

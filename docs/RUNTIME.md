@@ -28,6 +28,16 @@ Periodic reconciliation repairs missed wakeups and reconstructs the ready queue 
 restart. The bus is a bounded, coalescing in-process queue, not a second durable store.
 Planner handles scheduled occurrences; it does not select ready task-graph nodes.
 
+Task `run` nodes dispatch batch Runners through the ordinary Ray Worker; `invoke` nodes
+use atomic Workers. The explicit `task_context.execution_kind` selects the path; missing
+kind on legacy contexts means `atomic`. A batch retains all request metrics but advances
+its node only after the aggregate outcome commits. Its dependency delay anchors to batch
+completion, and its requests do not participate in atomic payload replay checks. Failed
+or cancelled batches terminate their instance's remaining nodes; other instances continue.
+Interrupted batches are not automatically replayed. Batch context and seed version live in
+existing JSON records, so this addition requires no database migration; deploy a compatible
+Backend before submitting `run` workflows, and drain such work before rolling back.
+
 ## Capacity
 
 ```text

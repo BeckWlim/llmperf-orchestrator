@@ -69,8 +69,11 @@ Provider definitions live in one versioned YAML or JSON document with a `provide
 relative paths resolve against that directory. A selected file is authoritative for all
 profiles; the legacy environment profile parser is used only when no file is selected or
 discovered. Missing explicit files, ambiguous discovery, duplicate keys/normalized IDs,
-unknown fields, and missing credential references fail validation without a partial reload.
-`api_key_env` references a source credential variable; optional `worker_api_key_env` and
+unknown fields fail validation without a partial reload. Provider startup errors are isolated:
+the API starts with an empty registry and a public configuration error, recoverable by reload.
+`api_key` stores an inline secret; alternatively `api_key_env` references a source variable.
+Empty or missing keys are allowed. Both sources cannot be specified together.
+Optional `worker_api_key_env` and
 `worker_api_base_env` specify adapter destinations. Source and destination credential
 variables for all profiles, including removed profiles, are stripped before injecting the
 selected profile into a Worker. Secret values are not part of public profile documents.

@@ -279,6 +279,9 @@ def _campaign_preview(document: Any, detailed: bool) -> Dict[str, Any]:
                         "after_seconds",
                         "role",
                         "payload_id",
+                        "execution_kind",
+                        "max_completed_requests",
+                        "concurrent_requests",
                         "conversation",
                         "payload_kind",
                         "execution_group",
@@ -287,6 +290,8 @@ def _campaign_preview(document: Any, detailed: bool) -> Dict[str, Any]:
                 )
                 if detailed and "payload_seed" in raw_node:
                     node["payload_seed"] = raw_node.get("payload_seed")
+                if detailed and "dataset_seed" in raw_node:
+                    node["dataset_seed"] = raw_node.get("dataset_seed")
                 nodes.append(node)
             instance = _pick(
                 raw_instance,
@@ -495,6 +500,10 @@ def _provider_list(document: Any, detailed: bool) -> Dict[str, Any]:
     source = _object(document, "provider.list")
     result = _items(source, "provider.list", _provider)
     result.update(_pick(source, ("generation", "loaded_at")))
+    configuration_error = source.get("configuration_error")
+    if configuration_error is not None and not isinstance(configuration_error, str):
+        raise ClientError("provider configuration_error must be a string or null")
+    result["configuration_error"] = configuration_error
     return result
 
 

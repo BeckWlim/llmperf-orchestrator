@@ -41,7 +41,9 @@ Apply these invariants:
    PostgreSQL. Runtime queues are reconstructible and non-authoritative. No SQLite fallback.
 6. Keep Provider endpoints and credentials in Backend-owned profiles. Put only
    the stable provider ID and model ID in workload YAML.
-7. Each compiled invoke sends one request and completes independently. Compatible parallel invokes
+7. Each compiled invoke sends one request and completes independently. A compiled `run`
+   dispatches a multi-request Runner and advances after its aggregate success commits.
+   Batch nodes retain their request limits and use ordinary batch Workers. Parallel invokes
    share actor capacity dynamically instead of waiting for a static group. Role names are
    metadata. Multi-turn successors require committed history. Readiness checks required tables and columns without a version marker. Older
    layouts need explicit migration or a fresh database; do not replay interrupted work.

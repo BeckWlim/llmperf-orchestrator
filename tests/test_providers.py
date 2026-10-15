@@ -69,9 +69,8 @@ def test_provider_document(tmp_path, suffix):
     "content",
     [
         'version: "1.0.0"\nproviders: {}',
-        'version: "1.0.0"\nproviders: {acme: {models: [model], api_key: secret-literal}}',
+        'version: "1.0.0"\nproviders: {acme: {models: [model], api_key: secret-literal, api_key_env: ACME_KEY}}',
         'version: "1.0.0"\nproviders: {acme: {models: [model], discovery: {cache_ttl_seconds: "5"}}}',
-        'version: "1.0.0"\nproviders: {acme: {models: [model], api_key_env: MISSING}}',
         'version: "1.0.0"\nproviders: {acme: {base_url: "https://user:secret-literal@example.com"}}',
         'version: "1.0.0"\nproviders: {acme: {models: [model], modles: [typo]}}',
         'version: "1.0.0"\nproviders: {acme: {models: [model]}, acme: {models: [other]}}',
@@ -87,6 +86,9 @@ def test_invalid_document(tmp_path, content):
     with pytest.raises(ProviderConfigError) as failure:
         load_provider_file(path, {})
     assert "secret-literal" not in str(failure.value)
+    registry = ProviderRegistry.from_loader(lambda: load_provider_file(path, {}))
+    assert registry.list_public() == []
+    assert registry.public_document()["configuration_error"]
 
 
 def test_json_duplicate(tmp_path):
@@ -96,6 +98,147 @@ def test_json_duplicate(tmp_path):
     )
     with pytest.raises(ProviderConfigError, match="duplicate"):
         load_provider_file(path, {})
+
+
+@pytest.mark.parametrize("environment", [{}, {"ACME_KEY": ""}, {"ACME_KEY": "   "}])
+def test_empty_credentials(tmp_path, environment):
+    path = tmp_path / "providers.yaml"
+    path.write_text(
+        'version: "1.0.0"\nproviders: {acme: {models: [model], api_key_env: ACME_KEY}}'
+    )
+    registry = ProviderRegistry.from_loader(
+        lambda: load_provider_file(path, environment)
+    )
+    assert registry.require("acme").api_key == ""
+    assert registry.list_public()[0]["api_key_configured"] is False
+    assert (
+        registry.worker_environment("acme", {"OPENAI_API_KEY": "unrelated-secret"})
+        == {}
+    )
+
+
+def test_startup_recovery(tmp_path, caplog):
+    path = tmp_path / "providers.yaml"
+    registry = ProviderRegistry.from_loader(lambda: load_provider_file(path, {}))
+    assert registry.list_public() == []
+    assert registry.public_document()["configuration_error"]
+    path.write_text('version: "1.0.0"\nproviders: [ secret-literal')
+    with pytest.raises(ProviderConfigError):
+        registry.reload()
+    assert registry.generation == 0
+    path.write_text('version: "1.0.0"\nproviders: {acme: {models: [model]}}')
+    assert registry.reload()["configuration_error"] is None
+    assert registry.require("acme").static_models == ("model",)
+    assert "secret-literal" not in caplog.text
+
+
+def test_loader_failure(caplog):
+    def broken_loader():
+        raise ValueError("private-secret")
+
+    registry = ProviderRegistry.from_loader(broken_loader)
+    with pytest.raises(ProviderConfigError) as failure:
+        registry.reload()
+    assert "private-secret" not in str(failure.value)
+    assert "private-secret" not in caplog.text
+
+
+@pytest.mark.parametrize("key", ["inline-secret", "", "   "])
+def test_inline_credentials(tmp_path, key):
+    from llmperf_backend.provider_files import ProviderFileProfile
+
+    path = tmp_path / "providers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": "1.0.0",
+                "providers": {"acme": {"models": ["model"], "api_key": key}},
+            }
+        )
+    )
+    registry = ProviderRegistry.from_loader(
+        lambda: load_provider_file(path, {"OPENAI_API_KEY": "unrelated-secret"})
+    )
+    profile = registry.require("acme")
+    assert profile.api_key == key.strip()
+    assert "inline-secret" not in repr(profile)
+    assert "inline-secret" not in repr(
+        ProviderFileProfile.model_validate({"api_key": key})
+    )
+    assert "inline-secret" not in json.dumps(registry.public_document())
+    worker = registry.worker_environment("acme", {"OPENAI_API_KEY": "unrelated-secret"})
+    assert worker.get("OPENAI_API_KEY", "") == key.strip()
+
+
+def test_default_credentials(tmp_path):
+    path = tmp_path / "providers.yaml"
+    path.write_text('version: "1.0.0"\nproviders: {local: {models: [model]}}')
+    registry = ProviderRegistry.from_loader(lambda: load_provider_file(path, {}))
+    assert registry.require("local").api_key == ""
+    assert registry.public_document()["configuration_error"] is None
+
+
+def test_shared_provider_parser(tmp_path):
+    path = tmp_path / "providers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": "1.0.0",
+                "providers": {
+                    "test": {
+                        "adapter": "anthropic",
+                        "base_url": "https://example.com/v1/",
+                        "api_key": "  secret  ",
+                        "models": ["a", "b"],
+                        "discovery": {
+                            "mode": "static",
+                            "path": "catalog",
+                            "cache_ttl_seconds": 42,
+                        },
+                        "worker_api_base_env": "CUSTOM_URL",
+                        "worker_api_key_env": "CUSTOM_KEY",
+                    }
+                },
+            }
+        )
+    )
+    legacy = ProviderRegistry.from_environment(
+        {
+            "LLMPERF_PROVIDER_TEST_ADAPTER": " ANTHROPIC ",
+            "LLMPERF_PROVIDER_TEST_URL": "https://example.com/v1/",
+            "LLMPERF_PROVIDER_TEST_KEY": "  secret  ",
+            "LLMPERF_PROVIDER_TEST_MODELS": "a, b",
+            "LLMPERF_PROVIDER_TEST_DISCOVERY": " STATIC ",
+            "LLMPERF_PROVIDER_TEST_PATH": "catalog",
+            "LLMPERF_PROVIDER_TEST_TTL": "42",
+            "LLMPERF_PROVIDER_TEST_URLVAR": "CUSTOM_URL",
+            "LLMPERF_PROVIDER_TEST_KEYVAR": "CUSTOM_KEY",
+        }
+    )
+    assert legacy.require("test") == load_provider_file(path, {})[0]
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("ADAPTER", "invalid"),
+        ("DISCOVERY", "invalid"),
+        ("TTL", "-1"),
+        ("TTL", "86401"),
+        ("TTL", "secret-literal"),
+        ("URLVAR", ""),
+        ("KEYVAR", ""),
+    ],
+)
+def test_invalid_legacy_fields(field, value):
+    with pytest.raises(ProviderConfigError) as failure:
+        ProviderRegistry.from_environment(
+            {
+                "LLMPERF_PROVIDER_TEST_MODELS": "a",
+                f"LLMPERF_PROVIDER_TEST_{field}": value,
+            }
+        )
+    assert "secret-literal" not in str(failure.value)
 
 
 def test_file_reload(tmp_path):

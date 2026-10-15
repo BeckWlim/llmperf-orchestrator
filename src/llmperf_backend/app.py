@@ -116,11 +116,31 @@ def _compile_campaign_task_preview(
                 for member in group
             }
             for node_row in instance_nodes[:node_limit]:
+                template_benchmark = definition.runner.benchmark
                 node_preview: Dict[str, Any] = {
                     "node_id": node_row.node_id,
                     "dependencies": list(node_row.dependencies),
                     "after_seconds": node_row.after_seconds,
                     "role": node_row.role,
+                    "execution_kind": node_row.execution_kind,
+                    "max_completed_requests": (
+                        1
+                        if node_row.execution_kind == "atomic"
+                        else (
+                            template_benchmark.max_completed_requests
+                            if template_benchmark is not None
+                            else None
+                        )
+                    ),
+                    "concurrent_requests": (
+                        1
+                        if node_row.execution_kind == "atomic"
+                        else (
+                            template_benchmark.concurrent_requests
+                            if template_benchmark is not None
+                            else None
+                        )
+                    ),
                     "payload_id": node_row.payload_id,
                     "conversation": node_row.conversation,
                     "payload_kind": (
@@ -130,7 +150,12 @@ def _compile_campaign_task_preview(
                     "group_size": execution_groups[node_row.node_id][1],
                 }
                 if include_debug:
-                    node_preview["payload_seed"] = node_row.payload_seed
+                    seed_field = (
+                        "dataset_seed"
+                        if node_row.execution_kind == "batch"
+                        else "payload_seed"
+                    )
+                    node_preview[seed_field] = node_row.payload_seed
                 node_previews.append(node_preview)
             instance_previews.append(
                 {
@@ -749,7 +774,12 @@ def create_app(
                 for key, value in definition_document.items()
                 if key != "runner"
             }
-            task_estimates.append(TaskCompiler.estimate(recipe_document))
+            task_estimates.append(
+                TaskCompiler.estimate(
+                    recipe_document,
+                    benchmark=task_definition["runner_template"]["benchmark"],
+                )
+            )
         LOGGER.info(
             "Campaign artifact validation completed: campaign=%s artifacts=%d "
             "bytes=%d",

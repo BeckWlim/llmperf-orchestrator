@@ -23,6 +23,7 @@ Scheduler owns the fixed shared Ray pool and bounded Worker handles. Waiting nev
 a request slot. See `docs/RUNTIME.md` for the concrete runtime and storage contract.
 
 Atomic invokes use lightweight Backend handles and cached tokenizers; ordinary batch Runners
+and compiled `run` batches
 use retry-free Ray tasks. Both share request actors across Runners. Never mutate process
 credentials, initialize Ray in a Worker, or connect an actor to PostgreSQL. Default capacity
 is eight actors times eight requests; the active Runner bound is independent.

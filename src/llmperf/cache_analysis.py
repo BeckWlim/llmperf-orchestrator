@@ -6,14 +6,7 @@ from statistics import median
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from llmperf import common_metrics
-
-
-def _valid_counter(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    if value < 0 or int(value) != value:
-        return None
-    return int(value)
+from llmperf.usage import normalize_counter
 
 
 def _quantile(values: Sequence[float], probability: float) -> Optional[float]:
@@ -52,8 +45,8 @@ def _summarize_cache_counters(
     invalid_requests = 0
     request_hits = 0
     for request in requests:
-        hit = _valid_counter(request.get(common_metrics.KV_CACHE_HIT_TOKENS))
-        miss = _valid_counter(request.get(common_metrics.KV_CACHE_MISS_TOKENS))
+        hit = normalize_counter(request.get(common_metrics.KV_CACHE_HIT_TOKENS))
+        miss = normalize_counter(request.get(common_metrics.KV_CACHE_MISS_TOKENS))
         normalized = request.get(common_metrics.NORMALIZED_USAGE)
         if isinstance(normalized, Mapping):
             schema = normalized.get("source_schema")
@@ -176,7 +169,7 @@ def analyze_cache_probe(
         if isinstance(normalized, Mapping) and normalized.get("valid") is False:
             return False
         return (
-            _valid_counter(request.get(common_metrics.KV_CACHE_HIT_TOKENS)) or 0
+            normalize_counter(request.get(common_metrics.KV_CACHE_HIT_TOKENS)) or 0
         ) > 0
 
     observed_hit = any(valid_hit(request) for request in paired_warm_requests)

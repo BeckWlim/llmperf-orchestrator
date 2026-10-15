@@ -124,6 +124,8 @@ def test_graph_compilation():
         "instances": 2,
         "nodes": 8,
         "runners": 8,
+        "requests": 8,
+        "peak_runners": 4,
         "max_concurrency": 1,
         "peak_requests": 4,
         "peak_actors": 4,

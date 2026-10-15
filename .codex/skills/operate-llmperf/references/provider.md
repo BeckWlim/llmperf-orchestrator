@@ -39,11 +39,15 @@ providers:
       cache_ttl_seconds: 300
 ```
 
-Keep credential values in `backend.env` via `llmperf-backend config set ... --stdin`, or
-export them in the service environment. `api_key_env` references the source variable;
-omit it for an unauthenticated endpoint. Optional `worker_api_base_env` and
+Set `api_key` in the Backend-owned Provider file, or keep credential values in `backend.env`
+via `llmperf-backend config set ... --stdin` or the service environment and use `api_key_env`.
+The two fields are mutually exclusive. Empty keys and unset referenced variables are allowed;
+OpenAI-compatible requests omit Authorization in that case. Protect inline-key files and
+never print their contents. Optional `worker_api_base_env` and
 `worker_api_key_env` override adapter destination variable names. Unknown fields, duplicate
-keys/normalized IDs, and missing referenced credentials reject the complete candidate.
+keys/normalized IDs reject the complete candidate. Startup loading errors leave the control
+plane available with no active profiles and a safe `configuration_error` in Provider list.
+Fix the configuration and reload. Failed reloads preserve the active profiles.
 
 `LLMPERF_PROVIDERS_FILE` selects an explicit file. Relative paths resolve beside the Backend
 environment file. Otherwise one `providers.yaml`, `providers.yml`, or `providers.json` in

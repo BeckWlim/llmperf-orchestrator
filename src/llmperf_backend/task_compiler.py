@@ -14,6 +14,7 @@ from typing import (
     Generic,
     Iterable,
     List,
+    Literal,
     Mapping,
     Optional,
     Sequence,
@@ -88,6 +89,14 @@ class InvokeConfig(CompilerModel):
         return self.role or self.name
 
 
+class RunConfig(CompilerModel):
+    """One bounded batch Runner using the definition's Runner template."""
+
+    name: str = Field(min_length=1, max_length=64)
+    role: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    after_seconds: TaskValue = 0
+
+
 class RepeatConfig(CompilerModel):
     """Bounded serial expansion of one nested node."""
 
@@ -113,13 +122,16 @@ class SequenceConfig(CompilerModel):
     steps: List[TaskNodeSpec] = Field(min_length=1, max_length=100)
 
 
-NodeConfig = Union[InvokeConfig, RepeatConfig, ParallelConfig, SequenceConfig]
+NodeConfig = Union[
+    InvokeConfig, RunConfig, RepeatConfig, ParallelConfig, SequenceConfig
+]
 
 
 class TaskNodeSpec(CompilerModel):
     """Readable one-key mapping from a YAML primitive to its configuration."""
 
     invoke: Optional[InvokeConfig] = None
+    run: Optional[RunConfig] = None
     repeat: Optional[RepeatConfig] = None
     parallel: Optional[ParallelConfig] = None
     sequence: Optional[SequenceConfig] = None
@@ -128,7 +140,7 @@ class TaskNodeSpec(CompilerModel):
     def validate_primitive(self) -> TaskNodeSpec:
         configured_primitives = [
             name
-            for name in ("invoke", "repeat", "parallel", "sequence")
+            for name in ("invoke", "run", "repeat", "parallel", "sequence")
             if getattr(self, name) is not None
         ]
         if len(configured_primitives) != 1:
@@ -136,7 +148,7 @@ class TaskNodeSpec(CompilerModel):
         return self
 
     def selected(self) -> Tuple[str, NodeConfig]:
-        for primitive_name in ("invoke", "repeat", "parallel", "sequence"):
+        for primitive_name in ("invoke", "run", "repeat", "parallel", "sequence"):
             primitive_config = getattr(self, primitive_name)
             if primitive_config is not None:
                 return primitive_name, primitive_config
@@ -207,7 +219,7 @@ class TaskInstancesConfig(CompilerModel):
 
     matrix: Dict[str, List[int]] = Field(default_factory=dict)
     trials: int = Field(default=1, ge=1, le=1_000)
-    seed: int = Field(default=11111, ge=0, le=2_147_483_647)
+    seed: int = Field(default=11111, ge=0, le=18_446_744_073_709_551_615)
 
     @field_validator("matrix")
     @classmethod
@@ -234,7 +246,7 @@ class TaskRecipe(CompilerModel):
 
     name: str = Field(min_length=1, max_length=200)
     instances: TaskInstancesConfig = Field(default_factory=TaskInstancesConfig)
-    payloads: Dict[str, TaskPayloadSpec] = Field(min_length=1, max_length=100)
+    payloads: Dict[str, TaskPayloadSpec] = Field(default_factory=dict, max_length=100)
     workflow: List[TaskNodeSpec] = Field(min_length=1, max_length=100)
 
     @model_validator(mode="before")
@@ -311,10 +323,11 @@ class CompiledNodeRow:
     dependencies: Tuple[str, ...]
     after_seconds: int
     role: str
-    payload_id: str
+    payload_id: Optional[str]
     payload_seed: int
     conversation: Optional[str] = None
     prompt_text: Optional[str] = None
+    execution_kind: Literal["atomic", "batch"] = "atomic"
 
 
 class CompilationTable:
@@ -370,7 +383,7 @@ class TaskNodeAssembly:
     after_seconds: int
     runner_template: Dict[str, Any]
     role: str
-    payload_id: str
+    payload_id: Optional[str]
     parallel_leader: Optional[str] = None
     parallel_size: int = 1
 
@@ -400,6 +413,17 @@ class InstanceContext:
     dimensions: Mapping[str, int]
     trial_index: int
     payloads: Mapping[str, TaskPayloadSpec]
+
+    def batch_seed(self, node_id: str) -> int:
+        coordinates = ";".join(
+            f"{key}={value}" for key, value in sorted(self.dimensions.items())
+        )
+        material = (
+            f"batch-v1\0{self.seed}\0{coordinates}\0{self.trial_index}\0{node_id}"
+        )
+        return int.from_bytes(
+            hashlib.sha256(material.encode("utf-8")).digest()[:8], "big"
+        )
 
     def payload_seed(self, payload_id: str) -> int:
         payload_spec = self.payloads.get(payload_id)
@@ -434,8 +458,9 @@ class GraphBuilder:
         dependencies: Tuple[str, ...],
         after_seconds: int,
         role: str,
-        payload_id: str,
+        payload_id: Optional[str],
         conversation: Optional[str] = None,
+        execution_kind: Literal["atomic", "batch"] = "atomic",
     ) -> str:
         if not node_id or len(node_id) > 120:
             raise ValueError("expanded task node IDs must contain 1-120 chars")
@@ -447,6 +472,8 @@ class GraphBuilder:
             raise ValueError(
                 f"task instance cannot exceed {MAX_NODES_PER_INSTANCE} nodes"
             )
+        if execution_kind == "atomic" and payload_id is None:
+            raise ValueError("atomic invocation requires a payload")
         compiled_row = CompiledNodeRow(
             instance_key=self.instance_key,
             node_id=node_id,
@@ -454,9 +481,18 @@ class GraphBuilder:
             after_seconds=after_seconds,
             role=role,
             payload_id=payload_id,
-            payload_seed=self.instance.payload_seed(payload_id),
+            payload_seed=(
+                self.instance.payload_seed(payload_id)
+                if payload_id is not None
+                else self.instance.batch_seed(node_id)
+            ),
             conversation=conversation,
-            prompt_text=self.instance.payloads[payload_id].text,
+            prompt_text=(
+                self.instance.payloads[payload_id].text
+                if payload_id is not None
+                else None
+            ),
+            execution_kind=execution_kind,
         )
         self._nodes.append(compiled_row)
         self._node_ids.add(node_id)
@@ -533,6 +569,41 @@ class InvokeNode(BaseNode):
             conversation=self.conversation,
         )
         return (emitted_node_id,)
+
+
+@dataclass(frozen=True)
+class RunNode(BaseNode):
+    role: str
+    after_seconds: TaskExpression
+
+    @classmethod
+    def from_config(cls, config: CompilerModel, depth: int) -> RunNode:
+        if not isinstance(config, RunConfig):
+            raise TypeError("run node requires RunConfig")
+        _validate_depth(depth)
+        return cls(
+            config.name,
+            config.role or config.name,
+            TaskExpression.from_value(config.after_seconds),
+        )
+
+    def expand(
+        self,
+        builder: GraphBuilder,
+        incoming_frontier: Tuple[str, ...],
+        path: Tuple[str, ...],
+        inherited_delay_seconds: int,
+    ) -> Tuple[str, ...]:
+        node_id = builder.emit(
+            node_id=_qualified_name(path, self.name),
+            dependencies=incoming_frontier,
+            after_seconds=inherited_delay_seconds
+            + self.after_seconds.resolve(builder.instance.dimensions),
+            role=self.role,
+            payload_id=None,
+            execution_kind="batch",
+        )
+        return (node_id,)
 
 
 @dataclass(frozen=True)
@@ -664,6 +735,7 @@ class SequenceNode(BaseNode):
 
 NODE_TYPES = {
     "invoke": InvokeNode,
+    "run": RunNode,
     "repeat": RepeatNode,
     "parallel": ParallelNode,
     "sequence": SequenceNode,
@@ -773,6 +845,7 @@ class TaskCompiler:
         cls,
         definition: Union[TaskRecipe, Mapping[str, Any]],
         requests_per_actor: int = 1,
+        benchmark: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, int]:
         if requests_per_actor < 1:
             raise ValueError("requests_per_actor must be positive")
@@ -784,9 +857,10 @@ class TaskCompiler:
         graph = TaskGraph.from_recipe(recipe)
         node_count = 0
         runner_count = 0
+        request_count = 0
+        peak_runners = 0
         max_concurrency = 0
         peak_requests = 0
-        peak_actors = 0
         coordinate_count = 0
         for coordinate_index, dimensions in enumerate(_matrix_coordinates(recipe)):
             coordinate_count += 1
@@ -801,14 +875,41 @@ class TaskCompiler:
             node_count += len(compiled_nodes) * recipe.instances.trials
             groups = parallel_request_groups(compiled_nodes)
             runner_count += len(groups) * recipe.instances.trials
-            max_concurrency = max(
-                max_concurrency, max((len(group) for group in groups), default=0)
+            batch_limit = int((benchmark or {}).get("max_completed_requests", 10))
+            batch_concurrency = min(
+                batch_limit, int((benchmark or {}).get("concurrent_requests", 1))
             )
-            request_weights = {group[0].node_id: len(group) for group in groups}
-            actor_weights = {
-                group[0].node_id: (len(group) + requests_per_actor - 1)
-                // requests_per_actor
-                for group in groups
+            request_count += (
+                sum(
+                    batch_limit if node.execution_kind == "batch" else 1
+                    for node in compiled_nodes
+                )
+                * recipe.instances.trials
+            )
+            runner_weights = {node.node_id: 1 for node in compiled_nodes}
+            peak_runners += (
+                max(
+                    (
+                        _weighted_peak(root, dimensions, runner_weights)
+                        for root in graph.roots
+                    ),
+                    default=0,
+                )
+                * recipe.instances.trials
+            )
+            max_concurrency = max(
+                max_concurrency,
+                max(
+                    (
+                        batch_concurrency if node.execution_kind == "batch" else 1
+                        for node in compiled_nodes
+                    ),
+                    default=0,
+                ),
+            )
+            request_weights = {
+                node.node_id: batch_concurrency if node.execution_kind == "batch" else 1
+                for node in compiled_nodes
             }
             peak_requests += (
                 max(
@@ -820,20 +921,12 @@ class TaskCompiler:
                 )
                 * recipe.instances.trials
             )
-            peak_actors += (
-                max(
-                    (
-                        _weighted_peak(root, dimensions, actor_weights)
-                        for root in graph.roots
-                    ),
-                    default=0,
-                )
-                * recipe.instances.trials
-            )
         return {
             "instances": coordinate_count * recipe.instances.trials,
             "nodes": node_count,
             "runners": runner_count,
+            "requests": request_count,
+            "peak_runners": peak_runners,
             "max_concurrency": max_concurrency,
             "peak_requests": peak_requests,
             "peak_actors": (peak_requests + requests_per_actor - 1)
@@ -842,7 +935,11 @@ class TaskCompiler:
 
     @classmethod
     def estimate_token_budget(
-        cls, definition: Mapping[str, Any], input_tokens: int, output_tokens: int
+        cls,
+        definition: Mapping[str, Any],
+        input_tokens: int,
+        output_tokens: int,
+        benchmark: Optional[Mapping[str, Any]] = None,
     ) -> int:
         recipe = TaskRecipe.model_validate(definition)
         graph = TaskGraph.from_recipe(recipe)
@@ -863,8 +960,14 @@ class TaskCompiler:
                     histories.get(node.conversation, 0) if node.conversation else 0
                 )
                 total += (
-                    history_tokens + user_tokens + output_tokens
-                ) * recipe.instances.trials
+                    (history_tokens + user_tokens + output_tokens)
+                    * recipe.instances.trials
+                    * (
+                        int((benchmark or {}).get("max_completed_requests", 10))
+                        if node.execution_kind == "batch"
+                        else 1
+                    )
+                )
                 if node.conversation:
                     histories[node.conversation] = (
                         history_tokens + user_tokens + output_tokens
@@ -918,7 +1021,7 @@ def _weighted_peak(
     path: Tuple[str, ...] = (),
 ) -> int:
     """Conservative overlap bound over the compiler's serial/parallel structure."""
-    if isinstance(node, InvokeNode):
+    if isinstance(node, (InvokeNode, RunNode)):
         return weights.get(_qualified_name(path, node.name), 0)
     nested_path = (*path, node.name)
     if isinstance(node, ParallelNode):
@@ -1024,19 +1127,16 @@ class TaskAssembler:
         node: CompiledNodeRow,
         instance_id: str,
     ) -> Dict[str, Any]:
-        from llmperf_backend.models import CompiledBenchmarkConfig
+        from llmperf_backend.models import BatchBenchmarkConfig, CompiledBenchmarkConfig
 
-        task_context = {
+        task_context: Dict[str, Any] = {
             "definition_id": self.context.definition_id,
             "instance_id": instance_id,
             "node_id": node.node_id,
             "role": node.role,
-            "payload_id": node.payload_id,
-            "payload_seed": node.payload_seed,
             "trial_index": instance.trial_index,
             "dimensions": dict(instance.dimensions),
-            "conversation": node.conversation,
-            "prompt_text": node.prompt_text,
+            "execution_kind": node.execution_kind,
         }
         benchmark = dict(self.context.runner_template["benchmark"])
         if node.conversation and benchmark.get("adapter") == "vertexai":
@@ -1049,20 +1149,27 @@ class TaskAssembler:
             raise ValueError(
                 "Conversation history cannot be overridden by sampling messages"
             )
-        benchmark.update(
-            {
-                "max_completed_requests": 1,
-                "concurrent_requests": 1,
-                "dataset_seed": node.payload_seed,
-                "task_context": task_context,
-            }
-        )
-        validated_benchmark = CompiledBenchmarkConfig.model_validate(benchmark)
+        benchmark["dataset_seed"] = node.payload_seed
+        benchmark["task_context"] = task_context
+        if node.execution_kind == "batch":
+            task_context.update(dataset_seed=node.payload_seed, seed_version="batch-v1")
+            batch_benchmark = BatchBenchmarkConfig.model_validate(benchmark)
+            benchmark_document = batch_benchmark.model_dump(mode="json")
+        else:
+            task_context.update(
+                payload_id=node.payload_id,
+                payload_seed=node.payload_seed,
+                conversation=node.conversation,
+                prompt_text=node.prompt_text,
+            )
+            benchmark.update(max_completed_requests=1, concurrent_requests=1)
+            atomic_benchmark = CompiledBenchmarkConfig.model_validate(benchmark)
+            benchmark_document = atomic_benchmark.model_dump(mode="json")
         prefix = (
             self.context.runner_template.get("label") or self.context.definition_name
         )
         return {
             "label": f"{prefix}:{node.node_id}"[:200],
             "metadata": dict(self.context.runner_template.get("metadata") or {}),
-            "benchmark": validated_benchmark.model_dump(mode="json"),
+            "benchmark": benchmark_document,
         }

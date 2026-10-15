@@ -73,19 +73,29 @@ class CacheProbeConfig(StrictModel):
     minimum_counter_coverage: float = Field(default=0.8, ge=0, le=1)
 
 
-class CompiledTaskContext(StrictModel):
-    """Compiler-owned identity for one atomic task-graph invocation."""
+class TaskExecutionContext(StrictModel):
+    """Compiler-owned identity shared by atomic and batch executions."""
 
     definition_id: str = Field(min_length=1, max_length=36)
     instance_id: str = Field(min_length=1, max_length=36)
     node_id: str = Field(min_length=1, max_length=120)
     role: str = Field(min_length=1, max_length=64)
-    payload_id: str = Field(min_length=1, max_length=64)
-    payload_seed: int = Field(ge=0, le=2_147_483_647)
     trial_index: int = Field(ge=0)
     dimensions: Dict[str, int] = Field(default_factory=dict)
+
+
+class CompiledTaskContext(TaskExecutionContext):
+    execution_kind: Literal["atomic"] = "atomic"
+    payload_id: str = Field(min_length=1, max_length=64)
+    payload_seed: int = Field(ge=0, le=2_147_483_647)
     conversation: Optional[str] = Field(default=None, min_length=1, max_length=64)
     prompt_text: Optional[str] = None
+
+
+class BatchTaskContext(TaskExecutionContext):
+    execution_kind: Literal["batch"] = "batch"
+    dataset_seed: int = Field(ge=0, le=18_446_744_073_709_551_615)
+    seed_version: Literal["batch-v1"] = "batch-v1"
 
 
 class DatasetSpec(StrictModel):
@@ -182,6 +192,20 @@ class CompiledBenchmarkConfig(ResolvedBenchmarkConfig):
             raise ValueError("compiled benchmark cannot define cache_probe")
         if self.max_completed_requests != 1 or self.concurrent_requests != 1:
             raise ValueError("compiled benchmark must contain exactly one request")
+        return self
+
+
+class BatchBenchmarkConfig(ResolvedBenchmarkConfig):
+    """Compiler-owned batch execution with ordinary Runner request limits."""
+
+    task_context: BatchTaskContext
+
+    @model_validator(mode="after")
+    def validate_batch(self) -> "BatchBenchmarkConfig":
+        if self.cache_probe is not None:
+            raise ValueError("compiled batch cannot define cache_probe")
+        if self.dataset_seed != self.task_context.dataset_seed:
+            raise ValueError("batch dataset seed must match task context")
         return self
 
 

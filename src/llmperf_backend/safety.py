@@ -224,10 +224,12 @@ def assess_workload(
         }
         template = item.get("runner_template", embedded_runner)
         benchmark = template.get("benchmark")
-        expansion = TaskCompiler.estimate(recipe_document, ray_actor_max_concurrency)
+        expansion = TaskCompiler.estimate(
+            recipe_document, ray_actor_max_concurrency, benchmark
+        )
         peak_requests += expansion["peak_requests"]
         peak_actors += expansion["peak_actors"]
-        requests = expansion["nodes"]
+        requests = expansion["requests"]
         runners_count = expansion["runners"]
         tokens_per_request = (
             int(benchmark["mean_input_tokens"]) + int(benchmark["mean_output_tokens"])
@@ -241,6 +243,7 @@ def assess_workload(
                 recipe_document,
                 int(benchmark["mean_input_tokens"]),
                 int(benchmark["mean_output_tokens"]),
+                benchmark,
             )
             if benchmark is not None
             else 0

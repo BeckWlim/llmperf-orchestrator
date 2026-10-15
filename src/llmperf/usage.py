@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, dataclass
 import json
+import math
 from typing import Any, Dict, Mapping, Optional
 
 from llmperf import common_metrics
@@ -9,10 +10,12 @@ from llmperf import common_metrics
 RAW_USAGE_LIMIT = 16_384
 
 
-def _counter(value: Any) -> Optional[int]:
+def normalize_counter(value: object) -> Optional[int]:
     """Return a valid non-negative integer counter, otherwise ``None``."""
 
     if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
         return None
     if value < 0 or int(value) != value:
         return None
@@ -87,7 +90,7 @@ def normalize_usage(usage: Mapping[str, Any]) -> NormalizedUsage:
 
     def checked(container: Mapping[str, Any], name: str, path: str) -> Optional[int]:
         value = container.get(name)
-        counter = _counter(value)
+        counter = normalize_counter(value)
         if value is not None and counter is None:
             invalid_counter_names.append(path)
         return counter

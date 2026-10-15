@@ -160,10 +160,8 @@ class OpenAIChatCompletionsClient(LLMClient):
         address = self.environment.get("OPENAI_API_BASE")
         if not address:
             raise ValueError("the environment variable OPENAI_API_BASE must be set.")
-        key = self.environment.get("OPENAI_API_KEY")
-        if not key:
-            raise ValueError("the environment variable OPENAI_API_KEY must be set.")
-        headers = {"Authorization": f"Bearer {key}"}
+        key = self.environment.get("OPENAI_API_KEY", "").strip()
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
         request_url = address.rstrip("/") + "/chat/completions"
         stream_idle_timeout = float(request_config.timeout_seconds or 180)
         transport_read_timeout = stream_idle_timeout + max(

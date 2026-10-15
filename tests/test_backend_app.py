@@ -131,6 +131,7 @@ def make_client(
     dataset_cache=None,
     provider_environment=None,
     auto_create_schema: bool = True,
+    provider_registry=None,
 ) -> ASGITestClient:
     config_path = tmp_path / "backend.yaml"
     config_path.write_text(
@@ -162,7 +163,7 @@ def make_client(
     return ASGITestClient(
         create_app(
             ConfigStore(config_path),
-            provider_registry=providers,
+            provider_registry=provider_registry or providers,
             tokenizer_cache=resolved_tokenizer_cache,
             dataset_cache=resolved_dataset_cache,
         )
@@ -224,6 +225,30 @@ def test_existing_schema(tmp_path, postgresql_url):
     with make_client(tmp_path, postgresql_url, auto_create_schema=False) as client:
         assert client.app.state.schema_state == "ready"
         assert client.get("/api/v1/runners").status_code == 200
+
+
+def test_provider_startup(tmp_path, postgresql_url):
+    from llmperf_backend.provider_files import load_provider_file
+
+    provider_path = tmp_path / "providers.yaml"
+    registry = ProviderRegistry.from_loader(
+        lambda: load_provider_file(provider_path, {})
+    )
+    with make_client(tmp_path, postgresql_url, provider_registry=registry) as client:
+        assert client.get("/health").status_code == 200
+        listed = client.get("/api/v1/providers").json()
+        assert listed["items"] == []
+        assert listed["configuration_error"]
+        assert client.post("/api/v1/providers/reload").status_code == 422
+        provider_path.write_text(
+            'version: "1.0.0"\nproviders: {test: {models: [test-model], api_key: ""}}'
+        )
+        assert client.post("/api/v1/providers/reload").status_code == 200
+        assert (
+            client.get("/api/v1/providers").json()["items"][0]["api_key_configured"]
+            is False
+        )
+        assert client.get("/health").json()["status"] == "ok"
 
 
 def test_provider_reload(client_factory):

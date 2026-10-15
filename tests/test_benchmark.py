@@ -785,11 +785,16 @@ def test_paired_verdict():
 
 
 @pytest.mark.parametrize("stream_options", ["default", None, {"include_usage": False}])
-def test_client_observability(monkeypatch, stream_options):
+@pytest.mark.parametrize("api_key", ["secret", "", "   ", None])
+def test_client_observability(monkeypatch, stream_options, api_key):
     sent_body = {}
 
     def post(*args, **kwargs):
         sent_body.update(kwargs["json"])
+        expected_headers = (
+            {"Authorization": "Bearer secret"} if api_key == "secret" else {}
+        )
+        assert kwargs["headers"] == expected_headers
         return FakeResponse()
 
     class FakeResponse:
@@ -824,7 +829,10 @@ def test_client_observability(monkeypatch, stream_options):
             yield b"data: [DONE]"
 
     monkeypatch.setenv("OPENAI_API_BASE", "https://provider.invalid/v1")
-    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    if api_key is None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_API_KEY", api_key)
     monkeypatch.setattr(
         "llmperf.ray_clients.openai_chat_completions_client.requests.post",
         post,

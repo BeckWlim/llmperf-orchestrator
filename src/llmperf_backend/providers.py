@@ -1,9 +1,10 @@
 """Server-owned provider profiles, worker credential injection, and model discovery."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import os
 import re
 import threading
@@ -13,7 +14,10 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 PROVIDER_PREFIX = "LLMPERF_PROVIDER_"
-SUPPORTED_ADAPTERS = {"openai", "anthropic", "litellm", "sagemaker", "vertexai"}
+LOGGER = logging.getLogger(__name__)
+CONFIGURATION_ERROR = (
+    "Provider configuration could not be loaded; correct it and reload Providers."
+)
 PROVIDER_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 ENVIRONMENT_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 PROFILE_FIELDS = (
@@ -89,7 +93,7 @@ class ProviderProfile:
     provider_id: str
     adapter: str
     api_base: str
-    api_key: str
+    api_key: str = field(repr=False)
     api_base_env: str
     api_key_env: str
     discovery: str
@@ -124,14 +128,17 @@ class ProviderRegistry:
         profiles: Sequence[ProviderProfile],
         reload_loader: Optional[Callable[[], Mapping[str, str]]] = None,
         profile_loader: Optional[Callable[[], Sequence[ProviderProfile]]] = None,
+        *,
+        allow_empty: bool = False,
     ):
         self._profiles = {profile.provider_id: profile for profile in profiles}
-        if not self._profiles:
+        if not self._profiles and not allow_empty:
             raise ProviderConfigError("At least one provider profile is required")
         self._reload_loader = reload_loader
         self._profile_loader = profile_loader
         self._lock = threading.RLock()
         self._generation = 0
+        self._configuration_error: Optional[str] = None
         self._loaded_at = _utcnow()
         self._credential_environment_names = {
             name
@@ -159,7 +166,15 @@ class ProviderRegistry:
     def from_loader(
         cls, loader: Callable[[], Sequence[ProviderProfile]]
     ) -> "ProviderRegistry":
-        return cls(loader(), profile_loader=loader)
+        try:
+            return cls(loader(), profile_loader=loader)
+        except Exception:
+            # External Provider configuration must not take down the control plane.
+            # Never log parser exceptions: their context can contain credentials.
+            registry = cls([], profile_loader=loader, allow_empty=True)
+            registry._configuration_error = CONFIGURATION_ERROR
+            LOGGER.error(CONFIGURATION_ERROR)
+            return registry
 
     @classmethod
     def profiles_from_environment(
@@ -189,75 +204,47 @@ class ProviderRegistry:
     def _profile_from_values(
         provider_id: str, values: Mapping[str, str]
     ) -> ProviderProfile:
-        adapter = values.get("ADAPTER", "openai").strip().lower()
-        if adapter not in SUPPORTED_ADAPTERS:
-            raise ProviderConfigError(
-                f"Provider {provider_id!r} has unsupported ADAPTER {adapter!r}"
-            )
-        api_base = values.get("URL", "").strip().rstrip("/")
-        _validate_api_base(provider_id, api_base)
-        static_models = tuple(
-            model.strip()
-            for model in values.get("MODELS", "").split(",")
-            if model.strip()
-        )
-        if not api_base and not static_models:
-            raise ProviderConfigError(
-                f"Provider {provider_id!r} requires URL or MODELS"
-            )
-        inferred_discovery = (
-            "static" if static_models else "openai" if api_base else "disabled"
-        )
-        discovery = values.get("DISCOVERY", inferred_discovery)
-        discovery = discovery.strip().lower()
-        if discovery not in {"openai", "static", "disabled"}:
-            raise ProviderConfigError(
-                f"Provider {provider_id!r} DISCOVERY must be openai, static, "
-                "or disabled"
-            )
+        # Legacy environment fields adapt into the same schema as providers.yaml.
+        from pydantic import ValidationError
+
+        from llmperf_backend.provider_files import ProviderFileProfile
+
         try:
-            cache_ttl = int(values.get("TTL", "300"))
-        except ValueError as exc:
+            cache_ttl_seconds = int(values.get("TTL", "300"))
+        except ValueError:
             raise ProviderConfigError(
                 f"Provider {provider_id!r} TTL must be an integer"
-            ) from exc
-        if cache_ttl < 0 or cache_ttl > 86400:
+            ) from None
+        discovery_fields: Dict[str, object] = {
+            "path": values.get("PATH", "/models").strip() or "/models",
+            "cache_ttl_seconds": cache_ttl_seconds,
+        }
+        if "DISCOVERY" in values:
+            discovery_fields["mode"] = values["DISCOVERY"].strip().lower()
+        profile_fields: Dict[str, object] = {
+            "adapter": values.get("ADAPTER", "openai").strip().lower(),
+            "base_url": values.get("URL", ""),
+            "api_key": values.get("KEY", ""),
+            "models": [
+                model.strip()
+                for model in values.get("MODELS", "").split(",")
+                if model.strip()
+            ],
+            "discovery": discovery_fields,
+        }
+        for legacy_field, document_field in (
+            ("URLVAR", "worker_api_base_env"),
+            ("KEYVAR", "worker_api_key_env"),
+        ):
+            if legacy_field in values:
+                profile_fields[document_field] = values[legacy_field].strip()
+        try:
+            definition = ProviderFileProfile.model_validate(profile_fields)
+        except ValidationError:
             raise ProviderConfigError(
-                f"Provider {provider_id!r} model cache TTL must be between 0 and 86400"
-            )
-        if discovery == "static" and not static_models:
-            raise ProviderConfigError(
-                f"Provider {provider_id!r} static discovery requires MODELS"
-            )
-        models_path = values.get("PATH", "/models").strip() or "/models"
-        if not models_path.startswith("/"):
-            models_path = f"/{models_path}"
-        api_base_env = _validate_environment_name(
-            provider_id,
-            "URLVAR",
-            values.get(
-                "URLVAR", DEFAULT_BASE_VARIABLES.get(adapter, "OPENAI_API_BASE")
-            ).strip(),
-        )
-        api_key_env = _validate_environment_name(
-            provider_id,
-            "KEYVAR",
-            values.get(
-                "KEYVAR", DEFAULT_KEY_VARIABLES.get(adapter, "OPENAI_API_KEY")
-            ).strip(),
-        )
-        return ProviderProfile(
-            provider_id=provider_id,
-            adapter=adapter,
-            api_base=api_base,
-            api_key=values.get("KEY", ""),
-            api_base_env=api_base_env,
-            api_key_env=api_key_env,
-            discovery=discovery,
-            models_path=models_path,
-            static_models=static_models,
-            model_cache_ttl_seconds=cache_ttl,
-        )
+                f"Invalid Provider fields for {provider_id!r}"
+            ) from None
+        return definition.resolve(provider_id, {})
 
     def get(self, provider_id: str) -> Optional[ProviderProfile]:
         with self._lock:
@@ -294,6 +281,7 @@ class ProviderRegistry:
             return {
                 "generation": self._generation,
                 "loaded_at": self._loaded_at.isoformat(),
+                "configuration_error": self._configuration_error,
                 "items": [
                     self._profiles[provider_id].public_dict()
                     for provider_id in sorted(self._profiles)
@@ -315,11 +303,13 @@ class ProviderRegistry:
                 environment = self._reload_loader()
                 candidate = type(self).from_environment(environment)
         except ProviderConfigError:
+            with self._lock:
+                self._configuration_error = CONFIGURATION_ERROR
             raise
-        except Exception as exc:
-            raise ProviderConfigError(
-                f"Unable to reload Provider Profiles: {exc}"
-            ) from exc
+        except Exception:
+            with self._lock:
+                self._configuration_error = CONFIGURATION_ERROR
+            raise ProviderConfigError(CONFIGURATION_ERROR) from None
 
         with self._lock:
             previous = self._profiles
@@ -332,6 +322,7 @@ class ProviderRegistry:
                 if previous[provider_id] != current[provider_id]
             )
             self._profiles = current
+            self._configuration_error = None
             self._credential_environment_names.update(
                 name
                 for profile in current.values()
