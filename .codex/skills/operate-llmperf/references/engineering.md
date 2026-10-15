@@ -5,35 +5,42 @@
 - `models.py`: strict general API/YAML models and configuration constraints.
 - `task_compiler.py`: task-specific Pydantic AST, `BaseNode` hierarchy, bounded workflow
   expansion, UUID-free compilation table, and runtime assembly.
-- `persistence.py`: PostgreSQL transactions, queues, task state, aggregation, and export.
-- `planner.py`: materialize due RunnerPlan or Dispatch work as ordinary Runners.
-- `scheduler.py`: claim queued Runners and supervise Worker handles.
-- `worker.py`: execute one retry-free Ray task and return results.
+- `persistence.py`: durable metadata, fenced attempts, checkpoints, messages, results and export.
+- `planner.py`: materialize due RunnerPlan occurrences.
+- `runtime.py`: bounded event bus, cached DAG readiness, timers and fair ready queue.
+- `scheduler.py`: supervise Worker handles and the shared request pool.
+- `worker.py`: local atomic handles or retry-free batch Ray tasks.
+- `request_pool.py`: fair shared capacity and isolated per-request Ray adapters.
+- `preparation.py`: initialization-only corpus calibration and bounded prompt chunks.
+- `rounds.py`: deterministic Runner expansion and runtime round eligibility.
 - `safety.py`: estimate expanded Runners, requests, tokens, and effective concurrency.
 - `llmperf_cli`: command parsing, HTTP boundaries, polling, logs, and rendering.
 - `cache_probe.py`, `usage.py`, `cache_analysis.py`: within-Runner KV-cache evidence.
 
-Keep the compiler, Planner, and Scheduler distinct. The compiler creates a finite graph;
-Planner consumes due generic Dispatches; Scheduler consumes queued Runners. Waiting must
-not occupy a Worker slot. Dependency UUIDs are scheduling keys; prompt hashes only verify
-payload identity.
+Keep compiler, Planner, RuntimeCoordinator and Scheduler distinct. Planner materializes
+scheduled occurrences. The coordinator owns dependencies, timers and a fair ready queue;
+Scheduler owns the fixed shared Ray pool and bounded Worker handles. Waiting never occupies
+a request slot. See `docs/RUNTIME.md` for the concrete runtime and storage contract.
 
-Worker is a Scheduler-local Ray execution handle for one Runner, not a subprocess.
-Scheduler is the only Ray driver. Each Worker submits one task, and that task creates
-Runner-owned serial client Actors (`max_concurrency=1`). Tasks must not initialize Ray or
-connect to PostgreSQL. Campaigns share the runtime but never Actors or mutable request state.
+Atomic invokes use lightweight Backend handles and cached tokenizers; ordinary batch Runners
+use retry-free Ray tasks. Both share request actors across Runners. Never mutate process
+credentials, initialize Ray in a Worker, or connect an actor to PostgreSQL. Default capacity
+is eight actors times eight requests; the active Runner bound is independent.
 
-Cross-Campaign execution is supported. PostgreSQL claims prefer Campaigns with fewer
-running Runners and use transactional locks to avoid simultaneous bias. Ray queues Actors
-independently; do not use an all-or-nothing placement group.
+Runtime guards stop new admission. Commit results and conversation messages before releasing
+successors. Recover interrupted execution as indeterminate without automatic Provider replay.
 
-Runtime guards only stop new claims. Memory or Object Store pressure must not fail queued
-or kill running Runners. Drop persisted ObjectRefs after completion. Ray infrastructure
-restarts/retries remain disabled for benchmark correctness.
+Optional preparation actors reserve one CPU each from `ray_num_cpus`; request actors use
+the remaining CPU budget. Calibration is once per ordinary Runner, before its timed loop.
+Bundled-sonnet and external concatenate workloads use the estimated chunk path through
+the existing dataset loader. External calibration samples at most 128 records with a
+4,096-character cap each; actors access the full memory-mapped corpus. Exact replay and
+sample mode retain existing preparation. Round barriers derive from durable Runner metadata
+and status, and consume no request slots while waiting.
 
 ## Persistence
 
-PostgreSQL is the only supported runtime database. Do not add SQLite or in-memory authority.
+PostgreSQL is the durable metadata platform. Runtime queues are reconstructible; do not add SQLite or in-memory durable authority.
 When an explicit compatibility break is authorized, update together:
 
 1. SQLAlchemy records;

@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import pytest
 
 from llmperf_backend.persistence import (
-    BenchmarkRunnerDispatchRecord,
+    ExecutionNodeRecord,
     RunnerRecordFactory,
 )
 
@@ -13,7 +13,7 @@ UTC = timezone.utc
 
 def test_factory_template():
     due_at = datetime(2026, 8, 20, 8, 30, tzinfo=UTC)
-    dispatch = BenchmarkRunnerDispatchRecord(
+    dispatch = ExecutionNodeRecord(
         id="dispatch-1",
         campaign_id="campaign-1",
         runner_plan_id="plan-1",

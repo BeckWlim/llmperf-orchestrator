@@ -155,6 +155,32 @@ def test_rejects_old_export():
         REPORT.prepare_analysis(document, "old fixture")
 
 
+def test_grouped_task_evidence():
+    document = task_document()
+    warm_runner, cold_runner = document["runners"][1:]
+    contexts = [
+        warm_runner["benchmark"].pop("task_context"),
+        cold_runner["benchmark"]["task_context"],
+    ]
+    warm_runner["benchmark"]["task_contexts"] = contexts
+    warm_runner["summary"].pop("task_context")
+    document["runners"] = document["runners"][:2]
+    document["dispatches"][2]["runner_id"] = warm_runner["runner_id"]
+    document["task_instances"][0]["outcome"] = {
+        "nodes": {
+            "warm": {"status": "succeeded"},
+            "cold": {"status": "failed"},
+        }
+    }
+
+    analysis = REPORT.prepare_analysis(document, "grouped fixture")
+    nodes = analysis["evidence"]["task_graphs"][0]["nodes"]
+    assert nodes[0]["runner"] is not None
+    assert all(node["runner"] is None for node in nodes[1:])
+    assert all(node["group_runner"]["task_node_count"] == 2 for node in nodes[1:])
+    assert nodes[2]["outcome"]["status"] == "failed"
+
+
 def test_analysis_cohorts():
     analysis = REPORT.prepare_analysis(task_document(), "fixture")
 

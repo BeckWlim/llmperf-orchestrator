@@ -21,7 +21,38 @@ models without remote discovery. Use `--json` for the stable projection. Use
 `provider models --refresh` only when remote refresh is necessary and authorized. Catalog
 visibility does not prove inference access; a 1x1 smoke does.
 
-## OpenAI-compatible Profile
+## Provider document (preferred)
+
+Store all profiles in one `~/.config/llmperf/providers.yaml` or `providers.json` file:
+
+```yaml
+version: "1.0.0"
+providers:
+  acme:
+    adapter: openai
+    base_url: https://api.example.com/v1
+    api_key_env: LLMPERF_PROVIDER_ACME_KEY
+    models: [model-a, model-b]
+    discovery:
+      mode: static
+      path: /models
+      cache_ttl_seconds: 300
+```
+
+Keep credential values in `backend.env` via `llmperf-backend config set ... --stdin`, or
+export them in the service environment. `api_key_env` references the source variable;
+omit it for an unauthenticated endpoint. Optional `worker_api_base_env` and
+`worker_api_key_env` override adapter destination variable names. Unknown fields, duplicate
+keys/normalized IDs, and missing referenced credentials reject the complete candidate.
+
+`LLMPERF_PROVIDERS_FILE` selects an explicit file. Relative paths resolve beside the Backend
+environment file. Otherwise one `providers.yaml`, `providers.yml`, or `providers.json` in
+that directory is discovered; multiple files require explicit selection. A selected file
+is authoritative, and legacy environment definition fields do not override it. Without a
+Provider file, legacy environment profiles remain supported. Use `llmperfctl provider reload`
+after edits or credential rotation; a failed reload preserves the active generation.
+
+## Legacy environment Profile
 
 Environment keys use `LLMPERF_PROVIDER_<ID>_<FIELD>`. Uppercase underscores in ID normalize
 to lowercase hyphens.
@@ -64,8 +95,9 @@ optional adapter.
 
 ## Reload and Worker injection
 
-Configuration precedence is process environment, an explicit `LLMPERF_ENV_FILE`, then
-persisted user configuration. Working-directory `.env` files are not loaded.
+Credential/environment precedence is process environment over the selected environment
+file (`LLMPERF_ENV_FILE`, otherwise persisted user configuration). Working-directory `.env`
+files are not loaded. The Provider document, when selected, owns all profile definitions.
 `llmperfctl provider reload` validates a complete candidate and atomically replaces only
 Provider Profiles and model caches. It does
 not reload PostgreSQL, Scheduler, Planner, Ray, auth, listen settings, or the default

@@ -29,6 +29,9 @@ def build_task_analyses(
                 {
                     **dict(dispatch),
                     "runner": dict(runner) if runner is not None else None,
+                    "outcome": (instance.get("outcome") or {})
+                    .get("nodes", {})
+                    .get(dispatch.get("node_id")),
                 }
             )
         analyses.append({**dict(instance), "nodes": nodes})

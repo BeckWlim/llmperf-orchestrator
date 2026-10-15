@@ -5,6 +5,9 @@ from collections import Counter
 
 import pytest
 import time
+import threading
+import sys
+from types import SimpleNamespace
 
 from llmperf import token_benchmark_ray as benchmark_module
 from llmperf import common_metrics
@@ -328,6 +331,226 @@ def test_normalization(case):
         assert normalized[name] == expected
 
 
+@pytest.mark.parametrize("provider_output", [None, 0, 7])
+def test_provider_token_counts(provider_output):
+    metrics = {
+        common_metrics.NUM_INPUT_TOKENS: 10,
+        common_metrics.NUM_OUTPUT_TOKENS: 3,  # SSE events are not token counts.
+        common_metrics.PROVIDER_INPUT_TOKENS: 12,
+        common_metrics.PROVIDER_OUTPUT_TOKENS: provider_output,
+        common_metrics.TTFT: 0.5,
+        common_metrics.E2E_LAT: 2.0,
+    }
+    normalized = normalize_request_metrics(metrics, "some generated text")
+    assert normalized[common_metrics.NUM_OUTPUT_TOKENS] == provider_output
+    assert normalized[common_metrics.LOCAL_OUTPUT_TOKENS] is None
+    assert normalized[common_metrics.LOCAL_INPUT_TOKENS] == 10
+    assert normalized[common_metrics.NUM_INPUT_TOKENS] == 12
+    assert normalized[common_metrics.NUM_TOTAL_TOKENS] == (
+        None if provider_output is None else 12 + provider_output
+    )
+    assert normalized[common_metrics.REQ_OUTPUT_THROUGHPUT] == (
+        None if provider_output is None else provider_output / 2
+    )
+    assert normalized[common_metrics.TOKEN_COUNT_SOURCES]["output"] == (
+        "unavailable" if provider_output is None else "provider"
+    )
+    assert normalized[common_metrics.TPOT] == (0.25 if provider_output == 7 else None)
+
+
+@pytest.mark.parametrize("adapter", ["vertexai", "sagemaker"])
+def test_actor_without_tokenizer(monkeypatch, adapter):
+    def forbidden_tokenizer():
+        raise AssertionError("Request actors must not load a tokenizer")
+
+    monkeypatch.setattr("llmperf.utils.get_tokenizer", forbidden_tokenizer)
+    if adapter == "vertexai":
+        from llmperf.ray_clients.vertexai_client import VertexAIClient
+
+        for name in (
+            "GCLOUD_PROJECT_ID",
+            "GCLOUD_REGION",
+            "VERTEXAI_ENDPOINT_ID",
+            "GCLOUD_ACCESS_TOKEN",
+        ):
+            monkeypatch.setenv(name, "test")
+        monkeypatch.setattr(
+            "llmperf.ray_clients.vertexai_client.requests.post",
+            lambda *args, **kwargs: SimpleNamespace(
+                status_code=200,
+                raise_for_status=lambda: None,
+                json=lambda: {"predictions": ["Input: prompt\nOutput:\nresponse"]},
+            ),
+        )
+        metrics, text, _ = VertexAIClient().llm_request(
+            RequestConfig(model="test", prompt=("prompt", 1))
+        )
+    else:
+        from llmperf.ray_clients.sagemaker_client import SageMakerClient
+
+        for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION_NAME"):
+            monkeypatch.setenv(name, "test")
+        response_bytes = b'[{"generation":{"content":"response"}}]\n'
+        runtime = SimpleNamespace(
+            invoke_endpoint_with_response_stream=lambda **kwargs: {
+                "Body": [{"PayloadPart": {"Bytes": response_bytes}}],
+            }
+        )
+        monkeypatch.setattr(
+            "llmperf.ray_clients.sagemaker_client.Session",
+            lambda **credentials: SimpleNamespace(
+                client=lambda *args, **kwargs: runtime
+            ),
+        )
+        metrics, text, _ = SageMakerClient().llm_request(
+            RequestConfig(model="test", prompt=("prompt", 1))
+        )
+    assert text == "response"
+    assert metrics[common_metrics.ERROR_CODE] is None
+    assert metrics[common_metrics.NUM_OUTPUT_TOKENS] is None
+
+
+def test_litellm_usage_chunk(monkeypatch):
+    from llmperf.ray_clients.litellm_client import LiteLLMClient
+
+    chunks = [
+        SimpleNamespace(
+            choices=[SimpleNamespace(delta={"content": "response"})],
+            model_dump=lambda: {},
+        ),
+        SimpleNamespace(
+            choices=[],
+            model_dump=lambda: {"usage": {"prompt_tokens": 2, "completion_tokens": 7}},
+        ),
+    ]
+    monkeypatch.setitem(
+        sys.modules,
+        "litellm",
+        SimpleNamespace(
+            completion=lambda **kwargs: iter(chunks),
+            validate_environment=lambda model: {"missing_keys": []},
+        ),
+    )
+    metrics, text, _ = LiteLLMClient().llm_request(
+        RequestConfig(model="test", prompt=("prompt", 1), llm_api="litellm")
+    )
+    normalized = normalize_request_metrics(metrics, text)
+    assert normalized[common_metrics.ERROR_CODE] is None
+    assert normalized[common_metrics.NUM_OUTPUT_TOKENS] == 7
+    assert normalized[common_metrics.NUM_INPUT_TOKENS] == 2
+
+
+@pytest.mark.parametrize("counts", [[None, None], [4, None], [4, 0]])
+def test_token_coverage(counts):
+    requests = [
+        normalize_request_metrics(
+            {
+                common_metrics.NUM_INPUT_TOKENS: 10,
+                common_metrics.PROVIDER_OUTPUT_TOKENS: count,
+                common_metrics.TTFT: 0.1,
+                common_metrics.E2E_LAT: 1.0,
+                common_metrics.ERROR_CODE: None,
+            },
+            "output",
+        )
+        for count in counts
+    ]
+    summary = metrics_summary(requests, 0.0, 2.0)
+    known_counts = [count for count in counts if count is not None]
+    assert summary[common_metrics.OUTPUT_TOKEN_COVERAGE] == {
+        "counted_requests": len(known_counts),
+        "successful_requests": 2,
+        "ratio": len(known_counts) / 2,
+    }
+    assert summary[common_metrics.OUTPUT_THROUGHPUT] == (
+        sum(known_counts) / 2 if len(known_counts) == 2 else None
+    )
+    if not known_counts:
+        assert summary[common_metrics.NUM_OUTPUT_TOKENS]["mean"] is None
+    json.dumps(summary, allow_nan=False)
+
+
+@pytest.mark.parametrize("count_mode", ["provider", "local"])
+@pytest.mark.parametrize("cache_probe", [False, True])
+def test_tokenization_phase(monkeypatch, count_mode, cache_probe):
+    completed = []
+    encoded_outputs = []
+    clock_seconds = [0.0]
+    expected_requests = 4 if cache_probe else 2
+
+    class PhaseTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            if text == "response":
+                assert len(completed) == expected_requests
+                encoded_outputs.append(text)
+                clock_seconds[0] += 100.0
+            else:
+                assert not completed
+            return [ord(character) for character in text]
+
+        def decode(self, tokens):
+            return "".join(chr(token) for token in tokens)
+
+    def prepare_prompts(**options):
+        count = options["get_token_length"]("prompt")
+        return [("prompt", count)] * 2, [{"source": "test"}] * 2
+
+    class PhaseLauncher:
+        def __init__(self, clients, request_executor=None):
+            self.config = None
+
+        def launch_requests(self, config):
+            self.config = config
+
+        def get_next_ready(self, block=False):
+            completed.append(self.config)
+            clock_seconds[0] += 1.0
+            return [
+                (
+                    {
+                        common_metrics.ERROR_CODE: None,
+                        common_metrics.E2E_LAT: 1.0,
+                        common_metrics.TTFT: 0.1,
+                        common_metrics.NUM_INPUT_TOKENS: 6,
+                        common_metrics.NUM_OUTPUT_TOKENS: 1,
+                        common_metrics.PROVIDER_OUTPUT_TOKENS: 2,
+                    },
+                    "response",
+                    self.config,
+                )
+            ]
+
+    monkeypatch.setattr(benchmark_module, "get_tokenizer", PhaseTokenizer)
+    monkeypatch.setattr(benchmark_module, "prepare_prompt_requests", prepare_prompts)
+    monkeypatch.setattr(benchmark_module, "construct_clients", lambda **options: [0])
+    monkeypatch.setattr(benchmark_module, "RequestsLauncher", PhaseLauncher)
+    monkeypatch.setattr(benchmark_module.time, "monotonic", lambda: clock_seconds[0])
+    summary, requests = benchmark_module.get_token_throughput_latencies(
+        model="test",
+        prompt_dataset_source=PromptDatasetSource.builtin_sonnet(),
+        mean_input_tokens=6,
+        stddev_input_tokens=0,
+        mean_output_tokens=8,
+        stddev_output_tokens=0,
+        max_num_completed_requests=2,
+        num_concurrent_requests=1,
+        output_token_count=count_mode,
+        cache_probe=(
+            {"mode": "exact_repeat", "trials": 2, "bootstrap_samples": 100}
+            if cache_probe
+            else None
+        ),
+    )
+    assert len(encoded_outputs) == (expected_requests if count_mode == "local" else 0)
+    assert summary["output_token_count"] == count_mode
+    assert summary["results"][common_metrics.COMPLETED_REQUESTS_PER_MIN] == 60.0
+    assert summary["timed_out"] is False
+    assert all(
+        request[common_metrics.NUM_OUTPUT_TOKENS] == (8 if count_mode == "local" else 2)
+        for request in requests
+    )
+
+
 def test_empty_summary():
     summary = metrics_summary([], 1.0, 2.0)
 
@@ -345,7 +568,7 @@ def test_thread_error_propagation(monkeypatch):
             return text.split()
 
     class FailingLauncher:
-        def __init__(self, clients):
+        def __init__(self, clients, request_executor=None):
             pass
 
         def launch_requests(self, request_config):
@@ -371,6 +594,89 @@ def test_thread_error_propagation(monkeypatch):
             test_timeout_s=10,
             llm_api="openai",
         )
+
+
+@pytest.mark.parametrize("concurrency,per_actor", [(4, 1), (64, 8), (9, 4)])
+def test_shared_actor_requests(monkeypatch, concurrency, per_actor):
+    from llmperf.common import RAY_ACTOR_CONCURRENCY_ENV
+
+    actor_count = (concurrency + per_actor - 1) // per_actor
+    active = [0] * actor_count
+    peak = [0] * actor_count
+    launched = []
+    created = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(concurrency, timeout=10)
+
+    def create_clients(llm_api, num_clients):
+        created.append(num_clients)
+        return list(range(num_clients))
+
+    class ConcurrentLauncher:
+        def __init__(self, clients, request_executor=None):
+            self.actor_index = clients[0]
+            self.config = None
+            self.first_request = True
+
+        def launch_requests(self, request_config):
+            self.config = request_config
+            with lock:
+                launched.append(request_config.prompt[0])
+                active[self.actor_index] += 1
+                peak[self.actor_index] = max(
+                    peak[self.actor_index], active[self.actor_index]
+                )
+
+        def get_next_ready(self):
+            if self.first_request:
+                barrier.wait()
+                self.first_request = False
+            with lock:
+                active[self.actor_index] -= 1
+            return [
+                (
+                    {
+                        common_metrics.E2E_LAT: 0.1,
+                        common_metrics.TTFT: 0.05,
+                        common_metrics.NUM_INPUT_TOKENS: 1,
+                        common_metrics.ERROR_CODE: None,
+                    },
+                    "x",
+                    self.config,
+                )
+            ]
+
+    request_budget = concurrency + 3
+    monkeypatch.setenv(RAY_ACTOR_CONCURRENCY_ENV, str(per_actor))
+    monkeypatch.setattr(benchmark_module, "construct_clients", create_clients)
+    monkeypatch.setattr(benchmark_module, "RequestsLauncher", ConcurrentLauncher)
+    monkeypatch.setattr(benchmark_module, "get_tokenizer", FakeMutationTokenizer)
+    monkeypatch.setattr(
+        benchmark_module,
+        "prepare_prompt_requests",
+        lambda **kwargs: (
+            [(f"request-{index}", 1) for index in range(request_budget)],
+            [{"source": "test"} for _ in range(request_budget)],
+        ),
+    )
+    _, requests = benchmark_module.get_token_throughput_latencies(
+        model="test",
+        prompt_dataset_source=PromptDatasetSource.builtin_sonnet(),
+        mean_input_tokens=1,
+        stddev_input_tokens=0,
+        mean_output_tokens=1,
+        stddev_output_tokens=0,
+        num_concurrent_requests=concurrency,
+        max_num_completed_requests=request_budget,
+        test_timeout_s=20,
+    )
+    assert created == [actor_count]
+    assert peak == [
+        min(per_actor, concurrency - index * per_actor) for index in range(actor_count)
+    ]
+    assert active == [0] * actor_count
+    assert len(requests) == request_budget
+    assert len(launched) == len(set(launched)) == request_budget
 
 
 class FakeMutationTokenizer:
@@ -478,7 +784,14 @@ def test_paired_verdict():
     ] == pytest.approx(0.8)
 
 
-def test_client_observability(monkeypatch):
+@pytest.mark.parametrize("stream_options", ["default", None, {"include_usage": False}])
+def test_client_observability(monkeypatch, stream_options):
+    sent_body = {}
+
+    def post(*args, **kwargs):
+        sent_body.update(kwargs["json"])
+        return FakeResponse()
+
     class FakeResponse:
         status_code = 200
         headers = {
@@ -514,7 +827,7 @@ def test_client_observability(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setattr(
         "llmperf.ray_clients.openai_chat_completions_client.requests.post",
-        lambda *args, **kwargs: FakeResponse(),
+        post,
     )
     from llmperf.ray_clients.openai_chat_completions_client import (
         OpenAIChatCompletionsClient,
@@ -526,10 +839,21 @@ def test_client_observability(monkeypatch):
             model="model",
             prompt=("prompt", 9),
             metadata={"family_id": "family-1", "role": "warm"},
+            sampling_params=(
+                {}
+                if stream_options == "default"
+                else {"stream_options": stream_options}
+            ),
         )
     )
 
     assert text == "one two"
+    if stream_options == "default":
+        assert sent_body["stream_options"] == {"include_usage": True}
+    elif stream_options is None:
+        assert "stream_options" not in sent_body
+    else:
+        assert sent_body["stream_options"] == stream_options
     assert metrics[common_metrics.KV_CACHE_HIT_TOKENS] == 8
     assert metrics[common_metrics.KV_CACHE_MISS_TOKENS] == 2
     assert metrics[common_metrics.PROVIDER_INPUT_TOKENS] == 10
@@ -647,12 +971,18 @@ def test_client_progress(monkeypatch):
     assert metrics[common_metrics.REQUEST_TIMING]["last_text_monotonic"] is not None
 
 
-def test_probe_execution_order(monkeypatch):
+@pytest.mark.parametrize("per_actor", [1, 2])
+def test_probe_execution_order(monkeypatch, per_actor):
     launches = []
+    created = []
     prompt_counter = iter(("abcdefghijk", "mnopqrstuvw"))
 
+    def create_clients(llm_api, num_clients):
+        created.append(num_clients)
+        return list(range(num_clients))
+
     class FakeLauncher:
-        def __init__(self, clients):
+        def __init__(self, clients, request_executor=None):
             self.config = None
 
         def launch_requests(self, request_config):
@@ -688,7 +1018,8 @@ def test_probe_execution_order(monkeypatch):
             [{"source": "test"}, {"source": "test"}],
         ),
     )
-    monkeypatch.setattr(benchmark_module, "construct_clients", lambda **kwargs: [])
+    monkeypatch.setenv("LLMPERF_WORKER_RAY_ACTOR_CONCURRENCY", str(per_actor))
+    monkeypatch.setattr(benchmark_module, "construct_clients", create_clients)
     monkeypatch.setattr(benchmark_module, "RequestsLauncher", FakeLauncher)
 
     summary, requests = benchmark_module.get_token_throughput_latencies(
@@ -717,6 +1048,7 @@ def test_probe_execution_order(monkeypatch):
     )
 
     assert len(requests) == 4
+    assert created == [2 // per_actor]
     assert summary["cache_probe_analysis"]["verdict"] == "confirmed_external"
     for family in {item["family_id"] for item in launches}:
         roles = [item["role"] for item in launches if item["family_id"] == family]
@@ -736,7 +1068,7 @@ def test_task_payload_replay(monkeypatch):
     launched = []
 
     class FakeLauncher:
-        def __init__(self, clients):
+        def __init__(self, clients, request_executor=None):
             self.config = None
 
         def launch_requests(self, request_config):
@@ -796,11 +1128,96 @@ def test_task_payload_replay(monkeypatch):
     assert summary["task_context"]["node_id"] == "warm"
 
 
+def test_grouped_request_failure(monkeypatch):
+    from llmperf.common import RAY_ACTOR_CONCURRENCY_ENV
+
+    launched = []
+    prepared_seeds = []
+    barrier = threading.Barrier(8, timeout=10)
+
+    def prepare(**kwargs):
+        prepared_seeds.append(kwargs["seed"])
+        assert kwargs["num_requests"] == 1
+        return [(f"payload-{kwargs['seed']}", 1)], [{"source": "test"}]
+
+    class Launcher:
+        def __init__(self, clients, request_executor=None):
+            assert clients == [0]
+            self.config = None
+
+        def launch_requests(self, request_config):
+            self.config = request_config
+            launched.append(request_config)
+
+        def get_next_ready(self):
+            barrier.wait()
+            assert self.config is not None
+            if self.config.metadata["node_id"] == "node-3":
+                raise RuntimeError("one failed invocation")
+            return [
+                (
+                    {
+                        common_metrics.ERROR_CODE: None,
+                        common_metrics.E2E_LAT: 0.1,
+                        common_metrics.TTFT: 0.05,
+                    },
+                    "x",
+                    self.config,
+                )
+            ]
+
+    contexts = [
+        {
+            "instance_id": "instance",
+            "node_id": f"node-{index}",
+            "payload_id": f"payload-{index}",
+            "payload_seed": index,
+        }
+        for index in range(8)
+    ]
+    monkeypatch.setenv(RAY_ACTOR_CONCURRENCY_ENV, "8")
+    monkeypatch.setattr(
+        benchmark_module,
+        "construct_clients",
+        lambda **kwargs: list(range(kwargs["num_clients"])),
+    )
+    monkeypatch.setattr(benchmark_module, "RequestsLauncher", Launcher)
+    monkeypatch.setattr(benchmark_module, "get_tokenizer", FakeMutationTokenizer)
+    monkeypatch.setattr(benchmark_module, "prepare_prompt_requests", prepare)
+    _, requests = benchmark_module.get_token_throughput_latencies(
+        model="test",
+        prompt_dataset_source=PromptDatasetSource.builtin_sonnet(),
+        mean_input_tokens=1,
+        stddev_input_tokens=0,
+        mean_output_tokens=1,
+        stddev_output_tokens=0,
+        num_concurrent_requests=8,
+        max_num_completed_requests=8,
+        test_timeout_s=20,
+        task_contexts=contexts,
+    )
+    assert prepared_seeds == list(range(8))
+    assert len(launched) == len(requests) == 8
+    assert {request.prompt[0] for request in launched} == {
+        f"payload-{index}" for index in range(8)
+    }
+    by_node = {
+        result[common_metrics.REQUEST_METADATA]["node_id"]: result
+        for result in requests
+    }
+    assert set(by_node) == {f"node-{index}" for index in range(8)}
+    assert by_node["node-3"][common_metrics.ERROR_CODE] == "worker_request_error"
+    assert sum(result[common_metrics.ERROR_CODE] is None for result in requests) == 7
+    assert all(
+        result[common_metrics.REQUEST_TIMING]["completed_utc"] for result in requests
+    )
+
+
 def test_task_dataset_replay(monkeypatch, tmp_path):
     launched = []
 
     class FakeLauncher:
-        def __init__(self, clients):
+        def __init__(self, clients, request_executor=None):
             self.config = None
 
         def launch_requests(self, request_config):

@@ -57,6 +57,17 @@ def test_config_crud(tmp_path, monkeypatch):
     assert "LLMPERF_SERVER_HOST" not in read_environment_file(path)
 
 
+def test_provider_file_setting(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    configured = execute_config(
+        _arguments("set", "LLMPERF_PROVIDERS_FILE", "providers.yaml")
+    )
+    assert configured["provider_reload_required"] is True
+    assert configured["restart_required"] is False
+    removed = execute_config(_arguments("unset", "LLMPERF_PROVIDERS_FILE"))
+    assert removed["provider_reload_required"] is True
+
+
 def test_proxy_redaction(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     proxy_url = "http://proxy-user:proxy-password@proxy.internal:3128"

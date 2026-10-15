@@ -25,17 +25,18 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, aliased, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import Select
 
 from llmperf.version import PROTOCOL_VERSION, TASK_FORMAT_VERSION
-from llmperf_backend.models import DatabaseConfig
+from llmperf_backend.models import DatabaseConfig, GroupedBenchmarkConfig
 from llmperf_backend.planner import as_utc, next_fire_details
 from llmperf_backend.task_compiler import (
     TaskAssembler,
@@ -86,6 +87,61 @@ def json_safe(value: Any) -> Any:
 
 class Base(DeclarativeBase):
     pass
+
+
+class ExecutionLeaseRecord(Base):
+    __tablename__ = "execution_leases"
+    __table_args__ = (
+        CheckConstraint("id = 1 AND generation > 0", name="ck_lease_singleton"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner: Mapped[str] = mapped_column(String(100), nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class TaskAttemptRecord(Base):
+    __tablename__ = "task_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('executing', 'succeeded', 'failed', 'cancelled', 'indeterminate')",
+            name="ck_attempt_state",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    runner_id: Mapped[str] = mapped_column(
+        ForeignKey("benchmark_runners.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(20), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class ConversationMessageRecord(Base):
+    __tablename__ = "conversation_messages"
+    __table_args__ = (
+        CheckConstraint(
+            "position >= 0 AND role IN ('user', 'assistant')",
+            name="ck_message_position_role",
+        ),
+    )
+    instance_id: Mapped[str] = mapped_column(
+        ForeignKey("benchmark_task_instances.id", ondelete="CASCADE"), primary_key=True
+    )
+    conversation: Mapped[str] = mapped_column(String(64), primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    runner_id: Mapped[str] = mapped_column(
+        ForeignKey("benchmark_runners.id"), nullable=False
+    )
 
 
 class BenchmarkCampaignRecord(Base):
@@ -230,8 +286,8 @@ class BenchmarkTaskInstanceRecord(Base):
     )
 
 
-class BenchmarkRunnerDispatchRecord(Base):
-    __tablename__ = "benchmark_runner_dispatches"
+class ExecutionNodeRecord(Base):
+    __tablename__ = "execution_nodes"
     __table_args__ = (
         UniqueConstraint(
             "runner_plan_id", "dispatch_key", name="uq_runner_dispatch_plan_key"
@@ -239,7 +295,13 @@ class BenchmarkRunnerDispatchRecord(Base):
         UniqueConstraint(
             "task_instance_id", "node_id", name="uq_runner_dispatch_task_node"
         ),
-        UniqueConstraint("runner_id", name="uq_runner_dispatch_runner"),
+        Index("ix_runner_dispatch_runner", "runner_id"),
+        Index(
+            "uq_runner_dispatch_plan_runner",
+            "runner_id",
+            unique=True,
+            postgresql_where=text("runner_plan_id IS NOT NULL"),
+        ),
         CheckConstraint(
             "state IN ('blocked', 'pending', 'emitted', 'cancelled')",
             name="ck_runner_dispatch_state",
@@ -340,7 +402,6 @@ class BenchmarkRunnerRecord(Base):
         Boolean, default=False, nullable=False
     )
     scheduler_id: Mapped[Optional[str]] = mapped_column(String(100))
-    process_id: Mapped[Optional[int]] = mapped_column(Integer)
     exit_code: Mapped[Optional[int]] = mapped_column(Integer)
     summary: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON_DOCUMENT)
     request_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -423,9 +484,7 @@ class RunnerRecordFactory:
         )
 
     @classmethod
-    def from_dispatch(
-        cls, dispatch: BenchmarkRunnerDispatchRecord
-    ) -> BenchmarkRunnerRecord:
+    def from_dispatch(cls, dispatch: ExecutionNodeRecord) -> BenchmarkRunnerRecord:
         """Create one queued Runner while preserving Dispatch provenance."""
 
         lineage: Mapping[str, Any] = dispatch.lineage or {}
@@ -579,6 +638,7 @@ class Database:
         engine_options: Dict[str, Any] = {
             "echo": config.echo,
             "pool_pre_ping": True,
+            "hide_parameters": True,
         }
         engine_options.update(
             pool_size=config.pool_size,
@@ -591,7 +651,53 @@ class Database:
 
     async def create_schema(self) -> None:
         async with self.engine.begin() as connection:
+            existing_columns = await self._schema_columns(connection)
+            if existing_columns and not self._has_required_columns(existing_columns):
+                raise RuntimeError(
+                    "schema_mismatch: required database tables or columns are missing"
+                )
             await connection.run_sync(Base.metadata.create_all)
+
+    @staticmethod
+    async def _schema_columns(connection: AsyncConnection) -> Dict[str, set[str]]:
+        rows = await connection.execute(
+            text(
+                "SELECT relation.tablename, column_info.column_name "
+                "FROM pg_tables AS relation "
+                "LEFT JOIN information_schema.columns AS column_info "
+                "ON column_info.table_schema = relation.schemaname "
+                "AND column_info.table_name = relation.tablename "
+                "WHERE relation.schemaname = current_schema()"
+            )
+        )
+        columns: Dict[str, set[str]] = {}
+        for row in rows:
+            table_name = str(row[0])
+            column_name = row[1]
+            table_columns = columns.setdefault(table_name, set())
+            if isinstance(column_name, str):
+                table_columns.add(column_name)
+        return columns
+
+    @staticmethod
+    def _has_required_columns(columns: Mapping[str, set[str]]) -> bool:
+        return all(
+            table_name in columns
+            and {column.name for column in table.columns} <= columns[table_name]
+            for table_name, table in Base.metadata.tables.items()
+        )
+
+    async def schema_status(self) -> str:
+        try:
+            async with self.engine.connect() as connection:
+                columns = await self._schema_columns(connection)
+                return (
+                    "ready"
+                    if self._has_required_columns(columns)
+                    else "schema_mismatch"
+                )
+        except Exception:
+            return "schema_mismatch" if await self.ping() else "unavailable"
 
     async def ping(self) -> bool:
         try:
@@ -636,7 +742,7 @@ def _runner_dict(runner: BenchmarkRunnerRecord) -> Dict[str, Any]:
         "stdout": runner.stdout,
         "stderr": runner.stderr,
         "worker": {
-            "process_id": runner.process_id,
+            "process_id": None,
             "exit_code": runner.exit_code,
         },
     }
@@ -681,7 +787,7 @@ def _runner_list_dict(runner: BenchmarkRunnerRecord) -> Dict[str, Any]:
         "finished_at": runner.finished_at,
         "scheduler_id": runner.scheduler_id,
         "worker": {
-            "process_id": runner.process_id,
+            "process_id": None,
             "exit_code": runner.exit_code,
         },
     }
@@ -753,7 +859,7 @@ def _task_instance_dict(
     }
 
 
-def _dispatch_dict(dispatch: BenchmarkRunnerDispatchRecord) -> Dict[str, Any]:
+def _dispatch_dict(dispatch: ExecutionNodeRecord) -> Dict[str, Any]:
     return {
         "dispatch_id": dispatch.id,
         "campaign_id": dispatch.campaign_id,
@@ -775,6 +881,260 @@ class RunnerRepository:
 
     def __init__(self, database: Database):
         self.database = database
+        self.runtime_owner: Optional[str] = None
+        self.runtime_generation = 0
+        self.lease_seconds = 30
+
+    async def acquire_runtime(self, owner: str) -> None:
+        async with self.database.sessions() as session, session.begin():
+            await session.execute(
+                select(func.pg_advisory_xact_lock(RUNNER_CLAIM_LOCK_ID))
+            )
+            lease = await session.get(ExecutionLeaseRecord, 1, with_for_update=True)
+            now = utcnow()
+            if lease is not None and lease.expires_at > now:
+                raise RuntimeError("Another Backend owns the runtime lease")
+            generation = lease.generation + 1 if lease is not None else 1
+            if lease is None:
+                lease = ExecutionLeaseRecord(
+                    id=1,
+                    owner=owner,
+                    generation=generation,
+                    expires_at=now + timedelta(seconds=self.lease_seconds),
+                )
+                session.add(lease)
+            else:
+                lease.owner = owner
+                lease.generation = generation
+                lease.expires_at = now + timedelta(seconds=self.lease_seconds)
+        self.runtime_owner = owner
+        self.runtime_generation = generation
+
+    async def _check_runtime(self, session: AsyncSession, renew: bool = False) -> None:
+        # Repository-only administrative/test calls do not acquire runtime ownership.
+        if self.runtime_owner is None:
+            return
+        lease = await session.get(ExecutionLeaseRecord, 1, with_for_update=True)
+        now = utcnow()
+        if (
+            lease is None
+            or lease.owner != self.runtime_owner
+            or lease.generation != self.runtime_generation
+            or lease.expires_at <= now
+        ):
+            raise RuntimeError("Runtime ownership expired or was fenced")
+        if renew:
+            lease.expires_at = now + timedelta(seconds=self.lease_seconds)
+
+    async def release_runtime(self) -> None:
+        async with self.database.sessions() as session, session.begin():
+            await session.execute(
+                update(ExecutionLeaseRecord)
+                .where(
+                    ExecutionLeaseRecord.id == 1,
+                    ExecutionLeaseRecord.owner == self.runtime_owner,
+                    ExecutionLeaseRecord.generation == self.runtime_generation,
+                )
+                .values(expires_at=utcnow())
+            )
+        self.runtime_owner = None
+
+    async def runtime_snapshot(self, runner_id: Optional[str] = None) -> Dict[str, Any]:
+        async with self.database.sessions() as session, session.begin():
+            await self._check_runtime(session, renew=True)
+            runners = (
+                list(
+                    (
+                        await session.execute(
+                            select(BenchmarkRunnerRecord)
+                            .where(
+                                BenchmarkRunnerRecord.status == QUEUED,
+                                BenchmarkRunnerRecord.cancel_requested.is_(False),
+                            )
+                            .order_by(BenchmarkRunnerRecord.created_at)
+                        )
+                    ).scalars()
+                )
+                if runner_id is None
+                else []
+            )
+            round_campaigns = {
+                runner.campaign_id
+                for runner in runners
+                if (runner.user_metadata or {}).get("runner_round")
+            }
+            round_records = (
+                list(
+                    (
+                        await session.execute(
+                            select(BenchmarkRunnerRecord).where(
+                                BenchmarkRunnerRecord.campaign_id.in_(round_campaigns),
+                                BenchmarkRunnerRecord.status.in_({QUEUED, RUNNING}),
+                            )
+                        )
+                    ).scalars()
+                )
+                if round_campaigns
+                else []
+            )
+            instance_query = select(BenchmarkTaskInstanceRecord)
+            if runner_id is None:
+                instance_query = instance_query.where(
+                    BenchmarkTaskInstanceRecord.state.in_(TASK_INSTANCE_PENDING_STATES)
+                )
+            else:
+                committed_runner = await session.get(BenchmarkRunnerRecord, runner_id)
+                context = (
+                    (committed_runner.benchmark_config.get("task_context") or {})
+                    if committed_runner is not None
+                    else {}
+                )
+                instance_query = instance_query.where(
+                    BenchmarkTaskInstanceRecord.id == context.get("instance_id", "")
+                )
+            instances = list((await session.execute(instance_query)).scalars())
+            snapshots: List[Dict[str, Any]] = []
+            for instance in instances:
+                nodes = list(
+                    (
+                        await session.execute(
+                            select(ExecutionNodeRecord).where(
+                                ExecutionNodeRecord.task_instance_id == instance.id
+                            )
+                        )
+                    ).scalars()
+                )
+                snapshots.append(
+                    {
+                        "instance_id": instance.id,
+                        "state": instance.state,
+                        "created_at": instance.created_at,
+                        "nodes": [
+                            {
+                                "node_id": node.id,
+                                "dependencies": tuple(
+                                    (node.lineage or {}).get("dependencies", ())
+                                ),
+                                "delay_seconds": float(
+                                    (node.lineage or {}).get("after_seconds", 0)
+                                ),
+                                "state": node.state,
+                                "terminal_status": (node.lineage or {}).get(
+                                    "terminal_status"
+                                ),
+                                "completed_at": (
+                                    datetime.fromisoformat(
+                                        node.lineage["actual_completed_at"]
+                                    )
+                                    if (node.lineage or {}).get("actual_completed_at")
+                                    else None
+                                ),
+                            }
+                            for node in nodes
+                        ],
+                    }
+                )
+            return {
+                "runners": [_runner_dict(runner) for runner in runners],
+                "round_states": [
+                    {
+                        "campaign_id": record.campaign_id,
+                        "status": record.status,
+                        "round_index": record.user_metadata["runner_round"]["index"],
+                    }
+                    for record in round_records
+                    if (record.user_metadata or {}).get("runner_round")
+                ],
+                "instances": snapshots,
+            }
+
+    async def activate_node(
+        self, node_id: str, due_at: datetime
+    ) -> Optional[Dict[str, Any]]:
+        async with self.database.sessions() as session, session.begin():
+            await self._check_runtime(session)
+            node = await session.get(ExecutionNodeRecord, node_id, with_for_update=True)
+            if node is None or node.state not in {"blocked", "pending"}:
+                return None
+            instance = await session.get(
+                BenchmarkTaskInstanceRecord, node.task_instance_id, with_for_update=True
+            )
+            if instance is None or instance.state not in TASK_INSTANCE_PENDING_STATES:
+                return None
+            node.due_at = due_at
+            node.state = "pending"
+            await self._emit_dispatch(session, node, utcnow(), self.runtime_owner)
+            instance.state = "active"
+            runner = await session.get(BenchmarkRunnerRecord, node.runner_id)
+            return _runner_dict(runner) if runner is not None else None
+
+    async def start_selected(
+        self, runner_id: str, owner: str
+    ) -> Optional[Dict[str, Any]]:
+        async with self.database.sessions() as session, session.begin():
+            await self._check_runtime(session)
+            runner = await session.get(
+                BenchmarkRunnerRecord, runner_id, with_for_update=True
+            )
+            if runner is None or runner.status != QUEUED or runner.cancel_requested:
+                return None
+            context = runner.benchmark_config.get("task_context") or {}
+            if context:
+                instance = await session.get(
+                    BenchmarkTaskInstanceRecord,
+                    context["instance_id"],
+                    with_for_update=True,
+                )
+                if instance is None or instance.state in TASK_INSTANCE_TERMINAL_STATES:
+                    runner.status = CANCELLED
+                    runner.finished_at = utcnow()
+                    session.add(
+                        self._event(
+                            runner_id, CANCELLED, "Task instance no longer executable"
+                        )
+                    )
+                    return None
+            runner.status = RUNNING
+            runner.started_at = utcnow()
+            runner.heartbeat_at = runner.started_at
+            runner.scheduler_id = owner
+            session.add(
+                TaskAttemptRecord(
+                    id=str(uuid4()),
+                    runner_id=runner_id,
+                    generation=self.runtime_generation,
+                    state="executing",
+                    started_at=runner.started_at,
+                )
+            )
+            session.add(
+                self._event(runner_id, RUNNING, "Admitted by runtime Scheduler")
+            )
+            context = runner.benchmark_config.get("task_context") or {}
+            if context.get("conversation"):
+                messages = list(
+                    (
+                        await session.execute(
+                            select(ConversationMessageRecord)
+                            .where(
+                                ConversationMessageRecord.instance_id
+                                == context["instance_id"],
+                                ConversationMessageRecord.conversation
+                                == context["conversation"],
+                            )
+                            .order_by(ConversationMessageRecord.position)
+                        )
+                    ).scalars()
+                )
+                benchmark = dict(runner.benchmark_config)
+                benchmark["conversation_messages"] = [
+                    {"role": item.role, "content": item.content} for item in messages
+                ]
+                # History is a transient execution input, never copied into Runner metadata.
+                result = _runner_dict(runner)
+                result["benchmark"] = benchmark
+                return result
+            return _runner_dict(runner)
 
     @staticmethod
     def _event(runner_id: str, status: str, message: Optional[str] = None):
@@ -879,8 +1239,8 @@ class RunnerRepository:
         dispatch_key: Optional[str] = None,
         task_instance_id: Optional[str] = None,
         node_id: Optional[str] = None,
-    ) -> BenchmarkRunnerDispatchRecord:
-        return BenchmarkRunnerDispatchRecord(
+    ) -> ExecutionNodeRecord:
+        return ExecutionNodeRecord(
             id=str(uuid4()),
             campaign_id=campaign_id,
             runner_plan_id=runner_plan_id,
@@ -996,7 +1356,7 @@ class RunnerRepository:
         plans = []
         definition_records: List[BenchmarkTaskDefinitionRecord] = []
         instance_records: List[BenchmarkTaskInstanceRecord] = []
-        dispatch_records: List[BenchmarkRunnerDispatchRecord] = []
+        dispatch_records: List[ExecutionNodeRecord] = []
         async with self.database.sessions() as session, session.begin():
             database_now = utcnow()
             if runner_plans or task_definitions:
@@ -1064,10 +1424,17 @@ class RunnerRepository:
                     )
                     for node in assembly.nodes:
                         dispatch_records.append(
-                            BenchmarkRunnerDispatchRecord(
+                            ExecutionNodeRecord(
                                 id=node.dispatch_id,
                                 campaign_id=campaign.id,
-                                due_at=database_now if not node.dependencies else None,
+                                due_at=(
+                                    (
+                                        database_now
+                                        + timedelta(seconds=node.after_seconds)
+                                    )
+                                    if not node.dependencies
+                                    else None
+                                ),
                                 state="pending" if not node.dependencies else "blocked",
                                 task_instance_id=assembly.instance_id,
                                 node_id=node.node_id,
@@ -1079,6 +1446,8 @@ class RunnerRepository:
                                         "after_seconds": node.after_seconds,
                                         "role": node.role,
                                         "payload_id": node.payload_id,
+                                        "parallel_leader": node.parallel_leader,
+                                        "parallel_size": node.parallel_size,
                                     }
                                 ),
                             )
@@ -1240,10 +1609,10 @@ class RunnerRepository:
             plan.updated_at = utcnow()
             if action == "cancel":
                 await session.execute(
-                    update(BenchmarkRunnerDispatchRecord)
+                    update(ExecutionNodeRecord)
                     .where(
-                        BenchmarkRunnerDispatchRecord.runner_plan_id == plan.id,
-                        BenchmarkRunnerDispatchRecord.state == "pending",
+                        ExecutionNodeRecord.runner_plan_id == plan.id,
+                        ExecutionNodeRecord.state == "pending",
                     )
                     .values(state="cancelled")
                 )
@@ -1282,14 +1651,22 @@ class RunnerRepository:
                 await self._materialize_plan(session, plan, database_now, planner_id)
             await session.flush()
             dispatch_statement = (
-                select(BenchmarkRunnerDispatchRecord)
+                select(ExecutionNodeRecord)
                 .where(
-                    BenchmarkRunnerDispatchRecord.state == "pending",
-                    BenchmarkRunnerDispatchRecord.due_at <= func.now(),
+                    ExecutionNodeRecord.state == "pending",
+                    ExecutionNodeRecord.runner_plan_id.is_not(None),
+                    ExecutionNodeRecord.due_at <= func.now(),
+                    or_(
+                        ExecutionNodeRecord.lineage["parallel_leader"]
+                        .as_string()
+                        .is_(None),
+                        ExecutionNodeRecord.lineage["parallel_leader"].as_string()
+                        == ExecutionNodeRecord.id,
+                    ),
                 )
                 .order_by(
-                    BenchmarkRunnerDispatchRecord.due_at.asc(),
-                    BenchmarkRunnerDispatchRecord.created_at.asc(),
+                    ExecutionNodeRecord.due_at.asc(),
+                    ExecutionNodeRecord.created_at.asc(),
                 )
                 .with_for_update(skip_locked=True)
                 .limit(limit)
@@ -1304,16 +1681,18 @@ class RunnerRepository:
     async def _emit_dispatch(
         self,
         session: AsyncSession,
-        dispatch: BenchmarkRunnerDispatchRecord,
+        dispatch: ExecutionNodeRecord,
         database_now: datetime,
         planner_id: Optional[str],
     ) -> None:
         runner = RunnerRecordFactory.from_dispatch(dispatch)
+        members = [dispatch]
         session.add(runner)
         await session.flush()
-        dispatch.state = "emitted"
-        dispatch.runner_id = runner.id
-        dispatch.emitted_at = database_now
+        for member in members:
+            member.state = "emitted"
+            member.runner_id = runner.id
+            member.emitted_at = database_now
         session.add(
             self._event(runner.id, QUEUED, f"Emitted by Planner {planner_id or '-'}")
         )
@@ -1412,10 +1791,10 @@ class RunnerRepository:
             pending_dispatches = (
                 await session.execute(
                     select(func.count())
-                    .select_from(BenchmarkRunnerDispatchRecord)
+                    .select_from(ExecutionNodeRecord)
                     .where(
-                        BenchmarkRunnerDispatchRecord.runner_plan_id == plan.id,
-                        BenchmarkRunnerDispatchRecord.state == "pending",
+                        ExecutionNodeRecord.runner_plan_id == plan.id,
+                        ExecutionNodeRecord.state == "pending",
                     )
                 )
             ).scalar_one()
@@ -1587,14 +1966,14 @@ class RunnerRepository:
                     task_statuses[str(campaign_id)][str(task_state)] = int(count)
                 dispatch_statement = (
                     select(
-                        BenchmarkRunnerDispatchRecord.campaign_id,
-                        BenchmarkRunnerDispatchRecord.state,
+                        ExecutionNodeRecord.campaign_id,
+                        ExecutionNodeRecord.state,
                         func.count(),
                     )
-                    .where(BenchmarkRunnerDispatchRecord.campaign_id.in_(campaign_ids))
+                    .where(ExecutionNodeRecord.campaign_id.in_(campaign_ids))
                     .group_by(
-                        BenchmarkRunnerDispatchRecord.campaign_id,
-                        BenchmarkRunnerDispatchRecord.state,
+                        ExecutionNodeRecord.campaign_id,
+                        ExecutionNodeRecord.state,
                     )
                 )
                 for campaign_id, dispatch_state, count in await session.execute(
@@ -1778,9 +2157,9 @@ class RunnerRepository:
                 for task_state, count in await session.execute(task_statement)
             }
             dispatch_statement = (
-                select(BenchmarkRunnerDispatchRecord.state, func.count())
-                .where(BenchmarkRunnerDispatchRecord.campaign_id == campaign_id)
-                .group_by(BenchmarkRunnerDispatchRecord.state)
+                select(ExecutionNodeRecord.state, func.count())
+                .where(ExecutionNodeRecord.campaign_id == campaign_id)
+                .group_by(ExecutionNodeRecord.state)
             )
             dispatch_statuses = {
                 str(dispatch_state): int(count)
@@ -1821,8 +2200,8 @@ class RunnerRepository:
             )
             instances = list((await session.execute(task_statement)).scalars().all())
             dispatch_statement = (
-                select(BenchmarkRunnerDispatchRecord)
-                .where(BenchmarkRunnerDispatchRecord.campaign_id == campaign_id)
+                select(ExecutionNodeRecord)
+                .where(ExecutionNodeRecord.campaign_id == campaign_id)
                 .with_for_update()
             )
             dispatches = list(
@@ -1902,56 +2281,6 @@ class RunnerRepository:
             serializer = _runner_dict if full else _runner_list_dict
             return [serializer(row) for row in rows]
 
-    async def claim_next(self, scheduler_id: str) -> Optional[Dict[str, Any]]:
-        async with self.database.sessions() as session, session.begin():
-            # Serialize the very small claim transaction across Backend replicas.
-            # Without this lock, simultaneous slots can all observe the same campaign
-            # counts before any claim commits and defeat fair sharing in a burst.
-            await session.execute(
-                select(func.pg_advisory_xact_lock(RUNNER_CLAIM_LOCK_ID))
-            )
-            running_runner = aliased(BenchmarkRunnerRecord)
-            campaign_running_count = (
-                select(func.count(running_runner.id))
-                .where(
-                    running_runner.status == RUNNING,
-                    running_runner.campaign_id == BenchmarkRunnerRecord.campaign_id,
-                )
-                .correlate(BenchmarkRunnerRecord)
-                .scalar_subquery()
-            )
-            statement = (
-                select(BenchmarkRunnerRecord)
-                .where(BenchmarkRunnerRecord.status == QUEUED)
-                .order_by(
-                    campaign_running_count.asc(),
-                    BenchmarkRunnerRecord.created_at.asc(),
-                )
-                .with_for_update(skip_locked=True)
-                .limit(1)
-            )
-            runner = (await session.execute(statement)).scalar_one_or_none()
-            if runner is None:
-                return None
-            now = utcnow()
-            runner.status = RUNNING
-            runner.started_at = now
-            runner.heartbeat_at = now
-            runner.scheduler_id = scheduler_id
-            session.add(
-                self._event(runner.id, RUNNING, f"Claimed by Scheduler {scheduler_id}")
-            )
-            await session.flush()
-            return _runner_dict(runner)
-
-    async def set_process(self, runner_id: str, process_id: int) -> None:
-        async with self.database.sessions() as session, session.begin():
-            await session.execute(
-                update(BenchmarkRunnerRecord)
-                .where(BenchmarkRunnerRecord.id == runner_id)
-                .values(process_id=process_id, heartbeat_at=utcnow())
-            )
-
     async def set_logs(
         self, runner_id: str, exit_code: int, stdout: str, stderr: str
     ) -> None:
@@ -1964,6 +2293,7 @@ class RunnerRepository:
 
     async def heartbeat(self, runner_id: str) -> bool:
         async with self.database.sessions() as session, session.begin():
+            await self._check_runtime(session)
             statement = (
                 update(BenchmarkRunnerRecord)
                 .where(
@@ -1973,7 +2303,8 @@ class RunnerRepository:
                 .values(heartbeat_at=utcnow())
                 .returning(BenchmarkRunnerRecord.cancel_requested)
             )
-            return bool((await session.execute(statement)).scalar_one_or_none())
+            cancellation = (await session.execute(statement)).scalar_one_or_none()
+            return cancellation is None or bool(cancellation)
 
     async def request_cancel(self, runner_id: str) -> Optional[Dict[str, Any]]:
         async with self.database.sessions() as session, session.begin():
@@ -1992,7 +2323,7 @@ class RunnerRepository:
                 runner.status = CANCELLED
                 finished_at = utcnow()
                 runner.finished_at = finished_at
-                await self._advance_task_instance(
+                await self._checkpoint_task_result(
                     session, runner, CANCELLED, finished_at
                 )
                 session.add(
@@ -2003,7 +2334,7 @@ class RunnerRepository:
             await session.flush()
             return _runner_dict(runner)
 
-    async def _advance_task_instance(
+    async def _checkpoint_task_result(
         self,
         session: AsyncSession,
         runner: BenchmarkRunnerRecord,
@@ -2013,10 +2344,56 @@ class RunnerRepository:
         request_completed_at: Optional[datetime] = None,
         request_prompt_hash: Optional[str] = None,
         request_payload_evidence: Optional[Mapping[str, Any]] = None,
+        request_metrics: Optional[Sequence[Mapping[str, Any]]] = None,
+        task_context_override: Optional[Mapping[str, Any]] = None,
     ) -> None:
         """Advance a compiled invoke DAG without task-specific runtime branches."""
 
-        context = (runner.benchmark_config or {}).get("task_context")
+        grouped_contexts = (runner.benchmark_config or {}).get("task_contexts")
+        if grouped_contexts and task_context_override is None:
+            for invocation in grouped_contexts:
+                matches = [
+                    request
+                    for request in (request_metrics or ())
+                    if all(
+                        (request.get("request_metadata") or {}).get(name)
+                        == invocation.get(name)
+                        for name in ("instance_id", "node_id", "payload_id")
+                    )
+                ]
+                evidence = matches[0] if len(matches) == 1 else {}
+                node_status = terminal_status
+                if terminal_status == SUCCEEDED and (
+                    len(matches) != 1 or evidence.get("error_code") is not None
+                ):
+                    node_status = FAILED
+                metadata = evidence.get("request_metadata") or {}
+                timing = evidence.get("request_timing") or {}
+                instants: Dict[str, datetime] = {}
+                for name in ("client_start_utc", "completed_utc"):
+                    value = timing.get(name)
+                    if isinstance(value, str):
+                        try:
+                            instants[name] = as_utc(datetime.fromisoformat(value))
+                        except ValueError:
+                            pass
+                await self._checkpoint_task_result(
+                    session,
+                    runner,
+                    node_status,
+                    occurred_at,
+                    request_started_at=instants.get("client_start_utc"),
+                    request_completed_at=instants.get("completed_utc"),
+                    request_prompt_hash=metadata.get("prompt_hash"),
+                    request_payload_evidence=metadata.get("payload_evidence"),
+                    task_context_override=invocation,
+                )
+            return
+        context = (
+            task_context_override
+            if task_context_override is not None
+            else (runner.benchmark_config or {}).get("task_context")
+        )
         if not isinstance(context, Mapping):
             return
         instance_id = context.get("instance_id")
@@ -2040,8 +2417,9 @@ class RunnerRepository:
             return
         source = (
             await session.execute(
-                select(BenchmarkRunnerDispatchRecord)
-                .where(BenchmarkRunnerDispatchRecord.runner_id == runner.id)
+                select(ExecutionNodeRecord)
+                .where(ExecutionNodeRecord.runner_id == runner.id)
+                .where(ExecutionNodeRecord.node_id == node_id)
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -2055,6 +2433,7 @@ class RunnerRepository:
         source_lineage = dict(source.lineage or {})
         source_lineage["actual_started_at"] = started_at.isoformat()
         source_lineage["actual_completed_at"] = completed_at.isoformat()
+        source_lineage["terminal_status"] = terminal_status
         source.lineage = json_safe(source_lineage)
 
         outcome = dict(instance.outcome or {})
@@ -2118,50 +2497,12 @@ class RunnerRepository:
 
         dispatch_rows_statement = self._task_dispatch_rows_statement(instance_id)
         rows = list((await session.execute(dispatch_rows_statement)).all())
-        statuses = {
-            dispatch.id: (
-                terminal_status
-                if dispatch.id == source.id
-                else runner_record.status if runner_record is not None else None
-            )
-            for dispatch, runner_record in rows
-        }
-        completions = {}
-        for dispatch, runner_record in rows:
-            if dispatch.id == source.id:
-                completions[dispatch.id] = completed_at
-                continue
-            value = (dispatch.lineage or {}).get("actual_completed_at")
-            if isinstance(value, str):
-                try:
-                    completions[dispatch.id] = as_utc(datetime.fromisoformat(value))
-                    continue
-                except ValueError:
-                    pass
-            if runner_record is not None and runner_record.finished_at is not None:
-                completions[dispatch.id] = runner_record.finished_at
-
-        for dispatch, _ in rows:
-            if dispatch.state != "blocked":
-                continue
-            dependencies = list((dispatch.lineage or {}).get("dependencies") or [])
-            if dependencies and all(
-                statuses.get(item) == SUCCEEDED for item in dependencies
-            ):
-                anchors = [completions.get(item) for item in dependencies]
-                resolved_anchors = [anchor for anchor in anchors if anchor is not None]
-                if len(resolved_anchors) != len(anchors):
-                    continue
-                dispatch.due_at = max(resolved_anchors) + timedelta(
-                    seconds=int((dispatch.lineage or {}).get("after_seconds", 0))
-                )
-                dispatch.state = "pending"
-
         instance.state = (
             "completed"
             if rows
             and all(
-                dispatch.state == "emitted" and statuses.get(dispatch.id) == SUCCEEDED
+                dispatch.state == "emitted"
+                and (dispatch.lineage or {}).get("terminal_status") == SUCCEEDED
                 for dispatch, _ in rows
             )
             else "active"
@@ -2171,25 +2512,52 @@ class RunnerRepository:
     @staticmethod
     def _task_dispatch_rows_statement(
         instance_id: str,
-    ) -> Select[Tuple[BenchmarkRunnerDispatchRecord, BenchmarkRunnerRecord]]:
+    ) -> Select[Tuple[ExecutionNodeRecord, BenchmarkRunnerRecord]]:
         return (
-            select(BenchmarkRunnerDispatchRecord, BenchmarkRunnerRecord)
+            select(ExecutionNodeRecord, BenchmarkRunnerRecord)
             .outerjoin(
                 BenchmarkRunnerRecord,
-                BenchmarkRunnerRecord.id == BenchmarkRunnerDispatchRecord.runner_id,
+                BenchmarkRunnerRecord.id == ExecutionNodeRecord.runner_id,
             )
-            .where(BenchmarkRunnerDispatchRecord.task_instance_id == instance_id)
-            .with_for_update(of=BenchmarkRunnerDispatchRecord)
+            .where(ExecutionNodeRecord.task_instance_id == instance_id)
+            .with_for_update(of=ExecutionNodeRecord)
         )
 
     async def _cancel_task_dispatches(
         self, session: AsyncSession, instance_id: str
     ) -> None:
+        queued_runners = list(
+            (
+                await session.execute(
+                    select(BenchmarkRunnerRecord)
+                    .where(
+                        BenchmarkRunnerRecord.id.in_(
+                            select(ExecutionNodeRecord.runner_id).where(
+                                ExecutionNodeRecord.task_instance_id == instance_id
+                            )
+                        ),
+                        BenchmarkRunnerRecord.status == QUEUED,
+                    )
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        for queued_runner in queued_runners:
+            queued_runner.status = CANCELLED
+            queued_runner.cancel_requested = True
+            queued_runner.finished_at = utcnow()
+            session.add(
+                self._event(
+                    queued_runner.id,
+                    CANCELLED,
+                    "Task instance terminated before request admission",
+                )
+            )
         await session.execute(
-            update(BenchmarkRunnerDispatchRecord)
+            update(ExecutionNodeRecord)
             .where(
-                BenchmarkRunnerDispatchRecord.task_instance_id == instance_id,
-                BenchmarkRunnerDispatchRecord.state.in_(["blocked", "pending"]),
+                ExecutionNodeRecord.task_instance_id == instance_id,
+                ExecutionNodeRecord.state.in_(["blocked", "pending"]),
             )
             .values(state="cancelled")
         )
@@ -2210,6 +2578,7 @@ class RunnerRepository:
         safe_summary = json_safe(summary)
         safe_requests = [json_safe(item) for item in request_metrics]
         async with self.database.sessions() as session, session.begin():
+            await self._check_runtime(session)
             statement = (
                 select(BenchmarkRunnerRecord)
                 .where(BenchmarkRunnerRecord.id == runner_id)
@@ -2219,6 +2588,21 @@ class RunnerRepository:
             if runner is None or runner.status != RUNNING or runner.cancel_requested:
                 return False
             completed_at = utcnow()
+            if runner.benchmark_config.get("task_context") and len(safe_requests) != 1:
+                raise ValueError(
+                    "Atomic invocation requires exactly one request result"
+                )
+            await self._commit_conversation(
+                session, runner, safe_requests, terminal_status
+            )
+            await session.execute(
+                update(TaskAttemptRecord)
+                .where(
+                    TaskAttemptRecord.runner_id == runner_id,
+                    TaskAttemptRecord.generation == self.runtime_generation,
+                )
+                .values(state=terminal_status, completed_at=completed_at)
+            )
             request_started_at = None
             request_completed_at = None
             request_prompt_hash = None
@@ -2282,7 +2666,7 @@ class RunnerRepository:
                     error_message=error_message,
                 )
             )
-            await self._advance_task_instance(
+            await self._checkpoint_task_result(
                 session,
                 runner,
                 terminal_status,
@@ -2291,6 +2675,7 @@ class RunnerRepository:
                 request_completed_at=request_completed_at,
                 request_prompt_hash=request_prompt_hash,
                 request_payload_evidence=request_payload_evidence,
+                request_metrics=safe_requests,
             )
             event_message = (
                 "Results persisted"
@@ -2299,6 +2684,58 @@ class RunnerRepository:
             )
             session.add(self._event(runner_id, terminal_status, event_message))
         return True
+
+    async def _commit_conversation(
+        self,
+        session: AsyncSession,
+        runner: BenchmarkRunnerRecord,
+        requests: List[Dict[str, Any]],
+        terminal_status: str,
+    ) -> None:
+        context = runner.benchmark_config.get("task_context") or {}
+        conversation = context.get("conversation")
+        if not conversation:
+            return
+        if len(requests) != 1:
+            raise ValueError("A conversation turn requires exactly one request result")
+        turn = requests[0].pop("conversation_turn", None)
+        if terminal_status != SUCCEEDED:
+            return
+        if not isinstance(turn, dict) or not turn.get("assistant"):
+            raise ValueError("Successful conversation turn omitted its message payload")
+        await session.get(
+            BenchmarkTaskInstanceRecord, context["instance_id"], with_for_update=True
+        )
+        position = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ConversationMessageRecord)
+                    .where(
+                        ConversationMessageRecord.instance_id == context["instance_id"],
+                        ConversationMessageRecord.conversation == conversation,
+                    )
+                )
+            ).scalar_one()
+        )
+        if turn.get("parent_version") != position:
+            raise ValueError("Conversation history version conflict")
+        for offset, role in enumerate(("user", "assistant")):
+            session.add(
+                ConversationMessageRecord(
+                    instance_id=context["instance_id"],
+                    conversation=conversation,
+                    position=position + offset,
+                    role=role,
+                    content=str(turn[role]),
+                    runner_id=runner.id,
+                )
+            )
+        requests[0]["conversation"] = {
+            "name": conversation,
+            "parent_version": position,
+            "version": position + 2,
+        }
 
     async def finish_runner(
         self,
@@ -2312,6 +2749,7 @@ class RunnerRepository:
         if status not in {FAILED, CANCELLED}:
             raise ValueError(f"Unsupported terminal status: {status}")
         async with self.database.sessions() as session, session.begin():
+            await self._check_runtime(session)
             statement = (
                 select(BenchmarkRunnerRecord)
                 .where(
@@ -2331,62 +2769,50 @@ class RunnerRepository:
             runner.error_message = message
             runner.stdout = stdout
             runner.stderr = stderr
-            await self._advance_task_instance(session, runner, status, finished_at)
+            await session.execute(
+                update(TaskAttemptRecord)
+                .where(
+                    TaskAttemptRecord.runner_id == runner_id,
+                )
+                .values(
+                    state=(
+                        "indeterminate"
+                        if message.startswith("indeterminate:")
+                        else status
+                    ),
+                    completed_at=finished_at,
+                )
+            )
+            await self._checkpoint_task_result(session, runner, status, finished_at)
             session.add(self._event(runner_id, status, message))
         return True
 
     async def requeue_runner(self, runner_id: str, message: str) -> None:
-        async with self.database.sessions() as session, session.begin():
-            result = await session.execute(
-                update(BenchmarkRunnerRecord)
-                .where(
-                    BenchmarkRunnerRecord.id == runner_id,
-                    BenchmarkRunnerRecord.status == RUNNING,
-                )
-                .values(
-                    status=QUEUED,
-                    scheduler_id=None,
-                    process_id=None,
-                    heartbeat_at=None,
-                    started_at=None,
-                )
-                .returning(BenchmarkRunnerRecord.id)
-            )
-            if result.scalar_one_or_none() is not None:
-                session.add(self._event(runner_id, QUEUED, message))
+        await self.finish_runner(
+            runner_id,
+            FAILED,
+            "indeterminate: execution interrupted; automatic replay disabled",
+            None,
+            "",
+            message,
+        )
 
     async def requeue_stale(self, stale_after_seconds: int) -> int:
-        stale_before = utcnow() - timedelta(seconds=stale_after_seconds)
-        async with self.database.sessions() as session, session.begin():
-            statement = (
-                update(BenchmarkRunnerRecord)
-                .where(
-                    BenchmarkRunnerRecord.status == RUNNING,
-                    or_(
-                        BenchmarkRunnerRecord.heartbeat_at.is_(None),
-                        BenchmarkRunnerRecord.heartbeat_at < stale_before,
-                    ),
-                )
-                .values(
-                    status=QUEUED,
-                    scheduler_id=None,
-                    process_id=None,
-                    heartbeat_at=None,
-                    started_at=None,
-                )
-                .returning(BenchmarkRunnerRecord.id)
+        async with self.database.sessions() as session:
+            runner_ids = list(
+                (
+                    await session.execute(
+                        select(BenchmarkRunnerRecord.id).where(
+                            BenchmarkRunnerRecord.status == RUNNING
+                        )
+                    )
+                ).scalars()
             )
-            result = await session.execute(statement)
-            runner_ids = list(result.scalars().all())
-            session.add_all(
-                self._event(
-                    runner_id,
-                    QUEUED,
-                    "Stale Scheduler heartbeat; Runner requeued",
-                )
-                for runner_id in runner_ids
+        for runner_id in runner_ids:
+            await self.requeue_runner(
+                runner_id, "Runtime recovered unfinished execution"
             )
-            return len(runner_ids)
+        return len(runner_ids)
 
     async def get_results(
         self, runner_id: str, include_requests: bool
@@ -2469,9 +2895,9 @@ class RunnerRepository:
                 (await session.execute(instance_statement)).scalars().all()
             )
             dispatch_statement = (
-                select(BenchmarkRunnerDispatchRecord)
-                .where(BenchmarkRunnerDispatchRecord.campaign_id == campaign_id)
-                .order_by(BenchmarkRunnerDispatchRecord.created_at.asc())
+                select(ExecutionNodeRecord)
+                .where(ExecutionNodeRecord.campaign_id == campaign_id)
+                .order_by(ExecutionNodeRecord.created_at.asc())
             )
             dispatch_records = (
                 (await session.execute(dispatch_statement)).scalars().all()
@@ -2545,6 +2971,27 @@ class RunnerRepository:
                 dispatches,
                 {runner.id: _runner_dict(runner) for runner in runner_records},
             )
+            messages = (
+                list(
+                    (
+                        await session.execute(
+                            select(ConversationMessageRecord)
+                            .where(
+                                ConversationMessageRecord.instance_id.in_(
+                                    [instance.id for instance in instance_records]
+                                )
+                            )
+                            .order_by(
+                                ConversationMessageRecord.instance_id,
+                                ConversationMessageRecord.conversation,
+                                ConversationMessageRecord.position,
+                            )
+                        )
+                    ).scalars()
+                )
+                if include_requests
+                else []
+            )
             return {
                 "version": PROTOCOL_VERSION,
                 "campaign": campaign,
@@ -2563,6 +3010,17 @@ class RunnerRepository:
                 "dispatches": dispatches,
                 "task_analyses": task_analyses,
                 "runners": runners,
+                "conversation_messages": [
+                    {
+                        "instance_id": message.instance_id,
+                        "conversation": message.conversation,
+                        "position": message.position,
+                        "role": message.role,
+                        "content": message.content,
+                        "runner_id": message.runner_id,
+                    }
+                    for message in messages
+                ],
             }
 
     async def get_trusted_client_by_key_id(

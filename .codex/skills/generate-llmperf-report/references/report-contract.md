@@ -36,7 +36,11 @@ exports instead of translating or guessing their semantics.
 ## Generic task semantics
 
 One Task Instance represents one matrix coordinate and trial. Each node is one atomic
-request Runner. Interpret fields as follows:
+request; compatible parallel nodes can share a Runner. Task graph `outcome` retains the
+individual node's status, timestamps, and payload evidence. For grouped nodes, `runner`
+is null and `group_runner` holds aggregate metrics: never use those averages as individual
+node latency or cache counters. Request-level comparisons require matching exported
+requests by instance/node/payload identity. Interpret fields as follows:
 
 - `role`: author-provided semantic label, not runtime behavior;
 - `payload_id`: logical generated input family;

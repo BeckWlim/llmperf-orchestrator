@@ -15,7 +15,7 @@ from llmperf.user_config import (
     set_environment_value,
     unset_environment_value,
 )
-from llmperf_backend.config import load_config
+from llmperf_backend.config import PROVIDERS_FILE, load_config
 from llmperf_backend.outbound import (
     normalize_outbound_environment,
     configure_ray_direct,
@@ -74,7 +74,10 @@ def execute_config(arguments: argparse.Namespace) -> Dict[str, Any]:
             raise UserConfigError("Provide exactly one of VALUE or --stdin")
         value = sys.stdin.read().rstrip("\r\n") if use_stdin else arguments.value
         set_environment_value(path, arguments.name, value)
-        provider_setting = arguments.name.startswith("LLMPERF_PROVIDER_")
+        provider_setting = (
+            arguments.name == PROVIDERS_FILE
+            or arguments.name.startswith("LLMPERF_PROVIDER_")
+        )
         return {
             "name": arguments.name,
             "value": display_environment_value(arguments.name, value),
@@ -84,7 +87,10 @@ def execute_config(arguments: argparse.Namespace) -> Dict[str, Any]:
         }
     if arguments.config_command == "unset":
         removed = unset_environment_value(path, arguments.name)
-        provider_setting = arguments.name.startswith("LLMPERF_PROVIDER_")
+        provider_setting = (
+            arguments.name == PROVIDERS_FILE
+            or arguments.name.startswith("LLMPERF_PROVIDER_")
+        )
         return {
             "name": arguments.name,
             "removed": removed,

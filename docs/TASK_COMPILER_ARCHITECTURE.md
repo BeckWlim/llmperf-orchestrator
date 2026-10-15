@@ -190,8 +190,17 @@ or mutable execution state.
 2. allocates one Dispatch ID for every logical node;
 3. maps logical dependency node IDs to Dispatch IDs;
 4. injects the instance/node/payload context into a single-request Runner template;
-5. validates the compiled benchmark configuration;
-6. returns immutable assembly records for persistence.
+5. preserves an independent completion boundary for every invoke;
+6. validates the compiled benchmark configuration and returns immutable assembly records.
+
+The runtime materializes each eligible invoke independently with `task_context`. Request
+slots share actors dynamically across instances and Runners. Preview groups are singletons;
+no static grouping adds a completion barrier. Repository commits per-node results and
+history; the coordinator computes successor readiness from those committed checkpoints.
+
+Use `invoke.conversation` to append a turn to instance-scoped history. The compiler rejects
+unordered writes to one conversation. `payloads.<name>.text` optionally supplies literal
+user text. Ordinary payload seeds and replay evidence remain available.
 
 This boundary keeps UUID generation out of graph semantics. Tests can compile and compare a
 stable table, while persistence receives fully assembled records with no topology decisions
@@ -208,7 +217,7 @@ left to make.
 - Repeat counts are resolved and bounded before persistence.
 - Graph nesting, instances, and nodes per instance have explicit hard limits.
 - Longest dependency-path delay cannot exceed 24 hours.
-- All compiled Runner nodes force one request at concurrency one.
+- Each compiled invoke sends one request; compatible invokes share a bounded Runner.
 - A parallel join depends on every outgoing branch frontier.
 - UUID assignment cannot change graph shape, node order, seeds, or planned delays.
 

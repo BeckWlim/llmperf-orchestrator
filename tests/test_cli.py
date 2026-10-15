@@ -1248,6 +1248,7 @@ def test_health_projection(capsys):
     raw = {
         "status": "ok",
         "database": "connected",
+        "database_schema": "ready",
         "planner": "running",
         "providers": 3,
         "auth": {
@@ -1268,6 +1269,7 @@ def test_health_projection(capsys):
     assert projected == {
         "status": "ok",
         "database": "connected",
+        "database_schema": "ready",
         "planner": "running",
         "providers": 3,
         "auth": {
@@ -1340,6 +1342,7 @@ def test_scheduler_projection(capsys):
         "ray_mode": "local",
         "ray_address": "ray://must-not-render:10001",
         "ray_actor_num_cpus": 1,
+        "ray_actor_max_concurrency": 8,
         "ray_runtime": {
             "status": "healthy",
             "alive_nodes": 1,
@@ -1371,7 +1374,9 @@ def test_scheduler_projection(capsys):
 
     assert projection.renderer == "scheduler_status"
     assert "Scheduler: scheduler-1  Status: running" in default_output
-    assert "Capacity: busy=2 live=4 max=4 workers=2" in default_output
+    assert "Request slots: busy=2 live=4" in default_output
+    assert "Runners: active=0 max=4 workers=2" in default_output
+    assert "requests_per_actor=8" in default_output
     assert (
         "Ray: status=healthy nodes=1 object_store_available=99.65% "
         "claim_blocked=False" in default_output
@@ -1390,6 +1395,7 @@ def test_scheduler_projection(capsys):
 
     assert projection.renderer == "json"
     assert json_output["scheduler_id"] == "scheduler-1"
+    assert json_output["ray_actor_max_concurrency"] == 8
     assert (
         json_output["ray_runtime"]["object_store_available_ratio"] == 0.9964756816625595
     )

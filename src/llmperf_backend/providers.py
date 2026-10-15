@@ -96,6 +96,7 @@ class ProviderProfile:
     models_path: str
     static_models: Tuple[str, ...]
     model_cache_ttl_seconds: int
+    credential_source_env: Optional[str] = None
 
     def public_dict(self) -> Dict[str, Any]:
         discovery: Dict[str, Any] = {
@@ -122,18 +123,25 @@ class ProviderRegistry:
         self,
         profiles: Sequence[ProviderProfile],
         reload_loader: Optional[Callable[[], Mapping[str, str]]] = None,
+        profile_loader: Optional[Callable[[], Sequence[ProviderProfile]]] = None,
     ):
         self._profiles = {profile.provider_id: profile for profile in profiles}
         if not self._profiles:
             raise ProviderConfigError("At least one provider profile is required")
         self._reload_loader = reload_loader
+        self._profile_loader = profile_loader
         self._lock = threading.RLock()
         self._generation = 0
         self._loaded_at = _utcnow()
         self._credential_environment_names = {
             name
             for profile in self._profiles.values()
-            for name in (profile.api_base_env, profile.api_key_env)
+            for name in (
+                profile.api_base_env,
+                profile.api_key_env,
+                profile.credential_source_env,
+            )
+            if name is not None
         }
 
     @classmethod
@@ -143,6 +151,20 @@ class ProviderRegistry:
         *,
         reload_loader: Optional[Callable[[], Mapping[str, str]]] = None,
     ) -> "ProviderRegistry":
+        return cls(
+            cls.profiles_from_environment(environment), reload_loader=reload_loader
+        )
+
+    @classmethod
+    def from_loader(
+        cls, loader: Callable[[], Sequence[ProviderProfile]]
+    ) -> "ProviderRegistry":
+        return cls(loader(), profile_loader=loader)
+
+    @classmethod
+    def profiles_from_environment(
+        cls, environment: Optional[Mapping[str, str]] = None
+    ) -> List[ProviderProfile]:
         values = dict(os.environ if environment is None else environment)
         grouped: Dict[str, Dict[str, str]] = {}
         for name, value in values.items():
@@ -158,13 +180,10 @@ class ProviderRegistry:
                         grouped.setdefault(provider_id, {})[field] = value
                     break
 
-        return cls(
-            [
-                cls._profile_from_values(provider_id, profile_values)
-                for provider_id, profile_values in sorted(grouped.items())
-            ],
-            reload_loader=reload_loader,
-        )
+        return [
+            cls._profile_from_values(provider_id, profile_values)
+            for provider_id, profile_values in sorted(grouped.items())
+        ]
 
     @staticmethod
     def _profile_from_values(
@@ -284,13 +303,17 @@ class ProviderRegistry:
     def reload(self) -> Dict[str, Any]:
         """Validate a Provider-only candidate before one atomic registry swap."""
 
-        if self._reload_loader is None:
+        if self._reload_loader is None and self._profile_loader is None:
             raise ProviderConfigError(
                 "This Provider Registry has no reloadable configuration source"
             )
         try:
-            environment = self._reload_loader()
-            candidate = type(self).from_environment(environment)
+            if self._profile_loader is not None:
+                candidate = type(self)(self._profile_loader())
+            else:
+                assert self._reload_loader is not None
+                environment = self._reload_loader()
+                candidate = type(self).from_environment(environment)
         except ProviderConfigError:
             raise
         except Exception as exc:
@@ -312,7 +335,12 @@ class ProviderRegistry:
             self._credential_environment_names.update(
                 name
                 for profile in current.values()
-                for name in (profile.api_base_env, profile.api_key_env)
+                for name in (
+                    profile.api_base_env,
+                    profile.api_key_env,
+                    profile.credential_source_env,
+                )
+                if name is not None
             )
             self._generation += 1
             self._loaded_at = _utcnow()
@@ -359,13 +387,16 @@ class ProviderRegistry:
             name: value
             for name, value in base_environment.items()
             if not name.startswith(PROVIDER_PREFIX)
+            and name not in {"LLMPERF_REQUEST_API_BASE", "LLMPERF_REQUEST_API_KEY"}
         }
         for environment_name in credential_environment_names:
             environment.pop(environment_name, None)
         if profile.api_base:
             environment[profile.api_base_env] = profile.api_base
+            environment["LLMPERF_REQUEST_API_BASE"] = profile.api_base
         if profile.api_key:
             environment[profile.api_key_env] = profile.api_key
+            environment["LLMPERF_REQUEST_API_KEY"] = profile.api_key
         return environment
 
 

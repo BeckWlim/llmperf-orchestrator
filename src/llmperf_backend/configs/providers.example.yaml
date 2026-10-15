@@ -1,0 +1,17 @@
+version: "1.0.0"
+providers:
+  aliyun:
+    adapter: openai
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    # Read from backend.env or the Backend process environment; no inline keys.
+    api_key_env: LLMPERF_PROVIDER_ALIYUN_KEY
+    discovery:
+      mode: openai
+      path: /models
+      cache_ttl_seconds: 300
+  local:
+    adapter: openai
+    base_url: http://127.0.0.1:8001/v1
+    models: [local-model]
+    discovery:
+      mode: static

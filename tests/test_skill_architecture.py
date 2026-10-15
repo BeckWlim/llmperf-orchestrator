@@ -26,8 +26,10 @@ def test_operation_skill():
 
     assert "task_definitions" in text
     assert all(term in text for term in ("matrix", "sequence", "repeat", "parallel"))
-    assert "single-request Runner" in text
-    assert "Planner only handles" in text
+    assert "Each compiled invoke sends one request" in text
+    assert "independent completion boundary" in text
+    assert "required tables and columns" in text
+    assert "dependencies and due times" in text
     assert "prompt_hash" in text
     assert "CLIProjection" in text
     assert "whitelist projector" in text

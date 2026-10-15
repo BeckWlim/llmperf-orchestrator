@@ -107,16 +107,22 @@ def test_finite_float():
     assert json_safe(1.0) == 1.0
 
 
-def test_shared_ray_options(monkeypatch):
-    fake_benchmark = SimpleNamespace(
-        get_token_throughput_latencies=lambda **options: ({"ok": True}, [])
-    )
+@pytest.mark.parametrize("count_mode", ["provider", "local"])
+def test_shared_ray_options(monkeypatch, count_mode):
+    received_options = {}
+
+    def calculate(**options):
+        received_options.update(options)
+        return {"ok": True}, []
+
+    fake_benchmark = SimpleNamespace(get_token_throughput_latencies=calculate)
     import sys
 
     monkeypatch.setitem(sys.modules, "llmperf.token_benchmark_ray", fake_benchmark)
 
     benchmark = dump_model(BenchmarkConfig(provider="test", model="test"))
     benchmark["adapter"] = "openai"
+    benchmark["output_token_count"] = count_mode
     result = _calculate(
         benchmark,
         {
@@ -128,12 +134,14 @@ def test_shared_ray_options(monkeypatch):
     )
 
     assert result[0]["ok"] is True
+    assert received_options["output_token_count"] == count_mode
     assert result[0]["execution_runtime"] == {
         "backend": "ray",
         "worker_kind": "ray_task",
         "ray_mode": "external",
         "ray_namespace": "llmperf-control",
         "ray_actor_num_cpus": 1.0,
+        "ray_actor_max_concurrency": 1,
     }
     assert result[1] == []
 
@@ -149,6 +157,7 @@ def test_worker_environment():
             "LLMPERF_PRIVATE_KEY": "must-not-propagate",
             "DATABASE_URL": "must-not-propagate",
             "LLMPERF_WORKER_RAY_ACTOR_CPUS": "0.5",
+            "LLMPERF_WORKER_RAY_ACTOR_CONCURRENCY": "8",
         }
     )
 
@@ -159,6 +168,7 @@ def test_worker_environment():
     assert runtime["NO_PROXY"] == "127.0.0.1,localhost"
     assert runtime["RAY_grpc_enable_http_proxy"] == "0"
     assert runtime["LLMPERF_WORKER_RAY_ACTOR_CPUS"] == "0.5"
+    assert runtime["LLMPERF_WORKER_RAY_ACTOR_CONCURRENCY"] == "8"
     assert "LLMPERF_PROXY" not in runtime
     assert "LLMPERF_PRIVATE_KEY" not in runtime
     assert "DATABASE_URL" not in runtime
@@ -171,6 +181,13 @@ def test_worker_actor_count():
     assert benchmark_actor_count(benchmark) == 3
     benchmark["cache_probe"] = {"trials": 2}
     assert benchmark_actor_count(benchmark) == 2
+    assert benchmark_actor_count(benchmark, 8) == 1
+    benchmark["cache_probe"] = None
+    benchmark["concurrent_requests"] = 64
+    benchmark["max_completed_requests"] = 640
+    assert benchmark_actor_count(benchmark, 8) == 8
+    benchmark["concurrent_requests"] = 65
+    assert benchmark_actor_count(benchmark, 8) == 9
 
 
 def test_worker_handle():
@@ -282,7 +299,8 @@ def test_async_result_failure():
     assert caught.value is error
 
 
-def test_actor_resource_options(monkeypatch):
+@pytest.mark.parametrize("concurrency", [1, 8])
+def test_actor_resource_options(monkeypatch, concurrency):
     import sys
 
     captured = {}
@@ -303,6 +321,7 @@ def test_actor_resource_options(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(remote=remote))
     monkeypatch.setenv(RAY_ACTOR_CPUS_ENV, "0.5")
+    monkeypatch.setenv("LLMPERF_WORKER_RAY_ACTOR_CONCURRENCY", str(concurrency))
     _ray_client_class.cache_clear()
 
     clients = construct_clients("openai", 2)
@@ -311,7 +330,7 @@ def test_actor_resource_options(monkeypatch):
     assert captured.pop("client_class").__name__ == "OpenAIChatCompletionsClient"
     assert captured == {
         "num_cpus": 0.5,
-        "max_concurrency": 1,
+        "max_concurrency": concurrency,
         "max_restarts": 0,
         "max_task_retries": 0,
     }
@@ -344,7 +363,6 @@ def test_list_projection():
         started_at=None,
         finished_at=created_at,
         scheduler_id="scheduler-1",
-        process_id=62791,
         exit_code=1,
         stdout="large stdout",
         stderr="large stderr",
@@ -364,7 +382,7 @@ def test_list_projection():
         "error_rate": 1.0,
     }
     assert listed["scheduler_id"] == "scheduler-1"
-    assert listed["worker"] == {"process_id": 62791, "exit_code": 1}
+    assert listed["worker"] == {"process_id": None, "exit_code": 1}
     assert "summary" not in listed
     assert "stdout" not in listed
     assert "stderr" not in listed

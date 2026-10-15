@@ -143,6 +143,40 @@ def test_embedded_task_runner():
     assert result["metrics"]["provider_requests"] == 2
 
 
+def test_grouped_capacity():
+    task = {
+        "name": "load64",
+        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "workflow": [
+            {"invoke": {"name": "prime", "payload": "replay"}},
+            {
+                "parallel": {
+                    "name": "load",
+                    "branches": [
+                        {"invoke": {"name": f"request-{index}", "payload": "replay"}}
+                        for index in range(64)
+                    ],
+                }
+            },
+            {"invoke": {"name": "join", "payload": "replay"}},
+        ],
+    }
+    result = assess_workload(
+        [],
+        [],
+        [{"definition": task, "runner_template": {"benchmark": BENCHMARK}}],
+        PerformanceGuardConfig(max_runner_concurrency=64, max_effective_concurrency=64),
+        scheduler_slots=64,
+        ray_actor_capacity=8,
+        ray_actor_max_concurrency=8,
+        now=NOW,
+    )
+    assert result["metrics"]["planned_runners"] == 66
+    assert result["metrics"]["provider_requests"] == 66
+    assert result["metrics"]["effective_concurrency"] == 64
+    assert result["metrics"]["ray_actor_demand"] == 8
+
+
 def test_workload_rejection():
     guard = PerformanceGuardConfig(max_campaign_provider_requests=9)
 
@@ -185,15 +219,52 @@ def test_object_store_watermarks():
 
 
 def test_ray_capacity():
-    with pytest.raises(WorkloadSafetyError) as captured:
-        assess_workload(
-            [{"benchmark": BENCHMARK}] * 4,
-            [],
-            [],
-            PerformanceGuardConfig(),
-            scheduler_slots=4,
-            ray_actor_capacity=4,
-            now=NOW,
-        )
+    result = assess_workload(
+        [{"benchmark": BENCHMARK}] * 4,
+        [],
+        [],
+        PerformanceGuardConfig(),
+        scheduler_slots=4,
+        ray_actor_capacity=4,
+        now=NOW,
+    )
+    assert result["metrics"]["effective_concurrency"] == 4
+    assert any(
+        warning["code"] == "request_capacity_limited" for warning in result["warnings"]
+    )
 
-    assert captured.value.assessment["risks"][0]["code"] == ("ray_actor_demand_limit")
+
+@pytest.mark.parametrize(
+    "runners,concurrency,capacity,expected_demand",
+    [(1, 64, 8, 8), (8, 8, 8, 8), (8, 1, 8, 1), (2, 9, 4, 3)],
+)
+def test_concurrent_actor_capacity(runners, concurrency, capacity, expected_demand):
+    benchmark = dict(
+        BENCHMARK, concurrent_requests=concurrency, max_completed_requests=100
+    )
+    result = assess_workload(
+        [{"benchmark": benchmark}] * runners,
+        [],
+        [],
+        PerformanceGuardConfig(max_runner_concurrency=64, max_effective_concurrency=64),
+        scheduler_slots=8,
+        ray_actor_capacity=capacity,
+        ray_actor_max_concurrency=8,
+    )
+    assert result["metrics"]["ray_actor_demand"] == expected_demand
+    assert result["metrics"]["effective_concurrency"] == runners * concurrency
+
+
+def test_shared_actor_rounding():
+    benchmark = dict(BENCHMARK, concurrent_requests=9, max_completed_requests=100)
+    result = assess_workload(
+        [{"benchmark": benchmark}] * 2,
+        [],
+        [],
+        PerformanceGuardConfig(),
+        scheduler_slots=2,
+        ray_actor_capacity=3,
+        ray_actor_max_concurrency=8,
+    )
+    assert result["metrics"]["ray_actor_demand"] == 3
+    assert result["metrics"]["effective_concurrency"] == 18

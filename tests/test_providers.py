@@ -8,6 +8,8 @@ from llmperf_backend.providers import (
     ProviderModelDiscovery,
     ProviderRegistry,
 )
+from llmperf_backend.config import load_provider_profiles
+from llmperf_backend.provider_files import load_provider_file
 
 PROVIDER_ENVIRONMENT = {
     "LLMPERF_PROVIDER_DEEPSEEK_URL": "https://models.example/v1",
@@ -19,6 +21,153 @@ PROVIDER_ENVIRONMENT = {
     "LLMPERF_PROVIDER_ANTHROPIC_KEY": "anthropic-secret",
     "LLMPERF_PROVIDER_ANTHROPIC_MODELS": "claude-test",
 }
+
+
+@pytest.mark.parametrize("suffix", ["yaml", "yml", "json"])
+def test_provider_document(tmp_path, suffix):
+    path = tmp_path / f"providers.{suffix}"
+    document = {
+        "version": "1.0.0",
+        "providers": {
+            "acme": {
+                "adapter": "openai",
+                "base_url": "https://acme.example/v1/",
+                "api_key_env": "ACME_KEY",
+                "models": ["model-a", "model,b"],
+                "discovery": {"mode": "static", "cache_ttl_seconds": 60},
+            },
+            "claude": {"adapter": "anthropic", "models": ["claude-test"]},
+        },
+    }
+    if suffix == "json":
+        content = json.dumps(document)
+    else:
+        import yaml
+
+        content = yaml.safe_dump(document)
+    path.write_text(content)
+    registry = ProviderRegistry(load_provider_file(path, {"ACME_KEY": "private-value"}))
+    assert registry.require("acme").static_models == ("model-a", "model,b")
+    assert registry.require("acme").api_base == "https://acme.example/v1"
+    assert registry.require("claude").api_key_env == "ANTHROPIC_API_KEY"
+    assert "private-value" not in json.dumps(registry.public_document())
+    worker_environment = registry.worker_environment(
+        "claude",
+        registry.worker_environment(
+            "acme", {"ACME_KEY": "private-value", "KEEP": "yes"}
+        ),
+    )
+    assert worker_environment == {"KEEP": "yes"}
+    selected_environment = registry.worker_environment(
+        "acme", {"ACME_KEY": "private-value"}
+    )
+    assert selected_environment["OPENAI_API_KEY"] == "private-value"
+    assert "ACME_KEY" not in selected_environment
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        'version: "1.0.0"\nproviders: {}',
+        'version: "1.0.0"\nproviders: {acme: {models: [model], api_key: secret-literal}}',
+        'version: "1.0.0"\nproviders: {acme: {models: [model], discovery: {cache_ttl_seconds: "5"}}}',
+        'version: "1.0.0"\nproviders: {acme: {models: [model], api_key_env: MISSING}}',
+        'version: "1.0.0"\nproviders: {acme: {base_url: "https://user:secret-literal@example.com"}}',
+        'version: "1.0.0"\nproviders: {acme: {models: [model], modles: [typo]}}',
+        'version: "1.0.0"\nproviders: {acme: {models: [model]}, acme: {models: [other]}}',
+        'version: "1.0.0"\nproviders: {ac_me: {models: [model]}, ac-me: {models: [other]}}',
+        'version: "1.0.0"\nproviders: {acme: {models: [""]}}',
+        'version: "1.0.0"\nproviders: {acme: {base_url: "https://example.com", discovery: {mode: static}}}',
+        'version: "1.0.0"\nproviders: [ secret-literal',
+    ],
+)
+def test_invalid_document(tmp_path, content):
+    path = tmp_path / "providers.yaml"
+    path.write_text(content)
+    with pytest.raises(ProviderConfigError) as failure:
+        load_provider_file(path, {})
+    assert "secret-literal" not in str(failure.value)
+
+
+def test_json_duplicate(tmp_path):
+    path = tmp_path / "providers.json"
+    path.write_text(
+        '{"version":"1.0.0","providers":{"acme":{"models":["a"]},"acme":{"models":["b"]}}}'
+    )
+    with pytest.raises(ProviderConfigError, match="duplicate"):
+        load_provider_file(path, {})
+
+
+def test_file_reload(tmp_path):
+    environment_path = tmp_path / "backend.env"
+    environment_path.write_text(
+        "ACME_KEY=old-secret\nLLMPERF_PROVIDERS_FILE=providers.json\nLLMPERF_PROVIDER_LEGACY_MODELS=ignored\n"
+    )
+    provider_path = tmp_path / "providers.json"
+    document = {
+        "version": "1.0.0",
+        "providers": {"acme": {"models": ["a"], "api_key_env": "ACME_KEY"}},
+    }
+    provider_path.write_text(json.dumps(document))
+
+    def load_profiles():
+        return load_provider_profiles(environment_path, process_environment={})
+
+    registry = ProviderRegistry.from_loader(load_profiles)
+    snapshot, _ = registry.profile_snapshot("acme")
+    assert registry.get("legacy") is None
+    environment_path.write_text(
+        "ACME_KEY=new-secret\nLLMPERF_PROVIDERS_FILE=providers.json\n"
+    )
+    result = registry.reload()
+    assert result["changes"]["updated"] == ["acme"]
+    assert registry.require("acme").api_key == "new-secret"
+    assert snapshot.api_key == "old-secret"
+    assert (
+        load_provider_profiles(
+            environment_path, process_environment={"ACME_KEY": "process-secret"}
+        )[0].api_key
+        == "process-secret"
+    )
+    provider_path.write_text('{"bad":"secret-literal"}')
+    with pytest.raises(ProviderConfigError):
+        registry.reload()
+    assert registry.generation == 1
+    assert registry.require("acme").api_key == "new-secret"
+    document["providers"] = {"other": {"models": ["b"]}}
+    provider_path.write_text(json.dumps(document))
+    registry.reload()
+    assert "ACME_KEY" not in registry.worker_environment(
+        "other", {"ACME_KEY": "new-secret"}
+    )
+
+
+def test_provider_file_selection(tmp_path):
+    environment_path = tmp_path / "backend.env"
+    environment_path.write_text("LLMPERF_PROVIDER_LEGACY_MODELS=a\n")
+    assert (
+        load_provider_profiles(environment_path, process_environment={})[0].provider_id
+        == "legacy"
+    )
+    provider_path = tmp_path / "providers.yaml"
+    provider_path.write_text('version: "1.0.0"\nproviders: {new: {models: [a]}}')
+    assert (
+        load_provider_profiles(environment_path, process_environment={})[0].provider_id
+        == "new"
+    )
+    (tmp_path / "providers.json").write_text("{}")
+    with pytest.raises(ProviderConfigError, match="Multiple"):
+        load_provider_profiles(environment_path, process_environment={})
+    selected = load_provider_profiles(
+        environment_path,
+        process_environment={"LLMPERF_PROVIDERS_FILE": str(provider_path)},
+    )
+    assert selected[0].provider_id == "new"
+    with pytest.raises(ProviderConfigError, match="Unable to read"):
+        load_provider_profiles(
+            environment_path,
+            process_environment={"LLMPERF_PROVIDERS_FILE": "missing.yaml"},
+        )
 
 
 def test_public_profile():

@@ -51,10 +51,33 @@ def test_defaults():
     assert config.planner.batch_size == 20
     assert config.scheduler.ray_num_cpus == 8
     assert config.scheduler.ray_actor_num_cpus == 1.0
+    assert config.scheduler.ray_actor_max_concurrency == 8
     assert config.scheduler.ray_object_store_memory_bytes == 268_435_456
     assert config.scheduler.artifact_resolution_timeout_seconds == 60.0
     assert config.performance_guard.min_ray_object_store_available_ratio == 0.1
     assert config.performance_guard.resume_ray_object_store_available_ratio == 0.2
+
+
+@pytest.mark.parametrize("concurrency", [0, -1, 1025, 1.5])
+def test_invalid_actor_concurrency(concurrency):
+    with pytest.raises(ValueError):
+        SchedulerConfig(ray_actor_max_concurrency=concurrency)
+
+
+def test_token_count_mode():
+    assert (
+        BenchmarkConfig(provider="test", model="test").output_token_count == "provider"
+    )
+    assert (
+        BenchmarkConfig(
+            provider="test", model="test", output_token_count="local"
+        ).output_token_count
+        == "local"
+    )
+    with pytest.raises(ValueError, match="output_token_count"):
+        BenchmarkConfig.model_validate(
+            {"provider": "test", "model": "test", "output_token_count": "chunks"}
+        )
 
 
 def test_dataset_prompt_modes():
@@ -122,6 +145,14 @@ def test_dataset_prompt_modes():
             dataset=DatasetSpec.model_validate(dataset_document),
             shared_prefix_tokens=1,
         )
+    prefix_dataset = BenchmarkConfig(
+        provider="test",
+        model="model",
+        dataset=DatasetSpec.model_validate(dataset_document),
+        dataset_prompt_mode="concatenate",
+        shared_prefix_tokens=100,
+    )
+    assert prefix_dataset.shared_prefix_tokens == 100
 
 
 def test_ray_runtime_config():
@@ -166,7 +197,9 @@ def test_protocol_version():
 
 
 def test_ray_worker_limit():
-    with pytest.raises(ValueError, match="embedded Ray requires server.workers=1"):
+    with pytest.raises(
+        ValueError, match="Runtime coordinator requires server.workers=1"
+    ):
         AppConfig(
             version=PROTOCOL_VERSION,
             server=ServerConfig(workers=2),
@@ -176,13 +209,13 @@ def test_ray_worker_limit():
 
 
 def test_ray_slot_capacity():
-    with pytest.raises(ValueError, match="Ray actor capacity"):
+    with pytest.raises(ValueError, match="Ray CPU budget"):
         AppConfig(
             version=PROTOCOL_VERSION,
             scheduler=SchedulerConfig(
                 max_concurrent_runners=3,
                 ray_num_cpus=2,
-                ray_actor_num_cpus=1,
+                ray_actor_num_cpus=3,
             ),
             performance_guard=PerformanceGuardConfig(),
             benchmark=BenchmarkConfig(provider="test", model="test"),

@@ -26,6 +26,23 @@ from llmperf_backend.worker import Worker, WORKER_DATASET_PATH
 class UnusedRepository:
     """Complete Scheduler repository stub that rejects unexpected persistence calls."""
 
+    async def runtime_snapshot(self, runner_id: Optional[str] = None) -> Dict[str, Any]:
+        raise AssertionError("runtime_snapshot is not expected")
+
+    async def activate_node(self, node_id, due_at) -> Optional[Dict[str, Any]]:
+        raise AssertionError("activate_node is not expected")
+
+    async def start_selected(
+        self, runner_id: str, owner: str
+    ) -> Optional[Dict[str, Any]]:
+        raise AssertionError("start_selected is not expected")
+
+    async def acquire_runtime(self, owner: str) -> None:
+        raise AssertionError("acquire_runtime is not expected")
+
+    async def release_runtime(self) -> None:
+        raise AssertionError("release_runtime is not expected")
+
     async def requeue_stale(self, stale_after_seconds: int) -> int:
         raise AssertionError("requeue_stale is not expected in this test")
 
@@ -190,6 +207,7 @@ def test_actor_environment(tmp_path: Path):
         SchedulerConfig(
             max_concurrent_runners=4,
             ray_address="ray://127.0.0.1:10001",
+            ray_actor_max_concurrency=8,
         ),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
         ProviderRegistry.from_environment(
@@ -204,12 +222,19 @@ def test_actor_environment(tmp_path: Path):
     environment = asyncio.run(scheduler.worker_environment(runner, {}))
 
     assert environment[WORKER_RAY_ACTOR_CPUS] == "1.0"
+    assert environment["LLMPERF_WORKER_RAY_ACTOR_CONCURRENCY"] == "8"
+    assert scheduler.status()["ray_actor_max_concurrency"] == 8
     assert scheduler.status()["ray_mode"] == "external"
     assert scheduler.status()["ray_address"] == "ray://127.0.0.1:10001"
 
 
 def test_embedded_ray(tmp_path: Path, monkeypatch):
     calls = {}
+
+    async def start_pool(self, ray):
+        return None
+
+    monkeypatch.setattr(Scheduler, "_start_request_pool", start_pool)
     monkeypatch.setenv(RAY_GRPC_ENABLE_HTTP_PROXY, "true")
 
     def initialize(**options):
@@ -357,7 +382,9 @@ def test_worker_execution(tmp_path: Path, monkeypatch):
             calls["created"] = (runner_id, actor_count, actor_cpus)
             self.task_ref = None
 
-        def start(self, benchmark, environment, runtime, log_limit):
+        def start(
+            self, benchmark, environment, runtime, log_limit, request_router=None
+        ):
             calls["started"] = (benchmark, environment, runtime, log_limit)
             self.task_ref = object()
 
@@ -412,7 +439,7 @@ def test_worker_execution(tmp_path: Path, monkeypatch):
 
     assert calls["created"] == ("runner-1", 1, 1.0)
     assert calls["started"][2]["worker_kind"] == "ray_task"
-    assert calls["started"][2]["resource_scheduling"] == "independent_actors"
+    assert calls["started"][2]["resource_scheduling"] == "shared_request_pool"
     assert calls["started"][2]["campaign_id"] == "campaign-1"
     assert repository.completed is not None
     assert repository.completed[0] == "runner-1"

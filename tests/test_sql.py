@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import pytest
 from sqlalchemy.dialects import postgresql
 
@@ -21,6 +22,14 @@ def _benchmark(model):
         "provider": "test",
         "model": model,
         "adapter": "openai",
+        "tokenizer": {
+            "id": "test/tokenizer",
+            "revision": "a" * 40,
+            "requested_revision": "main",
+            "immutable_revision": True,
+            "selection": "explicit",
+            "accuracy": "compatible",
+        },
         "timeout_seconds": 10,
         "max_completed_requests": 1,
         "concurrent_requests": 1,
@@ -37,7 +46,7 @@ def test_task_lock_scope():
     compiled_sql = str(statement.compile(dialect=postgresql.dialect()))
 
     assert "LEFT OUTER JOIN benchmark_runners" in compiled_sql
-    assert compiled_sql.endswith("FOR UPDATE OF benchmark_runner_dispatches")
+    assert compiled_sql.endswith("FOR UPDATE OF execution_nodes")
 
 
 def test_postgres_lifecycle(postgresql_url):
@@ -75,7 +84,9 @@ def test_postgres_lifecycle(postgresql_url):
                 label="postgres-runner",
             )
             assert runner is not None
-            claimed = await repository.claim_next("integration-scheduler")
+            claimed = await repository.start_selected(
+                runner["runner_id"], "integration-scheduler"
+            )
             assert claimed is not None
             assert claimed["runner_id"] == runner["runner_id"]
 
@@ -239,8 +250,11 @@ def test_task_advancement(postgresql_url):
                 "bootstrap-test",
             )
             campaign_id = workload["campaign"]["campaign_id"]
-            assert await repository.materialize_due_work(10) == 1
-            prime_runner = await repository.claim_next("task-scheduler")
+            from llmperf_backend.runtime import RuntimeCoordinator
+
+            coordinator = RuntimeCoordinator(repository)
+            await coordinator.reconcile()
+            prime_runner = await coordinator.next_runner("task-scheduler")
             assert prime_runner is not None
             assert prime_runner["label"] == "postgres-task:prime"
 
@@ -264,13 +278,13 @@ def test_task_advancement(postgresql_url):
             assert campaign_status is not None
             assert campaign_status["task_instance_status_counts"]["active"] == 1
             assert campaign_status["dispatch_status_counts"] == {
-                "blocked": 0,
-                "pending": 1,
+                "blocked": 1,
+                "pending": 0,
                 "emitted": 1,
                 "cancelled": 0,
             }
-            assert await repository.materialize_due_work(10) == 1
-            probe_runner = await repository.claim_next("task-scheduler")
+            await coordinator.reconcile()
+            probe_runner = await coordinator.next_runner("task-scheduler")
             assert probe_runner is not None
             assert probe_runner["label"] == "postgres-task:probe"
         finally:
@@ -311,9 +325,13 @@ def test_campaign_claim_fairness(postgresql_url):
                 campaign_id=campaign_b["campaign_id"],
             )
 
+            from llmperf_backend.runtime import RuntimeCoordinator
+
+            coordinator = RuntimeCoordinator(repository)
+            await coordinator.reconcile()
             claimed = await asyncio.gather(
-                repository.claim_next("fair-slot-1"),
-                repository.claim_next("fair-slot-2"),
+                coordinator.next_runner("fair-slot-1"),
+                coordinator.next_runner("fair-slot-2"),
             )
             first_claim, second_claim = claimed
             assert first_claim is not None
@@ -324,7 +342,7 @@ def test_campaign_claim_fairness(postgresql_url):
                 campaign_a["campaign_id"],
                 campaign_b["campaign_id"],
             }
-            remaining = await repository.claim_next("fair-slot-3")
+            remaining = await coordinator.next_runner("fair-slot-3")
             assert remaining is not None
             assert remaining["campaign_id"] == campaign_a["campaign_id"]
         finally:

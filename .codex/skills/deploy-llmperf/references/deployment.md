@@ -29,6 +29,13 @@ backup, and rollback strategy.
 
 ## Python and PostgreSQL
 
+Current source checks required tables and columns, with no application schema-version
+marker. Use a fresh database for cutover from older layouts; the earlier Dispatch migration
+is removed. Preserve the old database, stop the old service
+before switching `DATABASE_URL`, and verify both connectivity and `database_schema=ready`.
+`create_schema` rejects an existing incomplete layout instead of adding tables to it.
+See `docs/RUNTIME.md` for the concrete schema and request-slot configuration.
+
 LLMPerf requires Python 3.10+. Install only adapter extras that are needed.
 
 ```bash
@@ -63,6 +70,15 @@ Run configuration commands as the final service user. The default file is
 Store Provider keys through `--stdin`; do not place secrets in the unit. Client
 `llmperfctl config` does not replace Backend configuration. Restart after non-Provider
 configuration changes and verify the loaded config path.
+
+Prefer one `providers.yaml` or `providers.json` next to `backend.env` for all Provider
+definitions, using `api_key_env` references to credential variables. Start from
+`src/llmperf_backend/configs/providers.example.yaml`. `LLMPERF_PROVIDERS_FILE` selects another
+file; relative paths resolve beside `backend.env`. A selected file is authoritative and
+legacy profile definition variables do not override it. After the updated code is running,
+`llmperfctl provider reload` applies file edits and credential rotation without a restart.
+Back up the environment file before migrating local definitions, preserve keys and all
+non-Provider settings, and compare resolved profiles before activation.
 
 Use `LLMPERF_PROXY` for a Backend-wide outbound proxy only when that proxy has complete
 Provider and artifact reachability and sufficient benchmark performance. Before importing

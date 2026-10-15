@@ -16,6 +16,8 @@ from llmperf_backend.task_compiler import (
     TaskAssembler,
     TaskCompileContext,
     TaskCompiler,
+    CompiledNodeRow,
+    parallel_request_groups,
 )
 
 
@@ -121,6 +123,10 @@ def test_graph_compilation():
     assert TaskCompiler.estimate(_definition().recipe()) == {
         "instances": 2,
         "nodes": 8,
+        "runners": 8,
+        "max_concurrency": 1,
+        "peak_requests": 4,
+        "peak_actors": 4,
     }
     repeated_instance = next(
         instance
@@ -143,6 +149,40 @@ def test_graph_compilation():
     assert all(node.after_seconds == 60 for node in repeated_nodes[3:])
 
 
+def test_parallel_group_boundaries():
+    def node(name, dependencies=(), delay=0):
+        return CompiledNodeRow(
+            "instance", name, dependencies, delay, name, "payload", 1
+        )
+
+    nodes = [node("a"), node("b"), node("join", ("a", "b"))]
+    assert [
+        [entry.node_id for entry in group] for group in parallel_request_groups(nodes)
+    ] == [["a"], ["b"], ["join"]]
+    # Different successor frontiers must not introduce a wait on an unrelated branch.
+    asymmetric = [node("a"), node("b"), node("a-next", ("a",)), node("b-next", ("b",))]
+    assert all(len(group) == 1 for group in parallel_request_groups(asymmetric))
+    assert all(
+        len(group) == 1
+        for group in parallel_request_groups([node("a"), node("b", delay=1)])
+    )
+
+
+def test_parallel_assembly():
+    compiler = _compiler()
+    assemblies = TaskAssembler(compiler.context, compiler.compile()).assemble()
+    for instance in assemblies:
+        pair = [node for node in instance.nodes if node.node_id.startswith("observe.")]
+        assert len(pair) == 2
+        assert pair[0].parallel_leader is pair[1].parallel_leader is None
+        assert all(node.parallel_size == 1 for node in pair)
+        assert (
+            pair[0].runner_template["benchmark"]["task_context"]["payload_seed"]
+            != pair[1].runner_template["benchmark"]["task_context"]["payload_seed"]
+        )
+    assert assemblies[0].nodes[-1].dispatch_id != assemblies[1].nodes[-1].dispatch_id
+
+
 def test_node_hierarchy():
     compiler = _compiler()
 
@@ -151,6 +191,21 @@ def test_node_hierarchy():
     assert all(isinstance(node, BaseNode) for node in roots)
     assert isinstance(roots[1], RepeatNode)
     assert isinstance(roots[2], ParallelNode)
+
+
+def test_grouped_preview():
+    campaign = BenchmarkCampaignStart.model_validate(
+        {
+            "campaign": {"name": "grouped-preview"},
+            "task_definitions": [_definition().model_dump()],
+        }
+    )
+    preview = _compile_campaign_task_preview(campaign, 1, 20, False)
+    nodes = preview["task_definitions"][0]["instances"][0]["nodes"]
+    pair = [node for node in nodes if node["node_id"].startswith("observe.")]
+    assert len(pair) == 2
+    assert pair[0]["execution_group"] != pair[1]["execution_group"]
+    assert all(node["group_size"] == 1 for node in pair)
 
 
 def test_model_ownership():

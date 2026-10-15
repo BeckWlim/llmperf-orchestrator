@@ -1,17 +1,30 @@
 """Ray-backed execution abstraction for one durable benchmark Runner."""
 
+from __future__ import annotations
+
 import asyncio
-from concurrent.futures import Future
+from concurrent.futures import Executor, Future
 from contextlib import redirect_stderr, redirect_stdout
 import os
 import threading
 import traceback
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from llmperf import common_metrics
-from llmperf.common import RAY_ACTOR_CPUS_ENV
+from llmperf.preparation import PreparationHandle
+from llmperf.common import (
+    RAY_ACTOR_CPUS_ENV,
+    RAY_ACTOR_CONCURRENCY_ENV,
+    actor_concurrency,
+    request_actor_count,
+)
 from llmperf.utils import TOKENIZER_FAST, TOKENIZER_PATH
 from llmperf_backend.persistence import FAILED, SUCCEEDED
+from llmperf_backend.request_pool import RouterHandle, SharedRequestExecutor
+
+if TYPE_CHECKING:
+    from llmperf.token_benchmark_ray import TokenizerEncoder
 
 WORKER_DATASET_PATH = "LLMPERF_DATASET_PATH"
 
@@ -40,14 +53,20 @@ class _TailBuffer:
             return self._value
 
 
-def benchmark_actor_count(benchmark: Mapping[str, Any]) -> int:
+def benchmark_actor_count(
+    benchmark: Mapping[str, Any], requests_per_actor: int = 1
+) -> int:
     """Return the exact maximum number of request actors created by a Runner."""
 
     concurrent = int(benchmark["concurrent_requests"])
     cache_probe = benchmark.get("cache_probe")
     if cache_probe:
-        return max(1, min(concurrent, int(cache_probe["trials"])))
-    return max(1, min(concurrent, int(benchmark["max_completed_requests"])))
+        request_slots = max(1, min(concurrent, int(cache_probe["trials"])))
+    else:
+        request_slots = max(
+            1, min(concurrent, int(benchmark["max_completed_requests"]))
+        )
+    return request_actor_count(request_slots, requests_per_actor)
 
 
 def runtime_environment(environment: Mapping[str, str]) -> Dict[str, str]:
@@ -55,9 +74,12 @@ def runtime_environment(environment: Mapping[str, str]) -> Dict[str, str]:
 
     allowed_llmperf_variables = {
         RAY_ACTOR_CPUS_ENV,
+        RAY_ACTOR_CONCURRENCY_ENV,
         TOKENIZER_FAST,
         TOKENIZER_PATH,
         WORKER_DATASET_PATH,
+        "LLMPERF_REQUEST_API_BASE",
+        "LLMPERF_REQUEST_API_KEY",
     }
     return {
         name: value
@@ -68,18 +90,27 @@ def runtime_environment(environment: Mapping[str, str]) -> Dict[str, str]:
 
 
 def _calculate(
-    benchmark: Dict[str, Any], execution_runtime: Optional[Mapping[str, Any]] = None
+    benchmark: Dict[str, Any],
+    execution_runtime: Optional[Mapping[str, Any]] = None,
+    request_router: Optional[RouterHandle] = None,
+    execution_environment: Optional[Mapping[str, str]] = None,
+    tokenizer_override: Optional[TokenizerEncoder] = None,
+    preparation_actors: Sequence[PreparationHandle] = (),
 ) -> Tuple[Dict[str, Any], Sequence[Dict[str, Any]]]:
     """Run one benchmark inside an already connected Ray worker process."""
 
     from llmperf.prompt_datasets import PromptDatasetSource
     from llmperf.token_benchmark_ray import get_token_throughput_latencies
 
+    worker_environment = (
+        os.environ if execution_environment is None else execution_environment
+    )
+
     dataset = benchmark.get("dataset")
     if dataset is None:
         prompt_dataset_source = PromptDatasetSource.builtin_sonnet()
     else:
-        dataset_path = os.environ.get(WORKER_DATASET_PATH)
+        dataset_path = worker_environment.get(WORKER_DATASET_PATH)
         if not dataset_path:
             raise RuntimeError(
                 f"{WORKER_DATASET_PATH} is required for dataset workloads"
@@ -106,6 +137,26 @@ def _calculate(
         cache_probe=benchmark.get("cache_probe"),
         tokenizer_provenance=benchmark.get("tokenizer"),
         task_context=benchmark.get("task_context"),
+        task_contexts=benchmark.get("task_contexts"),
+        output_token_count=benchmark.get("output_token_count", "provider"),
+        request_executor=(
+            SharedRequestExecutor(
+                request_router,
+                str((execution_runtime or {})["runner_id"]),
+                runtime_environment(worker_environment),
+            )
+            if request_router is not None
+            else None
+        ),
+        conversation_messages=benchmark.get("conversation_messages"),
+        tokenizer_override=tokenizer_override,
+        preparation_actors=preparation_actors,
+        preparation_chunk_size=int(
+            (execution_runtime or {}).get("preparation_chunk_size", 16)
+        ),
+        preparation_buffer_chunks=int(
+            (execution_runtime or {}).get("preparation_buffer_chunks", 8)
+        ),
     )
     runtime = dict(execution_runtime or {})
     runtime.setdefault("backend", "ray")
@@ -113,6 +164,7 @@ def _calculate(
     runtime.setdefault(
         "ray_actor_num_cpus", float(os.environ.get(RAY_ACTOR_CPUS_ENV, "1.0"))
     )
+    runtime.setdefault("ray_actor_max_concurrency", actor_concurrency())
     summary["execution_runtime"] = runtime
     return summary, requests
 
@@ -121,6 +173,8 @@ def execute_worker_task(
     benchmark: Dict[str, Any],
     execution_runtime: Mapping[str, Any],
     log_limit: int,
+    request_router: Optional[RouterHandle] = None,
+    preparation_actors: Sequence[PreparationHandle] = (),
 ) -> Dict[str, Any]:
     """Ray task entrypoint; it never connects to PostgreSQL or initializes Ray."""
 
@@ -128,7 +182,20 @@ def execute_worker_task(
     stderr = _TailBuffer(log_limit)
     try:
         with redirect_stdout(stdout), redirect_stderr(stderr):
-            summary, requests = _calculate(benchmark, execution_runtime)
+            summary, requests = (
+                _calculate(
+                    benchmark,
+                    execution_runtime,
+                    request_router,
+                    preparation_actors=preparation_actors,
+                )
+                if preparation_actors
+                else (
+                    _calculate(benchmark, execution_runtime, request_router)
+                    if request_router is not None
+                    else _calculate(benchmark, execution_runtime)
+                )
+            )
         return {
             "ok": True,
             "summary": summary,
@@ -163,6 +230,7 @@ class Worker:
         self.actor_count = actor_count
         self.actor_num_cpus = actor_num_cpus
         self.task_ref: Any = None
+        self.preparation_actors: Sequence[PreparationHandle] = ()
         self._closed = False
 
     @classmethod
@@ -177,13 +245,26 @@ class Worker:
         environment: Mapping[str, str],
         execution_runtime: Mapping[str, Any],
         log_limit: int,
+        request_router: Optional[RouterHandle] = None,
     ) -> None:
         if self.task_ref is not None:
             raise RuntimeError(f"Worker {self.runner_id} has already started")
-        self.task_ref = self.remote_function.options(
+        configured_function = self.remote_function.options(
             name=f"llmperf-worker-{self.runner_id}",
             runtime_env={"env_vars": runtime_environment(environment)},
-        ).remote(dict(benchmark), dict(execution_runtime), log_limit)
+        )
+        if self.preparation_actors:
+            self.task_ref = configured_function.remote(
+                dict(benchmark),
+                dict(execution_runtime),
+                log_limit,
+                request_router,
+                self.preparation_actors,
+            )
+        else:
+            self.task_ref = configured_function.remote(
+                dict(benchmark), dict(execution_runtime), log_limit, request_router
+            )
 
     def ready(self) -> bool:
         if self.task_ref is None:
@@ -241,6 +322,104 @@ class Worker:
         # Dropping the final local ObjectRef lets Ray release task result state and,
         # after task completion, the Runner-owned actor handles created inside it.
         self.task_ref = None
+        self._closed = True
+
+
+_TOKENIZER_LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=8)
+def _cached_tokenizer(path: str, use_fast: bool) -> TokenizerEncoder:
+    from llmperf.utils import _load_tokenizer
+
+    return _load_tokenizer(path, local_files_only=True, use_fast=use_fast)
+
+
+def _prepared_tokenizer(path: str, use_fast: bool) -> TokenizerEncoder:
+    with _TOKENIZER_LOCK:
+        return _cached_tokenizer(path, use_fast)
+
+
+class AtomicWorker(Worker):
+    """Lightweight local handle for one atomic invoke; Ray owns only HTTP execution.
+
+    Explicit environment and tokenizer inputs avoid per-invoke Ray processes and
+    process-global configuration mutation. Output tokenization remains opt-in.
+    """
+
+    def __init__(
+        self,
+        ray_module: Any,
+        remote_function: Any,
+        runner_id: str,
+        actor_count: int,
+        actor_num_cpus: float,
+        executor: Executor,
+    ):
+        super().__init__(
+            ray_module, remote_function, runner_id, actor_count, actor_num_cpus
+        )
+        self.executor = executor
+        self.local_task: Optional[asyncio.Future[Dict[str, Any]]] = None
+
+    def start(
+        self,
+        benchmark: Dict[str, Any],
+        environment: Mapping[str, str],
+        execution_runtime: Mapping[str, Any],
+        log_limit: int,
+        request_router: Optional[RouterHandle] = None,
+    ) -> None:
+        if self.local_task is not None or request_router is None:
+            raise RuntimeError(
+                "Atomic Worker requires an unused handle and shared router"
+            )
+
+        def calculate() -> Dict[str, Any]:
+            try:
+                tokenizer = _prepared_tokenizer(
+                    environment[TOKENIZER_PATH],
+                    environment.get(TOKENIZER_FAST, "true").lower() == "true",
+                )
+                summary, requests = _calculate(
+                    benchmark, execution_runtime, request_router, environment, tokenizer
+                )
+                return {
+                    "ok": True,
+                    "summary": summary,
+                    "requests": list(requests),
+                    "stdout": "",
+                    "stderr": "",
+                }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "stdout": "",
+                    "stderr": traceback.format_exc()[-log_limit:],
+                }
+
+        self.local_task = asyncio.get_running_loop().run_in_executor(
+            self.executor, calculate
+        )
+
+    def ready(self) -> bool:
+        return self.local_task is not None and self.local_task.done()
+
+    async def result_async(self) -> Dict[str, Any]:
+        if self.local_task is None:
+            raise RuntimeError("Atomic Worker has not started")
+        return await asyncio.shield(self.local_task)
+
+    def task_id(self) -> Optional[str]:
+        return f"invoke:{self.runner_id}"
+
+    def cancel(self, force: bool = False) -> None:
+        # Scheduler cancels queued router calls. Executing calls retain physical
+        # capacity until their HTTP operation ends, even if this handle is dropped.
+        return None
+
+    def close(self) -> None:
         self._closed = True
 
 

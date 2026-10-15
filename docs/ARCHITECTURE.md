@@ -1,9 +1,12 @@
 # LLMPerf Architecture
 
+See [Runtime, storage, and multi-turn execution](RUNTIME.md) for the implemented
+database layout, shared request capacity, message history, and recovery behavior.
+
 ## 1. Design boundary
 
 LLMPerf separates workload authoring, compilation, scheduling, execution, and analysis.
-The runtime has one execution primitive: an atomic Runner. Experiment vocabulary such as
+The runtime has one execution primitive: a bounded Runner. Experiment vocabulary such as
 Prime, Warm, Probe, retention, and promotion is metadata, never Planner behavior.
 
 ```text
@@ -16,7 +19,7 @@ YAML authoring syntax
       finite CompiledTaskGraph (invoke DAG)
                     │
                     ▼
-  PostgreSQL Dispatch queue -> Planner -> Runner -> Worker -> Provider
+  PostgreSQL metadata -> Runtime coordinator -> Scheduler -> Shared Ray actors -> Provider
                     │
                     ▼
     export 1.0.0 -> normalized evidence -> autonomous HTML rendering
@@ -60,6 +63,20 @@ into the frozen Runner after validation; URLs, model names, and discovery modes 
 an adapter. All adapters can execute ordinary or compiled Runners. Cache-analysis claims
 remain conditional on the selected Provider returning comparable usage counters.
 
+Provider definitions live in one versioned YAML or JSON document with a `providers` map.
+`LLMPERF_PROVIDERS_FILE` selects its path; otherwise the Backend discovers one
+`providers.yaml`, `providers.yml`, or `providers.json` beside its environment file. Explicit
+relative paths resolve against that directory. A selected file is authoritative for all
+profiles; the legacy environment profile parser is used only when no file is selected or
+discovered. Missing explicit files, ambiguous discovery, duplicate keys/normalized IDs,
+unknown fields, and missing credential references fail validation without a partial reload.
+`api_key_env` references a source credential variable; optional `worker_api_key_env` and
+`worker_api_base_env` specify adapter destinations. Source and destination credential
+variables for all profiles, including removed profiles, are stripped before injecting the
+selected profile into a Worker. Secret values are not part of public profile documents.
+`provider reload` rereads the complete document and credentials and swaps one validated
+registry generation; existing Runner connection snapshots remain unchanged.
+
 The performance guard estimates the fully expanded graph before acceptance:
 
 - compiled Runner count;
@@ -76,7 +93,8 @@ bounded; there is no runtime loop capable of escaping static accounting.
 Backend support code is organized by stable ownership boundary rather than by individual
 download or validation features:
 
-- `config.py` owns dotenv discovery, Provider-only environment reloads, YAML expansion,
+- `provider_files.py` owns strict Provider YAML/JSON decoding and credential-reference resolution;
+- `config.py` owns dotenv discovery, Provider source selection and reloads, YAML expansion,
   validation, and the atomic active configuration store;
 - `outbound.py` owns process-wide HTTP(S) proxy normalization, the Hugging Face HTTP
   client, native Xet proxy visibility, and the explicit direct-connection policy for Ray
@@ -94,6 +112,24 @@ while allowing a remote CLI to render transfer progress on stderr.
 Worker runtime constants remain in `worker.py`; importing a Worker does not initialize the
 Backend artifact stack merely to obtain its dataset handoff key. Worker-side token counting
 retains its separate execution dependency on Transformers.
+
+Prompt construction and cache-probe mutation use the tokenizer before timed execution.
+The default `benchmark.output_token_count=provider` never tokenizes responses. Request
+actors do not load tokenizers; SageMaker and Vertex prediction schemas without usage return
+unknown output counts. After request threads join and the finish timestamp is captured,
+the Runner reconciles metrics using server usage. Input counts fall back to the prepared
+local estimate with explicit provenance. Missing output usage stays null, including derived
+token throughput and TPOT, and cannot be replaced by SSE-event counts or output budgets.
+Summary output-token coverage counts successful requests with known counts; any missing
+count makes overall output throughput null. Distribution statistics use known counts only.
+Optional `output_token_count=local` retains generated text until this finalization phase
+and counts output tokens once in the Runner, outside its measured duration. Provider
+counts remain separate. Both ordinary Runners and cache probes follow this boundary.
+
+This separation is informed by SGLang's
+[benchmark metrics finalization](https://github.com/sgl-project/sglang/blob/main/python/sglang/benchmark/serving.py),
+which calculates benchmark duration before retokenizing outputs. LLMPerf's default skips
+that retokenization entirely; local counting is explicitly requested.
 
 ## 3. Workload Compiler
 
@@ -114,8 +150,9 @@ Every logical compilation row contains:
 Final assembly maps logical dependencies to Dispatch IDs and attaches one resolved Runner
 template to each node.
 
-The compiler forces task Runners to `concurrent_requests: 1` and
-`max_completed_requests: 1`.
+Each logical invoke sends exactly one request and completes independently. The runtime
+shares request actors across eligible invokes; it does not impose a static group barrier.
+Optional conversation names bind dependency-ordered turns to committed message history.
 
 ### 3.2 Composition
 
@@ -187,44 +224,37 @@ uses an all-predecessors-succeeded rule, and a failed predecessor cancels its de
 Consequently, the statement that new experiments do not require Planner changes applies
 to new compositions within this envelope, not to every possible observer protocol.
 
-## 4. Persistence model
+## 4. Persistence and runtime ownership
 
-PostgreSQL is the source of truth.
-
-| Table | Responsibility |
-|---|---|
-| `benchmark_campaigns` | workload ownership and metadata |
-| `benchmark_runner_plans` | recurring Runner cursors |
-| `benchmark_task_definitions` | submitted recipe and frozen Runner template |
-| `benchmark_task_instances` | matrix/trial state, payload hashes, node outcomes |
-| `benchmark_runner_dispatches` | dependency DAG, due time, node lineage, Runner link |
-| `benchmark_runners` | execution state and resolved benchmark |
-| `benchmark_requests` | per-request metrics |
-| `benchmark_events` | Runner lifecycle audit trail |
-
-Root Dispatches begin `pending`. Dependent Dispatches begin `blocked`. After a successful
-node, Repository verifies payload identity, records request start/completion timestamps,
-and releases each child only when every dependency succeeded. The child due time is:
-
-```text
-max(actual dependency completion timestamps) + after_seconds
-```
-
-Any failed/cancelled node makes the instance terminal and cancels un-emitted descendants.
-No task-specific branch exists in this transaction.
+[Runtime storage](RUNTIME.md#durable-records) documents the concrete schema and ownership.
+PostgreSQL stores metadata, checkpoints, attempts, immutable messages, results, and audit
+records. `execution_nodes` replaces the Dispatch queue as durable node progress. A schema
+revision check prevents the previous database from scheduling updated code.
 
 ## 5. Planner and Scheduler
 
-Planner claims due Dispatch rows with PostgreSQL row locks and materializes their Runner
-templates. Waiting Dispatches consume no Scheduler slot, Worker, Ray Actor, or Provider
-connection.
-
-Scheduler claims queued Runners fairly across Campaigns, starts isolated Ray work, records
-heartbeats, and persists terminal results. PostgreSQL uniqueness constraints prevent
-duplicate plan occurrences, duplicate task nodes, and duplicate Runner binding when
-multiple Backend processes compete.
+Planner materializes bounded schedule occurrences. RuntimeCoordinator computes dependencies
+and due times, reconciles durable state, and admits eligible Runners through a fair in-memory
+queue. A bounded event bus wakes it after committed results. Waiting dependencies and delays
+reserve no physical request capacity. The single Backend owner holds a fenced durable lease.
 
 ## 6. Worker and observability
+
+### Request and actor concurrency
+
+Eight shared Ray actors with eight requests per actor provide 64 request slots by default.
+`live_slots` and `busy_slots` report physical request capacity and execution; active Runner
+handles have an independent bound. Atomic invokes use lightweight Backend handles and cached
+initialization tokenizers. Batch Runners retain a Ray task. Both execute HTTP requests through
+the shared pool with isolated per-request adapter state and credentials.
+
+Each compiled invoke completes independently. The runtime combines ready work across
+Runners at the actor pool without a static group barrier. Multi-turn invokes use an
+instance-scoped conversation name and dependency-ordered immutable history versions.
+Successors become eligible only after result, messages, and checkpoint commit atomically.
+See [configuration and examples](RUNTIME.md#capacity).
+
+### Request evidence
 
 The Worker builds one prompt from `payload_seed`, sends it through the selected Provider
 adapter, and persists:
@@ -292,7 +322,7 @@ Stable visual rules remain centralized:
 
 - A CLI disconnect does not affect Campaign execution.
 - A Backend restart leaves pending/blocked Dispatches and queued Runners durable.
-- A stale running Runner may be safely requeued by heartbeat policy.
+- An interrupted executing Runner becomes indeterminate; automatic replay is disabled.
 - A task node without `prompt_hash`, or a replay whose hash changed, fails closed.
 - Missing cache counters remain missing; they are never converted to zero or a miss.
 - This schema has no migration bridge from the removed protocol tables.

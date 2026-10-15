@@ -7,7 +7,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from dotenv import load_dotenv
 import yaml
@@ -15,10 +15,17 @@ from pydantic import ValidationError
 
 from llmperf.user_config import backend_environment_path, read_environment_file
 from llmperf_backend.models import AppConfig, dump_model, validate_app_config
+from llmperf_backend.provider_files import load_provider_file
+from llmperf_backend.providers import (
+    ProviderConfigError,
+    ProviderProfile,
+    ProviderRegistry,
+)
 
 CONFIG_PATH = "LLMPERF_BACKEND_CONFIG"
 ENV_FILE = "LLMPERF_ENV_FILE"
 PROVIDER_PREFIX = "LLMPERF_PROVIDER_"
+PROVIDERS_FILE = "LLMPERF_PROVIDERS_FILE"
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "configs" / "default.yaml"
 _ENV_PATTERN = re.compile(
     r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::-(?P<default>[^}]*))?\}"
@@ -96,6 +103,51 @@ def load_provider_environment(
         }
     )
     return effective_environment
+
+
+def load_provider_profiles(
+    path: Optional[Path] = None,
+    *,
+    process_environment: Optional[Mapping[str, str]] = None,
+) -> List[ProviderProfile]:
+    """Load one Provider document, falling back to legacy environment profiles.
+
+    Provider documents are authoritative when selected. Environment values supply
+    only named credentials; they do not silently override document fields.
+    """
+
+    environment_path = resolve_environment_path(path)
+    explicitly_selected = path is not None or bool(os.environ.get(ENV_FILE))
+    if explicitly_selected and not environment_path.is_file():
+        raise ProviderConfigError(
+            f"Environment file does not exist: {environment_path}"
+        )
+    file_environment = read_environment_file(environment_path)
+    process_values = (
+        _PROCESS_ENVIRONMENT if process_environment is None else process_environment
+    )
+    credential_environment = {**file_environment, **process_values}
+    configured_file = credential_environment.get(PROVIDERS_FILE)
+    if configured_file:
+        selected_path = Path(configured_file).expanduser()
+        provider_path = (
+            selected_path
+            if selected_path.is_absolute()
+            else environment_path.parent / selected_path
+        )
+        return load_provider_file(provider_path.resolve(), credential_environment)
+    candidates = [
+        environment_path.parent / name
+        for name in ("providers.yaml", "providers.yml", "providers.json")
+        if (environment_path.parent / name).is_file()
+    ]
+    if len(candidates) > 1:
+        raise ProviderConfigError(
+            "Multiple Provider files found; set LLMPERF_PROVIDERS_FILE to select one"
+        )
+    if candidates:
+        return load_provider_file(candidates[0], credential_environment)
+    return ProviderRegistry.profiles_from_environment(credential_environment)
 
 
 def _expand_environment(value: Any) -> Any:

@@ -7,6 +7,7 @@ def test_generic_task_join():
             "task_instance_id": "instance-1",
             "task_definition_id": "definition-1",
             "state": "completed",
+            "outcome": {"nodes": {"warm": {"status": "failed"}}},
             "spec": {"dimensions": {"delay": 60}, "trial_index": 0},
         }
     ]
@@ -25,3 +26,4 @@ def test_generic_task_join():
     assert analyses[0]["spec"]["dimensions"] == {"delay": 60}
     assert analyses[0]["nodes"][0]["node_id"] == "warm"
     assert analyses[0]["nodes"][0]["runner"]["status"] == "succeeded"
+    assert analyses[0]["nodes"][0]["outcome"]["status"] == "failed"

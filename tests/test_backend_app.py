@@ -22,6 +22,7 @@ server:
   port: 8000
 database:
   url: "{database_url}"
+  auto_create_schema: {auto_create_schema}
 scheduler:
   enabled: false
 planner:
@@ -129,30 +130,41 @@ def make_client(
     tokenizer_cache=None,
     dataset_cache=None,
     provider_environment=None,
+    auto_create_schema: bool = True,
 ) -> ASGITestClient:
     config_path = tmp_path / "backend.yaml"
-    config_path.write_text(CONFIG.format(database_url=database_url), encoding="utf-8")
-    provider_environment = provider_environment or {
+    config_path.write_text(
+        CONFIG.format(
+            database_url=database_url,
+            auto_create_schema=str(auto_create_schema).lower(),
+        ),
+        encoding="utf-8",
+    )
+    effective_provider_environment = provider_environment or {
         "LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"
     }
     providers = ProviderRegistry.from_environment(
-        provider_environment,
-        reload_loader=lambda: dict(provider_environment),
+        effective_provider_environment,
+        reload_loader=lambda: dict(effective_provider_environment),
     )
     if tokenizer_cache is None:
         tokenizer_directory = tmp_path / "tokenizer"
         tokenizer_directory.mkdir(exist_ok=True)
-        tokenizer_cache = FakeTokenizerCache(tokenizer_directory)
+        resolved_tokenizer_cache = FakeTokenizerCache(tokenizer_directory)
+    else:
+        resolved_tokenizer_cache = tokenizer_cache
     if dataset_cache is None:
         dataset_path = tmp_path / "sharegpt.json"
         dataset_path.write_text("[]", encoding="utf-8")
-        dataset_cache = FakeDatasetCache(dataset_path)
+        resolved_dataset_cache = FakeDatasetCache(dataset_path)
+    else:
+        resolved_dataset_cache = dataset_cache
     return ASGITestClient(
         create_app(
             ConfigStore(config_path),
             provider_registry=providers,
-            tokenizer_cache=tokenizer_cache,
-            dataset_cache=dataset_cache,
+            tokenizer_cache=resolved_tokenizer_cache,
+            dataset_cache=resolved_dataset_cache,
         )
     )
 
@@ -200,6 +212,20 @@ def test_health(client_factory):
         assert response.json()["config"]["benchmark"]["model"] == "test-model"
 
 
+def test_existing_schema(tmp_path, postgresql_url):
+    async def prepare():
+        database = Database(DatabaseConfig(url=postgresql_url))
+        try:
+            await database.create_schema()
+        finally:
+            await database.dispose()
+
+    asyncio.run(prepare())
+    with make_client(tmp_path, postgresql_url, auto_create_schema=False) as client:
+        assert client.app.state.schema_state == "ready"
+        assert client.get("/api/v1/runners").status_code == 200
+
+
 def test_provider_reload(client_factory):
     provider_environment = {
         "LLMPERF_PROVIDER_TEST_URL": "http://old.example/v1",
@@ -241,7 +267,9 @@ def test_provider_reload(client_factory):
 
 
 def test_config_validation(client_factory, postgresql_url):
-    rendered_config = CONFIG.format(database_url=postgresql_url)
+    rendered_config = CONFIG.format(
+        database_url=postgresql_url, auto_create_schema="true"
+    )
     with client_factory() as client:
         response = client.post(
             "/api/v1/config/validate", json={"yaml_content": rendered_config}
@@ -304,7 +332,7 @@ def test_runner_lifecycle(client_factory):
             "runner_id": runner_id,
             "status": "queued",
             "scheduler_id": None,
-            "worker": None,
+            "worker": {"process_id": None, "exit_code": None},
             "stdout": None,
             "stderr": None,
         }
@@ -355,6 +383,23 @@ def test_campaign_cancel(client_factory):
         assert cancelled.status_code == 200
         assert cancelled.json()["status"] == "cancelled"
         assert cancelled.json()["status_counts"]["cancelled"] == 2
+
+
+def test_campaign_rounds(client_factory):
+    with client_factory() as client:
+        submission = {
+            "campaign": {"name": "rounds", "rounds": {"count": 3, "seed": 20261014}},
+            "runners": [{"label": "a"}, {"label": "b"}],
+        }
+        preview = client.post("/api/v1/campaigns/preview", json=submission)
+        assert preview.status_code == 200
+        assert preview.json()["summary"]["immediate_runners"] == 6
+        started = client.post("/api/v1/campaigns/start", json=submission)
+        assert started.status_code == 202
+        runners = started.json()["items"]
+        assert len(runners) == 6
+        assert [runner["metadata"]["round"] for runner in runners] == [1, 1, 2, 2, 3, 3]
+        assert len({runner["benchmark"]["dataset_seed"] for runner in runners}) == 6
 
 
 def test_atomic_campaign_start(client_factory):

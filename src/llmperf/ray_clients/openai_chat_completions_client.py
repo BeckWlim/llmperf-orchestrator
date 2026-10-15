@@ -117,29 +117,29 @@ class OpenAIChatCompletionsClient(LLMClient):
     """Client for OpenAI Chat Completions API."""
 
     def llm_request(self, request_config: RequestConfig) -> LLMResponse:
-        prompt = request_config.prompt
-        prompt, prompt_len = prompt
+        prompt_text, prompt_len = request_config.prompt
 
         message = [
             {"role": "system", "content": ""},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": prompt_text},
         ]
         model = request_config.model
         body = {
             "model": model,
             "messages": message,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         sampling_params = request_config.sampling_params
         body.update(sampling_params or {})
+        if body.get("stream_options") is None:
+            body.pop("stream_options", None)
         inter_chunk_latencies = []
-        tokens_received = 0
-        ttft = 0
+        ttft = 0.0
         error_response_code = -1
         generated_text = ""
         error_msg = ""
-        output_throughput = 0
-        total_request_time = 0
+        total_request_time = 0.0
         usage: Dict[str, Any] = {}
         request_metadata = dict(request_config.metadata or {})
         response_headers: Dict[str, str] = {}
@@ -157,18 +157,14 @@ class OpenAIChatCompletionsClient(LLMClient):
         start_time = time.monotonic()
         start_utc = datetime.now(timezone.utc).isoformat()
         completed_utc = None
-        address = os.environ.get("OPENAI_API_BASE")
+        address = self.environment.get("OPENAI_API_BASE")
         if not address:
             raise ValueError("the environment variable OPENAI_API_BASE must be set.")
-        key = os.environ.get("OPENAI_API_KEY")
+        key = self.environment.get("OPENAI_API_KEY")
         if not key:
             raise ValueError("the environment variable OPENAI_API_KEY must be set.")
         headers = {"Authorization": f"Bearer {key}"}
-        if not address:
-            raise ValueError("No host provided.")
-        if not address.endswith("/"):
-            address = address + "/"
-        address += "chat/completions"
+        request_url = address.rstrip("/") + "/chat/completions"
         stream_idle_timeout = float(request_config.timeout_seconds or 180)
         transport_read_timeout = stream_idle_timeout + max(
             1.0, stream_idle_timeout * 0.1
@@ -203,7 +199,7 @@ class OpenAIChatCompletionsClient(LLMClient):
         progress_watcher.start()
         try:
             with requests.post(
-                address,
+                request_url,
                 json=body,
                 stream=True,
                 timeout=(stream_idle_timeout, transport_read_timeout),
@@ -240,7 +236,6 @@ class OpenAIChatCompletionsClient(LLMClient):
                     if event["kind"] == "done":
                         break
                     text = event["text"]
-                    tokens_received += 1
                     with progress_lock:
                         last_progress_time[0] = received_at
                     progress_changed.set()
@@ -272,11 +267,13 @@ class OpenAIChatCompletionsClient(LLMClient):
             if inactivity_expired.is_set() and not isinstance(
                 exc, StreamInactivityTimeout
             ):
-                exc = StreamInactivityTimeout(
+                effective_error = StreamInactivityTimeout(
                     "stream produced no text for " f"{stream_idle_timeout:g} seconds"
                 )
+            else:
+                effective_error = exc
             if not error_msg:
-                error_msg = f"{type(exc).__name__}: {exc}"
+                error_msg = f"{type(effective_error).__name__}: {effective_error}"
             metrics[common_metrics.ERROR_MSG] = error_msg
             metrics[common_metrics.ERROR_CODE] = error_response_code
             print(f"Warning Or Error: {error_msg}")
@@ -290,15 +287,12 @@ class OpenAIChatCompletionsClient(LLMClient):
             completion_time = time.monotonic()
             completed_utc = datetime.now(timezone.utc).isoformat()
             total_request_time = completion_time - start_time
-            output_throughput = (
-                tokens_received / total_request_time if total_request_time > 0 else 0
-            )
 
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
-        metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = output_throughput
-        metrics[common_metrics.NUM_TOTAL_TOKENS] = tokens_received + prompt_len
-        metrics[common_metrics.NUM_OUTPUT_TOKENS] = tokens_received
+        metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = None
+        metrics[common_metrics.NUM_TOTAL_TOKENS] = None
+        metrics[common_metrics.NUM_OUTPUT_TOKENS] = None
         metrics[common_metrics.NUM_INPUT_TOKENS] = prompt_len
         metrics[common_metrics.LOCAL_INPUT_TOKENS] = prompt_len
         metrics[common_metrics.REQUEST_METADATA] = request_metadata
@@ -331,6 +325,12 @@ class OpenAIChatCompletionsClient(LLMClient):
             normalized_usage = normalize_usage(usage)
             metrics.update(normalized_usage.to_metrics())
             output_tokens = normalized_usage.provider_output_tokens
+            if output_tokens is not None:
+                metrics[common_metrics.NUM_OUTPUT_TOKENS] = output_tokens
+                metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = (
+                    output_tokens / total_request_time if total_request_time > 0 else 0
+                )
+                metrics[common_metrics.NUM_TOTAL_TOKENS] = prompt_len + output_tokens
             if (
                 output_tokens is not None
                 and output_tokens > 1

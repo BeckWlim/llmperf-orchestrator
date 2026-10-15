@@ -4,36 +4,35 @@ import os
 import time
 from typing import Any, Dict
 
-import boto3
+from boto3.session import Session
 
 from llmperf.ray_llm_client import LLMClient, LLMResponse
 from llmperf.models import RequestConfig
 from llmperf import common_metrics
-from llmperf.utils import get_tokenizer
 
 
 class SageMakerClient(LLMClient):
     """Client for OpenAI Chat Completions API."""
 
-    def __init__(self):
-        # Sagemaker doesn't return the number of tokens that are generated so we approximate it by
-        # using the llama tokenizer.
-        self.tokenizer = get_tokenizer()
-
     def llm_request(self, request_config: RequestConfig) -> LLMResponse:
-        if not os.environ.get("AWS_ACCESS_KEY_ID"):
+        if not self.environment.get("AWS_ACCESS_KEY_ID"):
             raise ValueError("AWS_ACCESS_KEY_ID must be set.")
-        if not os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        if not self.environment.get("AWS_SECRET_ACCESS_KEY"):
             raise ValueError("AWS_SECRET_ACCESS_KEY must be set.")
-        if not os.environ.get("AWS_REGION_NAME"):
+        if not self.environment.get("AWS_REGION_NAME"):
             raise ValueError("AWS_REGION_NAME must be set.")
 
-        prompt = request_config.prompt
-        prompt, prompt_len = prompt
+        prompt_text, prompt_len = request_config.prompt
 
         model = request_config.model
-        sm_runtime = boto3.client(
-            "sagemaker-runtime", region_name=os.environ.get("AWS_REGION_NAME")
+        # Each concurrent call owns its SDK session; avoid the global default
+        # session's lazy initialization from multiple actor threads.
+        sm_runtime = Session(
+            aws_access_key_id=self.environment.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=self.environment.get("AWS_SECRET_ACCESS_KEY"),
+            aws_session_token=self.environment.get("AWS_SESSION_TOKEN"),
+        ).client(
+            "sagemaker-runtime", region_name=self.environment.get("AWS_REGION_NAME")
         )
 
         sampling_params = dict(request_config.sampling_params or {})
@@ -41,27 +40,27 @@ class SageMakerClient(LLMClient):
         if "max_tokens" in sampling_params:
             sampling_params["max_new_tokens"] = sampling_params["max_tokens"]
             del sampling_params["max_tokens"]
+        messages = sampling_params.pop(
+            "messages",
+            [
+                {"role": "system", "content": ""},
+                {"role": "user", "content": prompt_text},
+            ],
+        )
 
         request_body = {
-            "inputs": [
-                [
-                    {"role": "system", "content": ""},
-                    {"role": "user", "content": prompt},
-                ]
-            ],
+            "inputs": [messages],
             "parameters": {
                 **sampling_params,
             },
         }
 
         time_to_next_token = []
-        tokens_received = 0
-        ttft = 0
+        ttft = 0.0
         error_response_code = None
         generated_text = ""
         error_msg = ""
-        output_throughput = 0
-        total_request_time = 0
+        total_request_time = 0.0
         metrics: Dict[str, Any] = {}
 
         start_time = time.monotonic()
@@ -77,18 +76,17 @@ class SageMakerClient(LLMClient):
 
             event_stream = response["Body"]
             json_byte = b""
-            for line, ttft, _ in LineIterator(event_stream):
+            first_chunk_at = start_time
+            for line, first_chunk_at, _ in LineIterator(event_stream):
                 json_byte += line
                 time_to_next_token.append(
                     time.monotonic() - most_recent_received_token_time
                 )
                 most_recent_received_token_time = time.monotonic()
-            ttft = ttft - start_time
+            ttft = first_chunk_at - start_time
             resp = json.loads(json_byte)
             total_request_time = time.monotonic() - start_time
             generated_text = resp[0]["generation"]["content"]
-            tokens_received = len(self.tokenizer.encode(generated_text))
-            output_throughput = tokens_received / total_request_time
 
         except Exception as e:
             print(f"Warning Or Error: {e}")
@@ -100,9 +98,9 @@ class SageMakerClient(LLMClient):
         metrics[common_metrics.ERROR_CODE] = error_response_code
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
-        metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = output_throughput
-        metrics[common_metrics.NUM_TOTAL_TOKENS] = tokens_received + prompt_len
-        metrics[common_metrics.NUM_OUTPUT_TOKENS] = tokens_received
+        metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = None
+        metrics[common_metrics.NUM_TOTAL_TOKENS] = None
+        metrics[common_metrics.NUM_OUTPUT_TOKENS] = None
         metrics[common_metrics.NUM_INPUT_TOKENS] = prompt_len
 
         return metrics, generated_text, request_config
@@ -118,7 +116,7 @@ class LineIterator:
         self.byte_iterator = iter(stream)
         self.buffer = io.BytesIO()
         self.read_pos = 0
-        self.ttft = 0
+        self.ttft = 0.0
 
     def __iter__(self):
         return self

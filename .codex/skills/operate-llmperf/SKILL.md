@@ -30,21 +30,21 @@ Apply these invariants:
    Runners, bounded RunnerPlans, compiled task definitions, or any combination.
 2. Treat a RunnerPlan as a template. The Planner materializes due occurrences as
    ordinary queued Runners; it never occupies a Scheduler slot while waiting.
-3. Treat the Scheduler as the queue consumer and Worker owner. A Worker is a
-   Scheduler-local Ray execution handle for exactly one claimed Runner, not an OS
-   subprocess.
-4. Keep that one-Runner Worker resource boundary. The Scheduler is the only Ray driver.
-   Every Worker submits one retry-free Ray task and obtains at least one Runner-owned LLM
-   client actor. Actors request resources independently and release them with their request
-   slot. Keep every client actor serial (`max_concurrency=1`) and exclusive to one Runner;
-   never initialize Ray or connect PostgreSQL inside a Worker task.
-5. Persist control state and benchmark results in PostgreSQL. Do not add SQLite
-   fallback behavior or in-memory authoritative state.
+3. The runtime coordinator owns dependencies and due times and feeds a fair in-memory
+   ready queue. Scheduler owns Worker handles, bounded admission, and the shared Ray pool.
+4. Scheduler is the only Ray driver. Atomic invokes use lightweight Backend handles;
+   ordinary batch Runners use retry-free Ray tasks. All share the request actor pool.
+   `scheduler.ray_actor_max_concurrency` defaults to `8`; eight actors give 64 request slots.
+   Actors isolate per-request credentials and messages. Never mutate process environment
+   to switch Providers or connect PostgreSQL inside a Worker task or actor.
+5. Persist accepted work, checkpoints, execution attempts, history, and results in
+   PostgreSQL. Runtime queues are reconstructible and non-authoritative. No SQLite fallback.
 6. Keep Provider endpoints and credentials in Backend-owned profiles. Put only
    the stable provider ID and model ID in workload YAML.
-7. Treat an atomic single-request Runner as the only compiled-task execution primitive.
-   The Workload Compiler owns typed workflow-node expansion and runtime assembly; the
-   Planner only handles dependencies and due times and must not interpret role names.
+7. Each compiled invoke sends one request and completes independently. Compatible parallel invokes
+   share actor capacity dynamically instead of waiting for a static group. Role names are
+   metadata. Multi-turn successors require committed history. Readiness checks required tables and columns without a version marker. Older
+   layouts need explicit migration or a fresh database; do not replay interrupted work.
 8. Distinguish Campaign lifecycle `status` from aggregate execution `outcome`.
    Never infer that `completed` means every Runner succeeded.
 
@@ -54,17 +54,18 @@ Before submission, read `scheduler status` and validate with the active slot/Ray
 
 ```bash
 .venv/bin/python .codex/skills/operate-llmperf/scripts/validate_workload.py FILE \
-  --scheduler-slots SLOTS --ray-num-cpus CPUS --ray-actor-num-cpus ACTOR_CPUS
+  --scheduler-slots SLOTS --ray-num-cpus CPUS --ray-actor-num-cpus ACTOR_CPUS \
+  --ray-actor-max-concurrency REQUESTS_PER_ACTOR \
+  --max-runner-concurrency RUNNER_LIMIT --max-effective-concurrency TOTAL_LIMIT
 ```
 
 Treat a non-zero result as a stop condition. Report planned Runner count, estimated
 Provider requests, mean-token budget, maximum Runner concurrency, effective concurrency,
 and warnings. In addition:
 
-- verify the shared Ray actor capacity can satisfy the effective concurrency; every
-  Runner must use Ray, but no Runner may create its own runtime;
-- verify concurrent Campaigns receive fair claims while Ray independently queues their
-  actors; do not require all actors of one Runner to become ready simultaneously;
+- verify shared Ray capacity and the independent active Runner bound; actor demand rounds
+  across Runners (`ceil(total request slots / requests per actor)`);
+- verify concurrent Campaigns receive fair runtime admission; actors are shared and fixed;
 - account for all RunnerPlan occurrences and compiled invoke nodes, not only YAML item count;
 - inspect host CPU/memory, PostgreSQL latency, Ray worker churn, and queue growth before
   increasing slots; a 1x1 Runner can still be expensive when its runtime is heavyweight;

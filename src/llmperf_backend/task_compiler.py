@@ -16,6 +16,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Tuple,
     TypeVar,
     Union,
@@ -70,6 +71,7 @@ TaskValue = Annotated[
 
 class TaskPayloadSpec(CompilerModel):
     seed_namespace: str = Field(min_length=1, max_length=64)
+    text: Optional[str] = Field(default=None, min_length=1)
 
 
 class InvokeConfig(CompilerModel):
@@ -79,6 +81,7 @@ class InvokeConfig(CompilerModel):
     payload: str = Field(min_length=1, max_length=64)
     role: Optional[str] = Field(default=None, min_length=1, max_length=64)
     after_seconds: TaskValue = 0
+    conversation: Optional[str] = Field(default=None, min_length=1, max_length=64)
 
     @property
     def effective_role(self) -> str:
@@ -310,6 +313,8 @@ class CompiledNodeRow:
     role: str
     payload_id: str
     payload_seed: int
+    conversation: Optional[str] = None
+    prompt_text: Optional[str] = None
 
 
 class CompilationTable:
@@ -348,6 +353,13 @@ class CompilationTable:
             raise ValueError(f"unknown compiled instance {instance_key}") from exc
 
 
+def parallel_request_groups(
+    nodes: Sequence[CompiledNodeRow],
+) -> Tuple[Tuple[CompiledNodeRow, ...], ...]:
+    """Keep atomic completion boundaries; runtime pools all eligible requests."""
+    return tuple((node,) for node in nodes)
+
+
 @dataclass(frozen=True)
 class TaskNodeAssembly:
     """Runtime-ready node with UUID dependencies and serialized Runner input."""
@@ -359,6 +371,8 @@ class TaskNodeAssembly:
     runner_template: Dict[str, Any]
     role: str
     payload_id: str
+    parallel_leader: Optional[str] = None
+    parallel_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -421,6 +435,7 @@ class GraphBuilder:
         after_seconds: int,
         role: str,
         payload_id: str,
+        conversation: Optional[str] = None,
     ) -> str:
         if not node_id or len(node_id) > 120:
             raise ValueError("expanded task node IDs must contain 1-120 chars")
@@ -440,6 +455,8 @@ class GraphBuilder:
             role=role,
             payload_id=payload_id,
             payload_seed=self.instance.payload_seed(payload_id),
+            conversation=conversation,
+            prompt_text=self.instance.payloads[payload_id].text,
         )
         self._nodes.append(compiled_row)
         self._node_ids.add(node_id)
@@ -483,6 +500,7 @@ class InvokeNode(BaseNode):
     payload_id: str
     role: str
     after_seconds: TaskExpression
+    conversation: Optional[str] = None
 
     @classmethod
     def from_config(cls, config: CompilerModel, depth: int) -> InvokeNode:
@@ -494,6 +512,7 @@ class InvokeNode(BaseNode):
             payload_id=config.payload,
             role=config.effective_role,
             after_seconds=TaskExpression.from_value(config.after_seconds),
+            conversation=config.conversation,
         )
 
     def expand(
@@ -511,6 +530,7 @@ class InvokeNode(BaseNode):
             after_seconds=inherited_delay_seconds + own_delay_seconds,
             role=self.role,
             payload_id=self.payload_id,
+            conversation=self.conversation,
         )
         return (emitted_node_id,)
 
@@ -678,7 +698,22 @@ class TaskGraph:
         frontier: Tuple[str, ...] = ()
         for root in self.roots:
             frontier = root.expand(builder, frontier, (), 0)
-        return builder.rows()
+        compiled_rows = builder.rows()
+        ancestors: Dict[str, set[str]] = {}
+        previous_turns: Dict[str, str] = {}
+        for row in compiled_rows:
+            predecessors = set(row.dependencies)
+            for dependency in row.dependencies:
+                predecessors.update(ancestors[dependency])
+            ancestors[row.node_id] = predecessors
+            if row.conversation is not None:
+                previous_turn = previous_turns.get(row.conversation)
+                if previous_turn is not None and previous_turn not in predecessors:
+                    raise ValueError(
+                        "Conversation turns must be ordered by dependencies; use separate conversation names for parallel branches"
+                    )
+                previous_turns[row.conversation] = row.node_id
+        return compiled_rows
 
 
 def _matrix_coordinates(recipe: TaskRecipe) -> Iterable[Dict[str, int]]:
@@ -735,8 +770,12 @@ class TaskCompiler:
 
     @classmethod
     def estimate(
-        cls, definition: Union[TaskRecipe, Mapping[str, Any]]
+        cls,
+        definition: Union[TaskRecipe, Mapping[str, Any]],
+        requests_per_actor: int = 1,
     ) -> Dict[str, int]:
+        if requests_per_actor < 1:
+            raise ValueError("requests_per_actor must be positive")
         recipe = (
             definition
             if isinstance(definition, TaskRecipe)
@@ -744,6 +783,10 @@ class TaskCompiler:
         )
         graph = TaskGraph.from_recipe(recipe)
         node_count = 0
+        runner_count = 0
+        max_concurrency = 0
+        peak_requests = 0
+        peak_actors = 0
         coordinate_count = 0
         for coordinate_index, dimensions in enumerate(_matrix_coordinates(recipe)):
             coordinate_count += 1
@@ -756,10 +799,77 @@ class TaskCompiler:
             )
             compiled_nodes = graph.expand(instance_context, estimate_key)
             node_count += len(compiled_nodes) * recipe.instances.trials
+            groups = parallel_request_groups(compiled_nodes)
+            runner_count += len(groups) * recipe.instances.trials
+            max_concurrency = max(
+                max_concurrency, max((len(group) for group in groups), default=0)
+            )
+            request_weights = {group[0].node_id: len(group) for group in groups}
+            actor_weights = {
+                group[0].node_id: (len(group) + requests_per_actor - 1)
+                // requests_per_actor
+                for group in groups
+            }
+            peak_requests += (
+                max(
+                    (
+                        _weighted_peak(root, dimensions, request_weights)
+                        for root in graph.roots
+                    ),
+                    default=0,
+                )
+                * recipe.instances.trials
+            )
+            peak_actors += (
+                max(
+                    (
+                        _weighted_peak(root, dimensions, actor_weights)
+                        for root in graph.roots
+                    ),
+                    default=0,
+                )
+                * recipe.instances.trials
+            )
         return {
             "instances": coordinate_count * recipe.instances.trials,
             "nodes": node_count,
+            "runners": runner_count,
+            "max_concurrency": max_concurrency,
+            "peak_requests": peak_requests,
+            "peak_actors": (peak_requests + requests_per_actor - 1)
+            // requests_per_actor,
         }
+
+    @classmethod
+    def estimate_token_budget(
+        cls, definition: Mapping[str, Any], input_tokens: int, output_tokens: int
+    ) -> int:
+        recipe = TaskRecipe.model_validate(definition)
+        graph = TaskGraph.from_recipe(recipe)
+        total = 0
+        for index, dimensions in enumerate(_matrix_coordinates(recipe)):
+            context = InstanceContext(
+                recipe.instances.seed, dimensions, 0, recipe.payloads
+            )
+            histories: Dict[str, int] = {}
+            for node in graph.expand(context, f"budget-{index}"):
+                # Literal payloads need not match the configured generated-prompt size.
+                user_tokens = (
+                    max(input_tokens, len(node.prompt_text.encode("utf-8")))
+                    if node.prompt_text
+                    else input_tokens
+                )
+                history_tokens = (
+                    histories.get(node.conversation, 0) if node.conversation else 0
+                )
+                total += (
+                    history_tokens + user_tokens + output_tokens
+                ) * recipe.instances.trials
+                if node.conversation:
+                    histories[node.conversation] = (
+                        history_tokens + user_tokens + output_tokens
+                    )
+        return total
 
     def compile(self) -> CompilationTable:
         cached_table = self._compilation_table
@@ -801,6 +911,42 @@ def _uuid_identifier() -> str:
     return str(uuid4())
 
 
+def _weighted_peak(
+    node: BaseNode,
+    dimensions: Mapping[str, int],
+    weights: Mapping[str, int],
+    path: Tuple[str, ...] = (),
+) -> int:
+    """Conservative overlap bound over the compiler's serial/parallel structure."""
+    if isinstance(node, InvokeNode):
+        return weights.get(_qualified_name(path, node.name), 0)
+    nested_path = (*path, node.name)
+    if isinstance(node, ParallelNode):
+        return sum(
+            _weighted_peak(child, dimensions, weights, nested_path)
+            for child in node.branches
+        )
+    if isinstance(node, SequenceNode):
+        return max(
+            (
+                _weighted_peak(child, dimensions, weights, nested_path)
+                for child in node.steps
+            ),
+            default=0,
+        )
+    if isinstance(node, RepeatNode):
+        return max(
+            (
+                _weighted_peak(
+                    node.node, dimensions, weights, (*nested_path, str(index))
+                )
+                for index in range(1, node.count.resolve(dimensions) + 1)
+            ),
+            default=0,
+        )
+    raise TypeError("Unsupported task node in resource estimate")
+
+
 class TaskAssembler:
     """Assign runtime identities and serialize one compiled table for persistence."""
 
@@ -822,12 +968,19 @@ class TaskAssembler:
             dispatch_ids = {
                 node.node_id: self.identifier_factory() for node in compiled_nodes
             }
+            memberships = {
+                node.node_id: (dispatch_ids[group[0].node_id], len(group))
+                for group in parallel_request_groups(compiled_nodes)
+                for node in group
+                if len(group) > 1
+            }
             node_assemblies = tuple(
                 self._assemble_node(
                     instance_row,
                     node,
                     instance_id,
                     dispatch_ids,
+                    memberships.get(node.node_id),
                 )
                 for node in compiled_nodes
             )
@@ -848,6 +1001,7 @@ class TaskAssembler:
         node: CompiledNodeRow,
         instance_id: str,
         dispatch_ids: Mapping[str, str],
+        membership: Optional[Tuple[str, int]] = None,
     ) -> TaskNodeAssembly:
         dependency_dispatch_ids = tuple(
             dispatch_ids[dependency_node_id] for dependency_node_id in node.dependencies
@@ -860,6 +1014,8 @@ class TaskAssembler:
             runner_template=self._runner_template(instance, node, instance_id),
             role=node.role,
             payload_id=node.payload_id,
+            parallel_leader=membership[0] if membership else None,
+            parallel_size=membership[1] if membership else 1,
         )
 
     def _runner_template(
@@ -879,8 +1035,20 @@ class TaskAssembler:
             "payload_seed": node.payload_seed,
             "trial_index": instance.trial_index,
             "dimensions": dict(instance.dimensions),
+            "conversation": node.conversation,
+            "prompt_text": node.prompt_text,
         }
         benchmark = dict(self.context.runner_template["benchmark"])
+        if node.conversation and benchmark.get("adapter") == "vertexai":
+            raise ValueError(
+                "VertexAI prediction adapter does not support conversation messages"
+            )
+        if node.conversation and "messages" in benchmark.get(
+            "additional_sampling_params", {}
+        ):
+            raise ValueError(
+                "Conversation history cannot be overridden by sampling messages"
+            )
         benchmark.update(
             {
                 "max_completed_requests": 1,

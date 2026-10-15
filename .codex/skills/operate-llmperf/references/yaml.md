@@ -22,6 +22,18 @@ wait: false
 
 `wait` is a CLI field and is removed before API validation.
 
+For repeated parallel batches, add `campaign.rounds: {count: 100, seed: 20261014}`
+and supply the ordinary Runner templates in `runners`. Each round gets deterministic
+seeds derived from the base seed, round, and template index. The next round waits until
+all members of the current round are terminal. This shape cannot include RunnerPlans or
+task definitions. Safety checks count the full expansion (at most 10,000 Runners), not
+just templates. `metadata.runner_round` is reserved for Backend expansion.
+
+Optional `LLMPERF_PREPARATION_WORKERS` enables bounded chunk generation for ordinary
+bundled-sonnet and external `concatenate` workloads. Tokenization calibrates corpus estimates once per Runner before
+timed sending; chunk generation during sending does not tokenize. Local input counts are
+estimates and server usage remains authoritative. See `docs/RUNTIME.md` for CPU budgeting.
+
 ## Runner benchmark
 
 Provider profiles own endpoints and credentials. Workload YAML contains only `provider`
@@ -52,6 +64,7 @@ benchmark:
   dataset_seed: 11111
   mean_output_tokens: 8
   stddev_output_tokens: 0
+  output_token_count: provider
   additional_sampling_params:
     temperature: 0
 ```
@@ -74,15 +87,41 @@ cycling, joins diverse records, and truncates only the final segment to the requ
 budget. Concatenation requires `dataset_repeat_count: 1`; exact repetition belongs in a
 compiled task through a shared payload ID.
 
+External concatenation supports `shared_prefix_tokens`; intact-record `sample` mode does
+not. With preparation workers enabled, this reuses the existing dataset loader, calibrates
+from at most 128 records (4,096 characters each) during initialization, and constructs
+bounded estimated-length chunks from the full corpus. Switching among installed dataset
+adapters requires only workload YAML and cached artifacts, without dataset-specific runtime
+changes. Without preparation workers, concatenation retains exact local token counting
+during upfront preparation.
+
+`output_token_count: provider` is the default. The tokenizer prepares prompts before timed
+execution; output counts come only from server usage. Missing output counts and derived
+token throughput/TPOT remain null, while request counts and latency remain usable. Inspect
+`output_token_count_coverage` before comparing token throughput. `output_token_count: local`
+retokenizes outputs after timed execution using the selected tokenizer; it is useful for
+endpoints without usage, but local and server counts can differ. These fields also apply
+to task/plan Runner templates. Actors never tokenize individual responses.
+
 For cross-Runner replay tasks, use fixed token lengths and an explicit tokenizer resolved
 to an immutable revision. Dataset-backed tasks are accepted only after the Backend resolves
 the dataset revision to a Hugging Face commit hash. All registered Provider adapters may
 execute compiled tasks; cache conclusions still require comparable Provider counter
-evidence. The compiler overwrites task nodes to one request at concurrency one. Its internal
-`adapter`, resolved tokenizer provenance, and `task_context` are Backend-owned execution
-fields. They are not part of submitted YAML, and unknown fields are rejected.
+evidence. Each invoke sends one request and retains an independent completion boundary. Runtime
+request slots share actors dynamically across Runners and instances. Internal `adapter`,
+resolved tokenizer provenance and `task_context` are Backend-owned fields.
 
 ## Task definition grammar
+
+`benchmark.concurrent_requests` bounds requests within an ordinary Runner. Backend
+`scheduler.ray_actor_max_concurrency` bounds each shared actor (default eight). Eight actors
+provide 64 slots; `LLMPERF_RUNNERS_MAX=64` allows 64 atomic Runners to fill them. Dependencies
+and delays reserve no slots. Static preview groups are singletons.
+
+For multi-turn tests add `conversation: chat` to ordered invokes. History is scoped to one
+instance and commits with each result before the next turn. Parallel conversations need
+different names. Payloads may contain literal `text` in addition to `seed_namespace`.
+See `examples/example-multiturn.yaml` and `docs/RUNTIME.md`.
 
 ```yaml
 task_definitions:

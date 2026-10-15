@@ -1,9 +1,12 @@
 """Async, database-backed scheduling for LLMPerf benchmark Workers."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from llmperf.preparation import PreparationHandle, create_preparation_actor
 import logging
 import os
 import socket
+from sqlalchemy.exc import SQLAlchemyError
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 from uuid import uuid4
 
@@ -31,23 +34,29 @@ from llmperf_backend.artifacts import (
 from llmperf_backend.safety import RuntimePerformanceGuard
 from llmperf_backend.worker import (
     Worker,
+    AtomicWorker,
     WORKER_DATASET_PATH,
     benchmark_actor_count,
     summarize_outcome,
 )
-from llmperf.common import RAY_ACTOR_CPUS_ENV
+from llmperf.common import RAY_ACTOR_CPUS_ENV, RAY_ACTOR_CONCURRENCY_ENV
+from llmperf_backend.runtime import RuntimeCoordinator, RuntimeRepository
+from llmperf_backend.request_pool import (
+    create_request_actor,
+    create_request_router,
+    RequestActorHandle,
+    RouterHandle,
+)
 
 WORKER_DATABASE_URL = "LLMPERF_WORKER_DB"
 WORKER_RAY_ACTOR_CPUS = RAY_ACTOR_CPUS_ENV
 LOGGER = logging.getLogger(__name__)
 
 
-class SchedulerRepository(Protocol):
+class SchedulerRepository(RuntimeRepository, Protocol):
     """Persistence operations required by Scheduler."""
 
     async def requeue_stale(self, stale_after_seconds: int) -> int: ...
-
-    async def claim_next(self, scheduler_id: str) -> Optional[Dict[str, Any]]: ...
 
     async def heartbeat(self, runner_id: str) -> bool: ...
 
@@ -76,6 +85,9 @@ class SchedulerRepository(Protocol):
     async def get_runner(self, runner_id: str) -> Optional[Dict[str, Any]]: ...
 
     async def requeue_runner(self, runner_id: str, message: str) -> None: ...
+
+    async def acquire_runtime(self, owner: str) -> None: ...
+    async def release_runtime(self) -> None: ...
 
 
 class Scheduler:
@@ -106,8 +118,8 @@ class Scheduler:
             performance_guard_config or PerformanceGuardConfig()
         )
         self.scheduler_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
-        self._slots: List[asyncio.Task] = []
-        self._busy_slots = set()
+        self._runner_tasks: List[asyncio.Task] = []
+        self._busy_runners = set()
         self._stop: Optional[asyncio.Event] = None
         self._ray_module: Any = None
         self._ray_context: Any = None
@@ -119,6 +131,15 @@ class Scheduler:
         self._ray_monitor_task: Optional[asyncio.Task] = None
         self._worker_remote: Any = None
         self._active_workers: Dict[str, Worker] = {}
+        self.coordinator = RuntimeCoordinator(repository, config.poll_interval_seconds)
+        self._request_router: Optional[RouterHandle] = None
+        self._request_actors: List[RequestActorHandle] = []
+        self._preparation_actors: List[PreparationHandle] = []
+        self._pool_status: Dict[str, int] = {}
+        self._atomic_executor = ThreadPoolExecutor(
+            max_workers=config.max_concurrent_runners,
+            thread_name_prefix="llmperf-invoke",
+        )
 
     async def start(self) -> None:
         if not self.config.enabled:
@@ -127,39 +148,45 @@ class Scheduler:
         self._stop = asyncio.Event()
         try:
             await self._start_ray_runtime()
+            await self.repository.acquire_runtime(self.scheduler_id)
             await self.repository.requeue_stale(self.config.stale_after_seconds)
-            self._slots = [
+            await self.coordinator.start()
+            self._runner_tasks = [
                 asyncio.create_task(
                     self._worker(index), name=f"llmperf-scheduler-{index}"
                 )
                 for index in range(self.config.max_concurrent_runners)
             ]
         except Exception:
+            await self.coordinator.stop()
             await self._stop_ray_runtime()
             self._stop = None
             raise
         LOGGER.info(
-            "Scheduler %s started with %d slot(s)",
+            "Scheduler %s started with %d Runner handles",
             self.scheduler_id,
-            len(self._slots),
+            len(self._runner_tasks),
         )
 
     async def stop(self) -> None:
         if self._stop is None:
             return
         self._stop.set()
-        for task in self._slots:
+        for task in self._runner_tasks:
             task.cancel()
-        if self._slots:
-            await asyncio.gather(*self._slots, return_exceptions=True)
+        if self._runner_tasks:
+            await asyncio.gather(*self._runner_tasks, return_exceptions=True)
         if self._ray_monitor_task is not None:
             self._ray_monitor_task.cancel()
             await asyncio.gather(self._ray_monitor_task, return_exceptions=True)
             self._ray_monitor_task = None
         await self._stop_ray_runtime()
-        self._slots.clear()
-        self._busy_slots.clear()
+        await self.coordinator.stop()
+        await self.repository.release_runtime()
+        self._runner_tasks.clear()
+        self._busy_runners.clear()
         self._stop = None
+        self._atomic_executor.shutdown(wait=False, cancel_futures=True)
         LOGGER.info("Scheduler %s stopped", self.scheduler_id)
 
     def status(self) -> Dict[str, Any]:
@@ -168,18 +195,25 @@ class Scheduler:
             if not self.config.enabled
             else ("running" if self._stop is not None else "stopped")
         )
-        busy_slots = len(self._busy_slots)
+        active_runners = len(self._busy_runners)
         return {
             "scheduler_id": self.scheduler_id,
             "status": state,
             "max_concurrent_runners": self.config.max_concurrent_runners,
-            "live_slots": sum(not slot.done() for slot in self._slots),
-            "busy_slots": busy_slots,
+            "live_slots": self._pool_status.get("request_capacity", 0),
+            "busy_slots": self._pool_status.get("executing_requests", 0),
+            "active_runners": active_runners,
+            "request_pool": dict(self._pool_status),
+            "runtime_error": self.coordinator.last_error,
             "worker_kind": "ray_task",
             "active_workers": len(self._active_workers),
             "ray_mode": self._ray_mode,
             "ray_address": self._ray_address or self.config.ray_address,
             "ray_actor_num_cpus": self.config.ray_actor_num_cpus,
+            "ray_actor_max_concurrency": self.config.ray_actor_max_concurrency,
+            "preparation_workers": self.config.preparation_workers,
+            "preparation_chunk_size": self.config.preparation_chunk_size,
+            "preparation_buffer_chunks": self.config.preparation_buffer_chunks,
             "ray_runtime": dict(self._ray_status),
             "performance_guard": self.performance_guard.status(),
         }
@@ -212,6 +246,7 @@ class Scheduler:
         if not self._ray_healthy:
             raise RuntimeError("Ray runtime failed its initial health check")
         self._worker_remote = Worker.remote(ray)
+        await self._start_request_pool(ray)
         self._ray_monitor_task = asyncio.create_task(
             self._monitor_ray_runtime(), name="llmperf-ray-monitor"
         )
@@ -221,6 +256,35 @@ class Scheduler:
             self._ray_address,
             self._ray_status.get("cluster_resources"),
         )
+
+    async def _start_request_pool(self, ray: Any) -> None:
+        actor_count = self.config.request_actor_capacity
+        if actor_count < 1:
+            raise ValueError("Ray CPU budget cannot place one request actor")
+        self._request_actors = [
+            create_request_actor(
+                self.config.ray_actor_num_cpus, self.config.ray_actor_max_concurrency
+            )
+            for _ in range(actor_count)
+        ]
+        self._preparation_actors = [
+            create_preparation_actor() for _ in range(self.config.preparation_workers)
+        ]
+        self._request_router = create_request_router(
+            self._request_actors,
+            self.config.ray_actor_max_concurrency,
+            max(
+                1024,
+                self.config.max_concurrent_runners
+                * self.performance_guard.config.max_runner_concurrency,
+            ),
+            (
+                self.performance_guard.config.max_effective_concurrency
+                if self.performance_guard.config.enabled
+                else None
+            ),
+        )
+        self._pool_status = await self._request_router.status.remote()
 
     async def _stop_ray_runtime(self) -> None:
         ray = self._ray_module
@@ -232,7 +296,17 @@ class Scheduler:
         self._worker_remote = None
         self._ray_module = None
         if ray is not None:
+            if self._request_router is not None:
+                ray.kill(self._request_router)
+            for actor in self._request_actors:
+                ray.kill(actor)
+            for preparation_actor in self._preparation_actors:
+                ray.kill(preparation_actor)
             await asyncio.to_thread(ray.shutdown)
+        self._request_actors.clear()
+        self._preparation_actors.clear()
+        self._request_router = None
+        self._pool_status.clear()
 
     async def _sample_ray_runtime(self) -> None:
         ray = self._ray_module
@@ -274,6 +348,11 @@ class Scheduler:
                 asyncio.to_thread(snapshot),
                 timeout=self.config.ray_health_timeout_seconds,
             )
+            if self._request_router is not None:
+                self._pool_status = await asyncio.wait_for(
+                    self._request_router.status.remote(),
+                    self.config.ray_health_timeout_seconds,
+                )
             self._ray_healthy = (
                 float(self._ray_status["cluster_resources"].get("CPU", 0)) > 0
             )
@@ -323,6 +402,7 @@ class Scheduler:
                 not self.performance_guard.allow_claim()
                 or not self._ray_healthy
                 or self._ray_object_store_tripped
+                or self.coordinator.last_error is not None
             ):
                 try:
                     await asyncio.wait_for(
@@ -332,7 +412,7 @@ class Scheduler:
                     pass
                 continue
             try:
-                runner = await self.repository.claim_next(scheduler_slot_id)
+                runner = await self.coordinator.next_runner(scheduler_slot_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -357,11 +437,17 @@ class Scheduler:
                 scheduler_slot_id,
                 runner["runner_id"],
             )
-            self._busy_slots.add(index)
+            self._busy_runners.add(index)
             try:
                 await self._execute(runner)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.exception(
+                    "Execution could not persist its terminal state; recovery will mark it indeterminate"
+                )
             finally:
-                self._busy_slots.discard(index)
+                self._busy_runners.discard(index)
 
     async def worker_environment(
         self, runner: Dict[str, Any], base_environment: Dict[str, str]
@@ -380,6 +466,9 @@ class Scheduler:
             resolution = await self.dataset_cache.resolve(dataset)
             environment[WORKER_DATASET_PATH] = str(resolution.path)
         environment[WORKER_RAY_ACTOR_CPUS] = str(self.config.ray_actor_num_cpus)
+        environment[RAY_ACTOR_CONCURRENCY_ENV] = str(
+            self.config.ray_actor_max_concurrency
+        )
         return environment
 
     async def _prepare_worker_environment(
@@ -463,6 +552,8 @@ class Scheduler:
                 await asyncio.gather(result_task, return_exceptions=True)
 
     async def _cancel_worker(self, worker: Worker) -> None:
+        if self._request_router is not None:
+            await self._request_router.cancel.remote(worker.runner_id)
         worker.cancel(force=False)
         deadline = asyncio.get_running_loop().time() + self.config.cancel_grace_seconds
         while not worker.ready() and asyncio.get_running_loop().time() < deadline:
@@ -482,31 +573,52 @@ class Scheduler:
                 return
             if self._ray_module is None or self._worker_remote is None:
                 raise RuntimeError("Ray Worker runtime is not initialized")
-            actor_count = benchmark_actor_count(runner["benchmark"])
-            worker = Worker(
-                self._ray_module,
-                self._worker_remote,
-                runner_id,
-                actor_count,
-                self.config.ray_actor_num_cpus,
+            actor_count = benchmark_actor_count(
+                runner["benchmark"], self.config.ray_actor_max_concurrency
+            )
+            worker = (
+                AtomicWorker(
+                    self._ray_module,
+                    self._worker_remote,
+                    runner_id,
+                    actor_count,
+                    self.config.ray_actor_num_cpus,
+                    self._atomic_executor,
+                )
+                if runner["benchmark"].get("task_context")
+                and self._request_router is not None
+                else Worker(
+                    self._ray_module,
+                    self._worker_remote,
+                    runner_id,
+                    actor_count,
+                    self.config.ray_actor_num_cpus,
+                )
             )
             self._active_workers[runner_id] = worker
+            worker.preparation_actors = self._preparation_actors
             execution_runtime = {
                 "backend": "ray",
-                "worker_kind": "ray_task",
+                "worker_kind": (
+                    "local_invoke" if isinstance(worker, AtomicWorker) else "ray_task"
+                ),
                 "ray_mode": self._ray_mode,
                 "ray_namespace": "llmperf-control",
                 "ray_actor_num_cpus": self.config.ray_actor_num_cpus,
-                "ray_actor_count": actor_count,
-                "resource_scheduling": "independent_actors",
+                "ray_actor_count": len(self._request_actors) or actor_count,
+                "ray_actor_max_concurrency": self.config.ray_actor_max_concurrency,
+                "resource_scheduling": "shared_request_pool",
                 "runner_id": runner_id,
                 "campaign_id": runner.get("campaign_id"),
+                "preparation_chunk_size": self.config.preparation_chunk_size,
+                "preparation_buffer_chunks": self.config.preparation_buffer_chunks,
             }
             worker.start(
                 runner["benchmark"],
                 environment,
                 execution_runtime,
                 self.config.log_bytes_limit,
+                self._request_router,
             )
             LOGGER.info(
                 "Started Ray Worker task=%s for Runner %s with %d actor(s)",
@@ -548,16 +660,25 @@ class Scheduler:
             summary["runner_metadata"] = runner["metadata"]
             summary["execution_runtime"]["worker_id"] = worker.task_id()
             terminal_status, message = summarize_outcome(summary, requests)
-            committed = await self.repository.complete_runner(
-                runner_id,
-                summary,
-                requests,
-                0,
-                stdout,
-                stderr,
-                terminal_status=terminal_status,
-                error_message=message if terminal_status == FAILED else None,
-            )
+            while True:
+                try:
+                    committed = await self.repository.complete_runner(
+                        runner_id,
+                        summary,
+                        requests,
+                        0,
+                        stdout,
+                        stderr,
+                        terminal_status=terminal_status,
+                        error_message=message if terminal_status == FAILED else None,
+                    )
+                    break
+                except SQLAlchemyError:
+                    LOGGER.exception(
+                        "Result commit unavailable; retaining completed Runner %s",
+                        runner_id,
+                    )
+                    await asyncio.sleep(self.config.poll_interval_seconds)
             if not committed:
                 current = await self.repository.get_runner(runner_id)
                 if current is not None and current["cancel_requested"]:
@@ -574,16 +695,20 @@ class Scheduler:
             )
         except asyncio.CancelledError:
             if worker is not None:
+                if self._request_router is not None:
+                    await self._request_router.cancel.remote(runner_id)
                 worker.cancel(force=True)
                 worker.close()
             current = await self.repository.get_runner(runner_id)
             if current is not None and current["status"] not in TERMINAL_STATUSES:
                 await self.repository.requeue_runner(
-                    runner_id, "Scheduler stopped; Runner requeued"
+                    runner_id, "Scheduler stopped; execution outcome is indeterminate"
                 )
             raise
         except Exception as exc:
             LOGGER.exception("Scheduler failed while executing Runner %s", runner_id)
+            if worker is not None:
+                await self._cancel_worker(worker)
             await self.repository.finish_runner(
                 runner_id, FAILED, str(exc), 1, "", str(exc)
             )
@@ -591,3 +716,4 @@ class Scheduler:
             if worker is not None:
                 worker.close()
             self._active_workers.pop(runner_id, None)
+            self.coordinator.committed(runner_id)

@@ -35,7 +35,7 @@ from llmperf_backend.config import (
     ConfigError,
     ConfigSnapshot,
     ConfigStore,
-    load_provider_environment,
+    load_provider_profiles,
 )
 from llmperf_backend.models import (
     BenchmarkCampaignCreate,
@@ -71,7 +71,11 @@ from llmperf_backend.providers import (
 )
 from llmperf_backend.scheduler import Scheduler
 from llmperf_backend.safety import WorkloadSafetyError, assess_workload
-from llmperf_backend.task_compiler import TaskCompileContext, TaskCompiler
+from llmperf_backend.task_compiler import (
+    TaskCompileContext,
+    TaskCompiler,
+    parallel_request_groups,
+)
 
 RUNNER_STATUSES = {QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED}
 LOGGER = logging.getLogger(__name__)
@@ -106,6 +110,11 @@ def _compile_campaign_task_preview(
         for instance_row in visible_instances:
             node_previews: List[Dict[str, Any]] = []
             instance_nodes = compilation_table.nodes_for(instance_row.instance_key)
+            execution_groups = {
+                member.node_id: (group[0].node_id, len(group))
+                for group in parallel_request_groups(instance_nodes)
+                for member in group
+            }
             for node_row in instance_nodes[:node_limit]:
                 node_preview: Dict[str, Any] = {
                     "node_id": node_row.node_id,
@@ -113,6 +122,12 @@ def _compile_campaign_task_preview(
                     "after_seconds": node_row.after_seconds,
                     "role": node_row.role,
                     "payload_id": node_row.payload_id,
+                    "conversation": node_row.conversation,
+                    "payload_kind": (
+                        "literal" if node_row.prompt_text is not None else "generated"
+                    ),
+                    "execution_group": execution_groups[node_row.node_id][0],
+                    "group_size": execution_groups[node_row.node_id][1],
                 }
                 if include_debug:
                     node_preview["payload_seed"] = node_row.payload_seed
@@ -148,7 +163,8 @@ def _compile_campaign_task_preview(
         "campaign": payload.campaign.name,
         "debug": include_debug,
         "summary": {
-            "immediate_runners": len(payload.runners),
+            "immediate_runners": len(payload.runners)
+            * (payload.campaign.rounds.count if payload.campaign.rounds else 1),
             "runner_plans": len(payload.runner_plans),
             "task_definitions": len(payload.task_definitions),
             "task_instances": total_instances,
@@ -195,8 +211,8 @@ def create_app(
     validated_config = store.current()
     db = database or Database(validated_config.database)
     repository = RunnerRepository(db)
-    providers = provider_registry or ProviderRegistry.from_environment(
-        load_provider_environment(), reload_loader=load_provider_environment
+    providers = provider_registry or ProviderRegistry.from_loader(
+        load_provider_profiles
     )
     discovery = model_discovery or ProviderModelDiscovery(providers)
     if tokenizer_cache is None and dataset_cache is None:
@@ -223,8 +239,13 @@ def create_app(
         if validated_config.database.auto_create_schema:
             await db.create_schema()
         try:
-            await active_planner.start()
-            await active_scheduler.start()
+            schema_state = await db.schema_status()
+            application.state.schema_state = schema_state
+            if schema_state == "ready":
+                await active_scheduler.start()
+                await active_planner.start()
+            else:
+                LOGGER.error("Database %s; scheduling disabled", schema_state)
             yield
         finally:
             await active_planner.stop()
@@ -246,9 +267,33 @@ def create_app(
     application.state.model_discovery = discovery
     application.state.tokenizer_cache = tokenizers
     application.state.dataset_cache = datasets
+
+    async def require_schema(request: Request) -> None:
+        path = request.url.path
+        persistent_route = any(
+            path.startswith(f"/api/v1/{name}")
+            for name in (
+                "runners",
+                "runner-plans",
+                "campaigns",
+                "users",
+                "trusted-clients",
+            )
+        )
+        preflight = any(part in path for part in ("validate", "preview"))
+        if (
+            persistent_route
+            and not preflight
+            and getattr(application.state, "schema_state", "unchecked") != "ready"
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail="schema_mismatch: required database tables or columns are missing",
+            )
+
     api = APIRouter(
         prefix="/api/v1",
-        dependencies=[Depends(token_verifier)],
+        dependencies=[Depends(token_verifier), Depends(require_schema)],
     )
 
     role_level = {"viewer": 10, "operator": 20, "superuser": 30}
@@ -424,9 +469,9 @@ def create_app(
                 task_definitions,
                 config.performance_guard,
                 request.app.state.scheduler.config.max_concurrent_runners,
-                int(
-                    request.app.state.scheduler.config.ray_num_cpus
-                    / request.app.state.scheduler.config.ray_actor_num_cpus
+                request.app.state.scheduler.config.request_actor_capacity,
+                ray_actor_max_concurrency=(
+                    request.app.state.scheduler.config.ray_actor_max_concurrency
                 ),
             )
         except WorkloadSafetyError as exc:
@@ -452,7 +497,7 @@ def create_app(
         default_benchmark = request.app.state.config_store.snapshot().config[
             "benchmark"
         ]
-        resolved_runners = [
+        resolved_runner_templates = [
             await resolve_runner(
                 request,
                 runner,
@@ -461,6 +506,17 @@ def create_app(
             )
             for runner in payload.runners
         ]
+        from llmperf_backend.rounds import expand_rounds
+
+        resolved_runners = (
+            expand_rounds(
+                resolved_runner_templates,
+                payload.campaign.rounds.count,
+                payload.campaign.rounds.seed,
+            )
+            if payload.campaign.rounds is not None
+            else resolved_runner_templates
+        )
         resolved_runner_plans = [
             await resolve_plan(
                 request,
@@ -539,13 +595,19 @@ def create_app(
     async def health(request: Request) -> Dict[str, Any]:
         snapshot = request.app.state.config_store.snapshot()
         database_ok = await request.app.state.database.ping()
+        schema_state = await request.app.state.database.schema_status()
         token_verifier.refresh()
         auth_status = token_verifier.status()
         return {
             "status": (
-                "ok" if database_ok and not auth_status["reload_error"] else "degraded"
+                "ok"
+                if database_ok
+                and schema_state == "ready"
+                and not auth_status["reload_error"]
+                else "degraded"
             ),
             "database": "connected" if database_ok else "unavailable",
+            "database_schema": schema_state,
             "auth": auth_status,
             "providers": len(request.app.state.provider_registry.list_public()),
             "planner": request.app.state.planner.status()["status"],
@@ -640,6 +702,10 @@ def create_app(
         request: Request, payload: BenchmarkCampaignCreate
     ) -> Dict[str, Any]:
         actor = require_role(request, "operator")
+        if payload.rounds is not None:
+            raise HTTPException(
+                status_code=422, detail="Use /campaigns/start to submit Runner rounds"
+            )
         return await request.app.state.runner_repository.create_campaign(
             payload.name, payload.description, payload.tags, actor
         )

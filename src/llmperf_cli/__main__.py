@@ -258,6 +258,7 @@ def print_health(document: Dict[str, Any]) -> None:
     print(f"Backend: {_table_value(document.get('status'))}")
     print(
         f"Database: {_table_value(document.get('database'))}  "
+        f"Schema: {_table_value(document.get('database_schema'))}  "
         f"Planner: {_table_value(document.get('planner'))}"
     )
     print(
@@ -285,17 +286,27 @@ def print_scheduler_status(document: Dict[str, Any]) -> None:
         f"Status: {_table_value(document.get('status'))}"
     )
     print(
-        "Capacity: "
+        "Request slots: "
         f"busy={_table_value(document.get('busy_slots'), '0')} "
-        f"live={_table_value(document.get('live_slots'), '0')} "
+        f"live={_table_value(document.get('live_slots'), '0')}"
+    )
+    print(
+        f"Runners: active={_table_value(document.get('active_runners'), '0')} "
         f"max={_table_value(document.get('max_concurrent_runners'), '0')} "
         f"workers={_table_value(document.get('active_workers'), '0')}"
     )
     print(
         f"Execution: worker={_table_value(document.get('worker_kind'))} "
         f"ray_mode={_table_value(document.get('ray_mode'))} "
-        f"actor_cpus={_table_value(document.get('ray_actor_num_cpus'))}"
+        f"actor_cpus={_table_value(document.get('ray_actor_num_cpus'))} "
+        f"requests_per_actor={_table_value(document.get('ray_actor_max_concurrency'))}"
     )
+    if document.get("preparation_workers"):
+        print(
+            f"Preparation: workers={document['preparation_workers']} "
+            f"chunk_size={_table_value(document.get('preparation_chunk_size'))} "
+            f"buffer_chunks={_table_value(document.get('preparation_buffer_chunks'))}"
+        )
 
     runtime = document.get("ray_runtime") or {}
     print(
@@ -416,6 +427,11 @@ def print_task_preview(document: Dict[str, Any]) -> None:
                     print(
                         "      debug: "
                         f"payload_seed={_table_value(node.get('payload_seed'))}"
+                    )
+                if int(node.get("group_size") or 1) > 1:
+                    print(
+                        f"      shared Runner: {node.get('execution_group')} "
+                        f"({node.get('group_size')} concurrent requests)"
                     )
             truncated_node_count = int(instance.get("truncated_node_count") or 0)
             if truncated_node_count:

@@ -84,6 +84,8 @@ class CompiledTaskContext(StrictModel):
     payload_seed: int = Field(ge=0, le=2_147_483_647)
     trial_index: int = Field(ge=0)
     dimensions: Dict[str, int] = Field(default_factory=dict)
+    conversation: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    prompt_text: Optional[str] = None
 
 
 class DatasetSpec(StrictModel):
@@ -121,13 +123,18 @@ class _BenchmarkFields(StrictModel):
     dataset_seed: int = 11111
     mean_output_tokens: int = Field(default=150, gt=0)
     stddev_output_tokens: int = Field(default=80, ge=0)
+    output_token_count: Literal["provider", "local"] = "provider"
     additional_sampling_params: Dict[str, Any] = Field(default_factory=dict)
     cache_probe: Optional[CacheProbeConfig] = None
 
     @model_validator(mode="after")
     def validate_cache_probe(self) -> "_BenchmarkFields":
-        if self.dataset is not None and self.shared_prefix_tokens:
-            raise ValueError("dataset and shared_prefix_tokens cannot be used together")
+        if (
+            self.dataset is not None
+            and self.shared_prefix_tokens
+            and self.dataset_prompt_mode != "concatenate"
+        ):
+            raise ValueError("dataset shared_prefix_tokens requires concatenate mode")
         if self.dataset is None and self.dataset_prompt_mode != "sample":
             raise ValueError("dataset_prompt_mode requires dataset")
         if self.dataset_prompt_mode == "concatenate" and self.dataset_repeat_count != 1:
@@ -178,6 +185,29 @@ class CompiledBenchmarkConfig(ResolvedBenchmarkConfig):
         return self
 
 
+class GroupedBenchmarkConfig(ResolvedBenchmarkConfig):
+    """Compiler-owned parallel invocations sharing one Runner's request pool."""
+
+    task_contexts: List[CompiledTaskContext] = Field(min_length=2)
+
+    @model_validator(mode="after")
+    def validate_group(self) -> "GroupedBenchmarkConfig":
+        count = len(self.task_contexts)
+        if (
+            self.cache_probe is not None
+            or self.max_completed_requests != count
+            or self.concurrent_requests != count
+        ):
+            raise ValueError(
+                "grouped benchmark requires one concurrent request per task context"
+            )
+        if len({context.instance_id for context in self.task_contexts}) != 1:
+            raise ValueError("grouped benchmark cannot cross task instances")
+        if len({context.node_id for context in self.task_contexts}) != count:
+            raise ValueError("grouped task node IDs must be unique")
+        return self
+
+
 class DatabaseConfig(StrictModel):
     """Asynchronous SQLAlchemy connection settings."""
 
@@ -198,7 +228,7 @@ class SchedulerConfig(StrictModel):
     """Durable benchmark scheduling settings."""
 
     enabled: bool = True
-    max_concurrent_runners: int = Field(default=1, ge=1)
+    max_concurrent_runners: int = Field(default=64, ge=1, le=1024)
     poll_interval_seconds: float = Field(default=1.0, gt=0)
     cancel_grace_seconds: float = Field(default=5.0, gt=0)
     stale_after_seconds: int = Field(default=300, gt=0)
@@ -206,10 +236,20 @@ class SchedulerConfig(StrictModel):
     ray_address: Optional[str] = Field(default=None, min_length=1)
     ray_num_cpus: int = Field(default=8, ge=1, le=1024)
     ray_actor_num_cpus: float = Field(default=1.0, gt=0, le=64)
+    ray_actor_max_concurrency: int = Field(default=8, ge=1, le=1024)
+    preparation_workers: int = Field(default=0, ge=0, le=64)
+    preparation_chunk_size: int = Field(default=16, ge=1, le=256)
+    preparation_buffer_chunks: int = Field(default=8, ge=1, le=64)
     ray_object_store_memory_bytes: int = Field(default=268_435_456, ge=78_643_200)
     ray_health_interval_seconds: float = Field(default=5.0, gt=0, le=300)
     ray_health_timeout_seconds: float = Field(default=3.0, gt=0, le=60)
     artifact_resolution_timeout_seconds: float = Field(default=60.0, gt=0, le=3600)
+
+    @property
+    def request_actor_capacity(self) -> int:
+        return int(
+            (self.ray_num_cpus - self.preparation_workers) / self.ray_actor_num_cpus
+        )
 
     @field_validator("ray_address", mode="before")
     @classmethod
@@ -221,8 +261,8 @@ class PerformanceGuardConfig(StrictModel):
     """Fail-closed limits for runtime fan-out and submitted workloads."""
 
     enabled: bool = True
-    max_runner_concurrency: int = Field(default=32, ge=1)
-    max_effective_concurrency: int = Field(default=32, ge=1)
+    max_runner_concurrency: int = Field(default=64, ge=1)
+    max_effective_concurrency: int = Field(default=64, ge=1)
     max_campaign_runners: int = Field(default=1_000, ge=1)
     max_campaign_provider_requests: int = Field(default=10_000, ge=1)
     max_campaign_token_budget: int = Field(default=100_000_000, ge=1)
@@ -288,26 +328,11 @@ class AppConfig(StrictModel):
 
     @model_validator(mode="after")
     def validate_ray_runtime_shape(self) -> "AppConfig":
-        if (
-            self.scheduler.enabled
-            and self.scheduler.ray_address is None
-            and self.server.workers != 1
-        ):
-            raise ValueError(
-                "embedded Ray requires server.workers=1; configure scheduler.ray_address "
-                "for a multi-process Backend"
-            )
-        actor_capacity = int(
-            self.scheduler.ray_num_cpus / self.scheduler.ray_actor_num_cpus
-        )
-        minimum_actor_demand = (
-            self.server.workers * self.scheduler.max_concurrent_runners
-        )
-        if self.scheduler.enabled and minimum_actor_demand > actor_capacity:
-            raise ValueError(
-                "Ray actor capacity must cover at least one actor per Scheduler slot: "
-                f"demand={minimum_actor_demand}, capacity={actor_capacity}"
-            )
+        if self.scheduler.enabled and self.server.workers != 1:
+            raise ValueError("Runtime coordinator requires server.workers=1")
+        actor_capacity = self.scheduler.request_actor_capacity
+        if self.scheduler.enabled and actor_capacity < 1:
+            raise ValueError("Ray CPU budget must place at least one shared actor")
         return self
 
 
@@ -321,6 +346,15 @@ class BenchmarkRunnerSpec(StrictModel):
     benchmark: Optional[BenchmarkConfig] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     label: Optional[str] = Field(default=None, min_length=1, max_length=200)
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        if "runner_round" in value:
+            raise ValueError(
+                "metadata.runner_round is reserved for Backend round expansion"
+            )
+        return value
 
 
 TaskDefinitionCreate = CompilerTaskDefinitionCreate[BenchmarkRunnerSpec]
@@ -422,12 +456,20 @@ class RunnerPlanCreate(RunnerPlanTiming):
     runner: BenchmarkRunnerSpec
 
 
+class RunnerRounds(StrictModel):
+    """Repeat the campaign's Runner templates behind completion barriers."""
+
+    count: int = Field(ge=1, le=1000)
+    seed: int = Field(ge=0)
+
+
 class BenchmarkCampaignCreate(StrictModel):
     """Create a durable grouping for multiple benchmark Runners."""
 
     name: str = Field(min_length=1, max_length=200)
     description: Optional[str] = Field(default=None, max_length=2000)
     tags: Dict[str, Any] = Field(default_factory=dict)
+    rounds: Optional[RunnerRounds] = None
 
 
 class BenchmarkCampaignStart(StrictModel):
@@ -452,6 +494,13 @@ class BenchmarkCampaignStart(StrictModel):
             )
         if workload_size > 100:
             raise ValueError("campaign workload cannot contain more than 100 items")
+        if self.campaign.rounds is not None:
+            if not self.runners or self.runner_plans or self.task_definitions:
+                raise ValueError(
+                    "campaign rounds require only immediate Runner templates"
+                )
+            if len(self.runners) * self.campaign.rounds.count > 10000:
+                raise ValueError("campaign rounds cannot exceed 10000 expanded runners")
         instance_count = 0
         for definition in self.task_definitions:
             instance_count += definition.instance_count

@@ -1,5 +1,6 @@
 import abc
-from typing import Any, Dict, Tuple
+import os
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from llmperf.models import RequestConfig
 
@@ -8,6 +9,9 @@ LLMResponse = Tuple[Dict[str, Any], str, RequestConfig]
 
 class LLMClient:
     """A client for making requests to a LLM API e.g Anyscale Endpoints."""
+
+    def __init__(self, environment: Optional[Mapping[str, str]] = None):
+        self.environment = dict(os.environ if environment is None else environment)
 
     @abc.abstractmethod
     def llm_request(self, request_config: RequestConfig) -> LLMResponse:

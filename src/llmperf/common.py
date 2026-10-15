@@ -14,6 +14,23 @@ from llmperf.ray_llm_client import LLMClient
 SUPPORTED_APIS = ["openai", "anthropic", "litellm", "sagemaker", "vertexai"]
 LITELLM_APIS = {"anthropic", "litellm"}
 RAY_ACTOR_CPUS_ENV = "LLMPERF_WORKER_RAY_ACTOR_CPUS"
+RAY_ACTOR_CONCURRENCY_ENV = "LLMPERF_WORKER_RAY_ACTOR_CONCURRENCY"
+
+
+def actor_concurrency() -> int:
+    """Return the bounded number of simultaneous requests per client actor."""
+
+    concurrency = int(os.environ.get(RAY_ACTOR_CONCURRENCY_ENV, "1"))
+    if concurrency < 1:
+        raise ValueError(f"{RAY_ACTOR_CONCURRENCY_ENV} must be greater than zero")
+    return concurrency
+
+
+def request_actor_count(request_slots: int, requests_per_actor: int) -> int:
+    if request_slots < 1 or requests_per_actor < 1:
+        raise ValueError("Request slots and requests per actor must be positive")
+    return (request_slots + requests_per_actor - 1) // requests_per_actor
+
 
 ClientT = TypeVar("ClientT")
 
@@ -57,16 +74,17 @@ def _client_class(llm_api: str) -> Type[LLMClient]:
 
 
 @lru_cache(maxsize=None)
-def _ray_client_class(llm_api: str, num_cpus: float) -> _RemoteActorClass[LLMClient]:
+def _ray_client_class(
+    llm_api: str, num_cpus: float, max_concurrency: int = 1
+) -> _RemoteActorClass[LLMClient]:
     import ray
 
     remote_class = ray.remote(_client_class(llm_api))
     return remote_class.options(
         num_cpus=num_cpus,
-        # A client actor is the atomic request-execution unit seen by the
-        # Scheduler. Keep method execution serial even if Ray's defaults or
-        # surrounding launch code change.
-        max_concurrency=1,
+        # Synchronous adapters use Ray's bounded thread pool. Each invocation
+        # owns its request/response state; actors remain exclusive to a Runner.
+        max_concurrency=max_concurrency,
         max_restarts=0,
         max_task_retries=0,
     )
@@ -86,5 +104,5 @@ def construct_clients(llm_api: str, num_clients: int) -> "List[ActorProxy[LLMCli
     num_cpus = float(os.environ.get(RAY_ACTOR_CPUS_ENV, "1.0"))
     if num_cpus <= 0:
         raise ValueError(f"{RAY_ACTOR_CPUS_ENV} must be greater than zero")
-    remote_class = _ray_client_class(llm_api, num_cpus)
+    remote_class = _ray_client_class(llm_api, num_cpus, actor_concurrency())
     return [remote_class.remote() for _ in range(num_clients)]

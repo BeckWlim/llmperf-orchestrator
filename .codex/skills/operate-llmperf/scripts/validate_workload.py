@@ -16,6 +16,7 @@ from llmperf_backend.models import (
     dump_model,
 )
 from llmperf.version import PROTOCOL_VERSION
+from llmperf_backend.rounds import expand_rounds
 from llmperf_backend.safety import WorkloadSafetyError, assess_workload
 
 
@@ -45,12 +46,19 @@ def validate_document(
     scheduler_slots: int = 1,
     ray_num_cpus: int = 8,
     ray_actor_num_cpus: float = 1.0,
+    ray_actor_max_concurrency: int = 1,
+    max_runner_concurrency: int = 32,
+    max_effective_concurrency: int = 32,
 ) -> str:
     if ray_num_cpus < 1 or ray_actor_num_cpus <= 0:
         raise ValueError("Ray CPU and actor CPU values must be greater than zero")
     ray_actor_capacity = int(ray_num_cpus / ray_actor_num_cpus)
     if ray_actor_capacity < 1:
         raise ValueError("Ray runtime cannot schedule even one configured actor")
+    guard = PerformanceGuardConfig(
+        max_runner_concurrency=max_runner_concurrency,
+        max_effective_concurrency=max_effective_concurrency,
+    )
     if document.get("version") != PROTOCOL_VERSION:
         raise ValueError(f"YAML version must be {PROTOCOL_VERSION!r}")
     if "campaign" not in document:
@@ -62,9 +70,10 @@ def validate_document(
             [dump_model(runner)],
             [],
             [],
-            PerformanceGuardConfig(),
+            guard,
             scheduler_slots,
             ray_actor_capacity,
+            ray_actor_max_concurrency=ray_actor_max_concurrency,
         )
         return (
             f"valid runner workload: provider={provider} model={model} "
@@ -75,7 +84,13 @@ def validate_document(
         key: value for key, value in document.items() if key not in {"wait", "export"}
     }
     campaign = BenchmarkCampaignStart.model_validate(payload)
-    runners = [dump_model(runner) for runner in campaign.runners]
+    runner_templates = [dump_model(runner) for runner in campaign.runners]
+    rounds = campaign.campaign.rounds
+    expanded_runners = (
+        expand_rounds(runner_templates, rounds.count, rounds.seed)
+        if rounds is not None
+        else runner_templates
+    )
     plans = []
     for runner_plan in campaign.runner_plans:
         item = dump_model(runner_plan)
@@ -88,12 +103,13 @@ def validate_document(
         runner = item.pop("runner")
         tasks.append({"definition": item, "runner_template": runner})
     assessment = assess_workload(
-        runners,
+        expanded_runners,
         plans,
         tasks,
-        PerformanceGuardConfig(),
+        guard,
         scheduler_slots,
         ray_actor_capacity,
+        ray_actor_max_concurrency=ray_actor_max_concurrency,
     )
     return (
         "valid campaign workload: "
@@ -121,6 +137,14 @@ def main() -> int:
         default=1.0,
         help="CPU resource reserved by each LLM client actor",
     )
+    parser.add_argument(
+        "--ray-actor-max-concurrency",
+        type=int,
+        default=1,
+        help="Maximum simultaneous requests per client actor",
+    )
+    parser.add_argument("--max-runner-concurrency", type=int, default=32)
+    parser.add_argument("--max-effective-concurrency", type=int, default=32)
     arguments = parser.parse_args()
     try:
         print(
@@ -129,6 +153,9 @@ def main() -> int:
                 scheduler_slots=arguments.scheduler_slots,
                 ray_num_cpus=arguments.ray_num_cpus,
                 ray_actor_num_cpus=arguments.ray_actor_num_cpus,
+                ray_actor_max_concurrency=arguments.ray_actor_max_concurrency,
+                max_runner_concurrency=arguments.max_runner_concurrency,
+                max_effective_concurrency=arguments.max_effective_concurrency,
             )
         )
     except (ValueError, ValidationError, WorkloadSafetyError) as exc:

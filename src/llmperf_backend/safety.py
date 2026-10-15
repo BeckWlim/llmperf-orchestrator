@@ -182,9 +182,12 @@ def assess_workload(
     scheduler_slots: int,
     ray_actor_capacity: Optional[int] = None,
     now: Optional[datetime] = None,
+    ray_actor_max_concurrency: int = 1,
 ) -> Dict[str, Any]:
     """Estimate fan-out and reject workloads beyond configured hard limits."""
 
+    if ray_actor_max_concurrency < 1:
+        raise ValueError("ray_actor_max_concurrency must be positive")
     assessed_at = now or datetime.now(UTC)
     total = {
         "planned_runners": 0,
@@ -205,6 +208,14 @@ def assess_workload(
             _plan_occurrences(plan, assessed_at),
         )
 
+    # Ordinary Runner/plan costs retain the existing conservative slot bound.
+    ordinary_runner_count = total["planned_runners"]
+    ordinary_concurrency = total["max_runner_concurrency"]
+    peak_requests = ordinary_runner_count * ordinary_concurrency
+    peak_actors = ordinary_runner_count * (
+        (ordinary_concurrency + ray_actor_max_concurrency - 1)
+        // ray_actor_max_concurrency
+    )
     for item in task_definitions:
         definition_document = item.get("definition", item)
         embedded_runner = definition_document.get("runner", {})
@@ -213,9 +224,11 @@ def assess_workload(
         }
         template = item.get("runner_template", embedded_runner)
         benchmark = template.get("benchmark")
-        expansion = TaskCompiler.estimate(recipe_document)
+        expansion = TaskCompiler.estimate(recipe_document, ray_actor_max_concurrency)
+        peak_requests += expansion["peak_requests"]
+        peak_actors += expansion["peak_actors"]
         requests = expansion["nodes"]
-        runners_count = requests
+        runners_count = expansion["runners"]
         tokens_per_request = (
             int(benchmark["mean_input_tokens"]) + int(benchmark["mean_output_tokens"])
             if benchmark is not None
@@ -223,16 +236,36 @@ def assess_workload(
         )
         total["planned_runners"] += runners_count
         total["provider_requests"] += requests
-        total["token_budget"] += requests * tokens_per_request
+        total["token_budget"] += (
+            TaskCompiler.estimate_token_budget(
+                recipe_document,
+                int(benchmark["mean_input_tokens"]),
+                int(benchmark["mean_output_tokens"]),
+            )
+            if benchmark is not None
+            else 0
+        )
         total["max_runner_concurrency"] = max(
-            total["max_runner_concurrency"], 1 if benchmark is not None else 0
+            total["max_runner_concurrency"],
+            expansion["max_concurrency"] if benchmark is not None else 0,
         )
         total["unknown_benchmarks"] += int(benchmark is None)
 
-    effective_concurrency = (
-        min(total["planned_runners"], scheduler_slots) * total["max_runner_concurrency"]
+    effective_concurrency = min(
+        peak_requests,
+        min(total["planned_runners"], scheduler_slots)
+        * total["max_runner_concurrency"],
     )
-    metrics = {**total, "effective_concurrency": effective_concurrency}
+    requested_concurrency = effective_concurrency
+    if ray_actor_capacity is not None:
+        effective_concurrency = min(
+            effective_concurrency, ray_actor_capacity * ray_actor_max_concurrency
+        )
+    metrics = {
+        **total,
+        "effective_concurrency": effective_concurrency,
+        "requested_concurrency": requested_concurrency,
+    }
     limits = {
         "planned_runners": guard.max_campaign_runners,
         "provider_requests": guard.max_campaign_provider_requests,
@@ -241,10 +274,20 @@ def assess_workload(
         "effective_concurrency": guard.max_effective_concurrency,
     }
     if ray_actor_capacity is not None:
-        metrics["ray_actor_demand"] = effective_concurrency
+        metrics["ray_actor_demand"] = (
+            effective_concurrency + ray_actor_max_concurrency - 1
+        ) // ray_actor_max_concurrency
         limits["ray_actor_demand"] = ray_actor_capacity
     risks: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
+    if requested_concurrency > effective_concurrency:
+        warnings.append(
+            {
+                "code": "request_capacity_limited",
+                "value": requested_concurrency,
+                "limit": effective_concurrency,
+            }
+        )
     for metric, limit in limits.items():
         value = metrics[metric]
         issue = {"code": f"{metric}_limit", "value": value, "limit": limit}

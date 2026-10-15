@@ -37,8 +37,8 @@ def number(value: Any) -> Optional[float]:
 
 
 def integer(value: Any) -> Optional[int]:
-    value = number(value)
-    return int(value) if value is not None else None
+    numeric_value = number(value)
+    return int(numeric_value) if numeric_value is not None else None
 
 
 def median(values: Iterable[Any]) -> Optional[float]:
@@ -102,6 +102,7 @@ def runner_information(runner: Mapping[str, Any], index: int) -> Dict[str, Any]:
     probe = summary.get("cache_probe_analysis") or {}
     benchmark = runner.get("benchmark") or {}
     task = benchmark.get("task_context") or summary.get("task_context") or {}
+    task_contexts = benchmark.get("task_contexts") or summary.get("task_contexts") or []
     cache = probe.get("cache") or results.get("kv_cache") or {}
     tokenizer = benchmark.get("tokenizer") or summary.get("tokenizer") or {}
     first_error = get_path(outcome, "first_error.message") or runner.get(
@@ -110,6 +111,7 @@ def runner_information(runner: Mapping[str, Any], index: int) -> Dict[str, Any]:
     return {
         "order": index + 1,
         "runner_id": runner.get("runner_id"),
+        "task_node_count": len(task_contexts) or int(bool(task)),
         "label": runner.get("label"),
         "status": runner.get("status") or "unknown",
         "outcome": outcome.get("status"),
@@ -228,6 +230,7 @@ def build_task_evidence(
         for dispatch in dispatches.get(instance_id, []):
             lineage = dispatch.get("lineage") or {}
             runner = runner_by_id.get(str(dispatch.get("runner_id")))
+            grouped = runner is not None and runner.get("task_node_count", 0) > 1
             nodes.append(
                 {
                     "node_id": dispatch.get("node_id"),
@@ -239,7 +242,13 @@ def build_task_evidence(
                     "actual_started_at": lineage.get("actual_started_at"),
                     "actual_completed_at": lineage.get("actual_completed_at"),
                     "state": dispatch.get("state"),
-                    "runner": runner,
+                    "runner_id": dispatch.get("runner_id"),
+                    "outcome": (instance.get("outcome") or {})
+                    .get("nodes", {})
+                    .get(dispatch.get("node_id")),
+                    # Group averages cannot stand in for this node's measurement.
+                    "runner": None if grouped else runner,
+                    "group_runner": runner if grouped else None,
                 }
             )
         evidence.append(

@@ -8,22 +8,16 @@ import requests
 from llmperf.ray_llm_client import LLMClient, LLMResponse
 from llmperf.models import RequestConfig
 from llmperf import common_metrics
-from llmperf.utils import get_tokenizer
 
 
 class VertexAIClient(LLMClient):
     """Client for VertexAI API."""
 
-    def __init__(self):
-        # VertexAI doesn't return the number of tokens that are generated so we approximate it by
-        # using the llama tokenizer.
-        self.tokenizer = get_tokenizer()
-
     def llm_request(self, request_config: RequestConfig) -> LLMResponse:
-        project_id = os.environ.get("GCLOUD_PROJECT_ID")
-        region = os.environ.get("GCLOUD_REGION")
-        endpoint_id = os.environ.get("VERTEXAI_ENDPOINT_ID")
-        access_token = os.environ.get("GCLOUD_ACCESS_TOKEN")
+        project_id = self.environment.get("GCLOUD_PROJECT_ID")
+        region = self.environment.get("GCLOUD_REGION")
+        endpoint_id = self.environment.get("VERTEXAI_ENDPOINT_ID")
+        raw_access_token = self.environment.get("GCLOUD_ACCESS_TOKEN")
         if not project_id:
             raise ValueError("the environment variable GCLOUD_PROJECT_ID must be set.")
         if not region:
@@ -32,24 +26,20 @@ class VertexAIClient(LLMClient):
             raise ValueError(
                 "the environment variable VERTEXAI_ENDPOINT_ID must be set."
             )
+        if not raw_access_token:
+            raise ValueError(
+                "the environment variable GCLOUD_ACCESS_TOKEN must be set."
+            )
+        access_token = raw_access_token.strip()
         if not access_token:
             raise ValueError(
                 "the environment variable GCLOUD_ACCESS_TOKEN must be set."
             )
-        access_token = access_token.strip()
-        if not access_token:
-            raise ValueError(
-                "the environment variable GCLOUD_ACCESS_TOKEN must be set."
-            )
-        prompt = request_config.prompt
-        prompt, prompt_len = prompt
+        prompt_text, prompt_len = request_config.prompt
 
-        time_to_next_token = []
-        tokens_received = 0
-        ttft = 0
+        ttft = 0.0
         generated_text = ""
-        output_throughput = 0
-        total_request_time = 0
+        total_request_time = 0.0
 
         metrics: Dict[str, Any] = {}
         response_code = -1
@@ -77,7 +67,10 @@ class VertexAIClient(LLMClient):
                 )
 
             # Define the data payload
-            data = {"instances": [{"prompt": prompt}], "parameters": sampling_params}
+            data = {
+                "instances": [{"prompt": prompt_text}],
+                "parameters": sampling_params,
+            }
 
             # Make the POST request
             start_time = time.monotonic()
@@ -88,12 +81,7 @@ class VertexAIClient(LLMClient):
             # output from the endpoint is in the form:
             # {"predictions": ["Input: ... \nOutput:\n ..."]}
             generated_text = response.json()["predictions"][0].split("\nOutput:\n")[1]
-            tokens_received = len(self.tokenizer.encode(generated_text))
-            ttft = -1
-            output_throughput = tokens_received / total_request_time
-            time_to_next_token = [
-                total_request_time / tokens_received for _ in range(tokens_received)
-            ]
+            ttft = -1.0
 
         except Exception as e:
             metrics[common_metrics.ERROR_MSG] = str(e)
@@ -103,9 +91,11 @@ class VertexAIClient(LLMClient):
 
         metrics[common_metrics.TTFT] = ttft
         metrics[common_metrics.E2E_LAT] = total_request_time
-        metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = output_throughput
-        metrics[common_metrics.NUM_TOTAL_TOKENS] = tokens_received + prompt_len
-        metrics[common_metrics.NUM_OUTPUT_TOKENS] = tokens_received
+        # This prediction schema has no token usage. The Runner may optionally
+        # count output tokens locally after its timed execution phase.
+        metrics[common_metrics.REQ_OUTPUT_THROUGHPUT] = None
+        metrics[common_metrics.NUM_TOTAL_TOKENS] = None
+        metrics[common_metrics.NUM_OUTPUT_TOKENS] = None
         metrics[common_metrics.NUM_INPUT_TOKENS] = prompt_len
 
         return metrics, generated_text, request_config

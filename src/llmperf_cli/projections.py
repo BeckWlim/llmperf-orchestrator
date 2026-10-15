@@ -83,6 +83,7 @@ def project_health(document: Any, detailed: bool = False) -> Dict[str, Any]:
     return {
         "status": source.get("status"),
         "database": source.get("database"),
+        "database_schema": source.get("database_schema"),
         "planner": source.get("planner"),
         "providers": source.get("providers"),
         "auth": {
@@ -278,6 +279,10 @@ def _campaign_preview(document: Any, detailed: bool) -> Dict[str, Any]:
                         "after_seconds",
                         "role",
                         "payload_id",
+                        "conversation",
+                        "payload_kind",
+                        "execution_group",
+                        "group_size",
                     ),
                 )
                 if detailed and "payload_seed" in raw_node:
@@ -389,12 +394,30 @@ def _scheduler(document: Any, detailed: bool) -> Dict[str, Any]:
             "max_concurrent_runners",
             "live_slots",
             "busy_slots",
+            "active_runners",
+            "runtime_error",
             "worker_kind",
             "active_workers",
             "ray_mode",
             "ray_actor_num_cpus",
+            "ray_actor_max_concurrency",
+            "preparation_workers",
+            "preparation_chunk_size",
+            "preparation_buffer_chunks",
         ),
     )
+    pool = source.get("request_pool")
+    if isinstance(pool, Mapping):
+        result["request_pool"] = _pick(
+            pool,
+            (
+                "actor_count",
+                "request_capacity",
+                "executing_requests",
+                "available_slots",
+                "queued_requests",
+            ),
+        )
     guard = source.get("performance_guard")
     if isinstance(guard, Mapping):
         guard_view = _pick(
