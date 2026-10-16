@@ -9,26 +9,26 @@ import threading
 import sys
 from types import SimpleNamespace
 
-from llmperf import token_benchmark_ray as benchmark_module
-from llmperf import common_metrics
-from llmperf.models import RequestConfig
-from llmperf.prompt_datasets import (
+from llmperf.benchmark import throughput as benchmark_module
+from llmperf.metrics import constants as common_metrics
+from llmperf.clients.models import RequestConfig
+from llmperf.datasets.prompts import (
     PromptDatasetSource,
     concatenate_prompt_requests,
     load_prompt_dataset,
     sample_prompt_requests,
 )
-from llmperf.ray_clients.openai_chat_completions_client import (
+from llmperf.clients.openai import (
     OpenAIStreamError,
     SSE_ITER_CHUNK_SIZE,
     StreamInactivityTimeout,
     cache_metrics_from_usage,
     decode_sse_line,
 )
-from llmperf.cache_analysis import analyze_cache_probe, summarize_cache_counters
-from llmperf.cache_probe import DependentPlanQueue, build_cache_probe_plan
-from llmperf.usage import normalize_usage
-from llmperf.token_benchmark_ray import metrics_summary, normalize_request_metrics
+from llmperf.metrics.cache import analyze_cache_probe, summarize_cache_counters
+from llmperf.datasets.probes import DependentPlanQueue, build_cache_probe_plan
+from llmperf.metrics.usage import normalize_usage
+from llmperf.benchmark.throughput import metrics_summary, normalize_request_metrics
 
 NORMALIZATION_CASES = [
     pytest.param(
@@ -363,9 +363,9 @@ def test_actor_without_tokenizer(monkeypatch, adapter):
     def forbidden_tokenizer():
         raise AssertionError("Request actors must not load a tokenizer")
 
-    monkeypatch.setattr("llmperf.utils.get_tokenizer", forbidden_tokenizer)
+    monkeypatch.setattr("llmperf.datasets.tokenizer.get_tokenizer", forbidden_tokenizer)
     if adapter == "vertexai":
-        from llmperf.ray_clients.vertexai_client import VertexAIClient
+        from llmperf.clients.vertexai import VertexAIClient
 
         for name in (
             "GCLOUD_PROJECT_ID",
@@ -375,7 +375,7 @@ def test_actor_without_tokenizer(monkeypatch, adapter):
         ):
             monkeypatch.setenv(name, "test")
         monkeypatch.setattr(
-            "llmperf.ray_clients.vertexai_client.requests.post",
+            "llmperf.clients.vertexai.requests.post",
             lambda *args, **kwargs: SimpleNamespace(
                 status_code=200,
                 raise_for_status=lambda: None,
@@ -386,7 +386,7 @@ def test_actor_without_tokenizer(monkeypatch, adapter):
             RequestConfig(model="test", prompt=("prompt", 1))
         )
     else:
-        from llmperf.ray_clients.sagemaker_client import SageMakerClient
+        from llmperf.clients.sagemaker import SageMakerClient
 
         for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION_NAME"):
             monkeypatch.setenv(name, "test")
@@ -397,7 +397,7 @@ def test_actor_without_tokenizer(monkeypatch, adapter):
             }
         )
         monkeypatch.setattr(
-            "llmperf.ray_clients.sagemaker_client.Session",
+            "llmperf.clients.sagemaker.Session",
             lambda **credentials: SimpleNamespace(
                 client=lambda *args, **kwargs: runtime
             ),
@@ -411,7 +411,7 @@ def test_actor_without_tokenizer(monkeypatch, adapter):
 
 
 def test_litellm_usage_chunk(monkeypatch):
-    from llmperf.ray_clients.litellm_client import LiteLLMClient
+    from llmperf.clients.litellm import LiteLLMClient
 
     chunks = [
         SimpleNamespace(
@@ -598,7 +598,7 @@ def test_thread_error_propagation(monkeypatch):
 
 @pytest.mark.parametrize("concurrency,per_actor", [(4, 1), (64, 8), (9, 4)])
 def test_shared_actor_requests(monkeypatch, concurrency, per_actor):
-    from llmperf.common import RAY_ACTOR_CONCURRENCY_ENV
+    from llmperf.clients.factory import RAY_ACTOR_CONCURRENCY_ENV
 
     actor_count = (concurrency + per_actor - 1) // per_actor
     active = [0] * actor_count
@@ -834,10 +834,10 @@ def test_client_observability(monkeypatch, stream_options, api_key):
     else:
         monkeypatch.setenv("OPENAI_API_KEY", api_key)
     monkeypatch.setattr(
-        "llmperf.ray_clients.openai_chat_completions_client.requests.post",
+        "llmperf.clients.openai.requests.post",
         post,
     )
-    from llmperf.ray_clients.openai_chat_completions_client import (
+    from llmperf.clients.openai import (
         OpenAIChatCompletionsClient,
     )
 
@@ -907,10 +907,10 @@ def test_client_inactivity(monkeypatch):
     monkeypatch.setenv("OPENAI_API_BASE", "https://provider.invalid/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setattr(
-        "llmperf.ray_clients.openai_chat_completions_client.requests.post",
+        "llmperf.clients.openai.requests.post",
         lambda *args, **kwargs: FakeResponse(),
     )
-    from llmperf.ray_clients.openai_chat_completions_client import (
+    from llmperf.clients.openai import (
         OpenAIChatCompletionsClient,
     )
 
@@ -957,10 +957,10 @@ def test_client_progress(monkeypatch):
     monkeypatch.setenv("OPENAI_API_BASE", "https://provider.invalid/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setattr(
-        "llmperf.ray_clients.openai_chat_completions_client.requests.post",
+        "llmperf.clients.openai.requests.post",
         lambda *args, **kwargs: FakeResponse(),
     )
-    from llmperf.ray_clients.openai_chat_completions_client import (
+    from llmperf.clients.openai import (
         OpenAIChatCompletionsClient,
     )
 
@@ -1137,7 +1137,7 @@ def test_task_payload_replay(monkeypatch):
 
 
 def test_grouped_request_failure(monkeypatch):
-    from llmperf.common import RAY_ACTOR_CONCURRENCY_ENV
+    from llmperf.clients.factory import RAY_ACTOR_CONCURRENCY_ENV
 
     launched = []
     prepared_seeds = []

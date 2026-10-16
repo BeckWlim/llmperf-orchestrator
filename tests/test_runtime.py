@@ -6,17 +6,16 @@ from typing import Dict
 
 import pytest
 
-from llmperf.models import RequestConfig
-from llmperf.ray_llm_client import LLMResponse
-from llmperf_backend.request_pool import RequestRouter
-from llmperf_backend.runtime import (
+from llmperf.clients.models import RequestConfig
+from llmperf.clients.base import LLMResponse
+from llmperf_backend.runtime.request_pool import RequestRouter
+from llmperf_backend.runtime.coordinator import (
     NodeSnapshot,
     ready_nodes,
-    RuntimeBus,
-    RuntimeEvent,
-    EventKind,
+    ReconcileNotifier,
+    ReconcileHint,
 )
-from llmperf_backend.task_compiler import TaskRecipe, TaskCompiler
+from llmperf_backend.compiler.tasks import TaskRecipe, TaskCompiler
 
 
 def test_dependency_delay():
@@ -35,11 +34,11 @@ def test_dependency_delay():
 
 def test_bus_bound():
     async def exercise():
-        bus = RuntimeBus(1)
-        first = RuntimeEvent(EventKind.COMMITTED, "first")
+        bus = ReconcileNotifier(1)
+        first = ReconcileHint("first")
         bus.publish(first)
         bus.publish(first)
-        bus.publish(RuntimeEvent(EventKind.COMMITTED, "second"))
+        bus.publish(ReconcileHint("second"))
         assert bus.queue.qsize() == 1
         assert await bus.receive(1) == first
         assert not bus.pending
@@ -92,32 +91,58 @@ def test_shared_capacity():
     asyncio.run(exercise())
 
 
-def test_conversation_order():
-    invoke = lambda name: {
-        "invoke": {"name": name, "payload": "p", "conversation": "chat"}
+def test_message_dependencies():
+    base = {"name": "merge", "payloads": {"p": {"seed": "p"}}}
+    definition = {
+        **base,
+        "workflow": [
+            {
+                "parallel": {
+                    "name": "sources",
+                    "branches": [
+                        {"invoke": {"name": "left", "payload": "p"}},
+                        {"invoke": {"name": "right", "payload": "p"}},
+                    ],
+                }
+            },
+            {
+                "invoke": {
+                    "name": "merge",
+                    "payload": "p",
+                    "depends_on": [
+                        {"step": "sources.right", "reuse_messages": True},
+                        {"step": "sources.left", "reuse_messages": True},
+                    ],
+                }
+            },
+        ],
     }
-    base = {"name": "turns", "payloads": {"p": {"seed_namespace": "p"}}}
-    TaskRecipe.model_validate({**base, "workflow": [invoke("first"), invoke("second")]})
-    with pytest.raises(ValueError, match="ordered by dependencies"):
+    TaskRecipe.model_validate(definition)
+    assert TaskCompiler.estimate_token_budget(definition, 10, 2) == 60
+    with pytest.raises(ValueError, match="earlier node"):
         TaskRecipe.model_validate(
             {
                 **base,
                 "workflow": [
                     {
-                        "parallel": {
-                            "name": "fork",
-                            "branches": [invoke("first"), invoke("second")],
+                        "invoke": {
+                            "name": "bad",
+                            "payload": "p",
+                            "depends_on": ["missing"],
                         }
                     }
                 ],
             }
         )
-    assert (
-        TaskCompiler.estimate_token_budget(
-            {**base, "workflow": [invoke("first"), invoke("second")]}, 10, 2
+    with pytest.raises(ValueError, match="Extra inputs"):
+        TaskRecipe.model_validate(
+            {
+                **base,
+                "workflow": [
+                    {"invoke": {"name": "old", "payload": "p", "conversation": "chat"}}
+                ],
+            }
         )
-        == 36
-    )
 
 
 def test_cancelled_capacity():
@@ -156,9 +181,9 @@ def test_cancelled_capacity():
 
 
 def test_history_identity(monkeypatch):
-    from llmperf import common_metrics
-    from llmperf import token_benchmark_ray as benchmark
-    from llmperf.prompt_datasets import PromptDatasetSource
+    from llmperf.metrics import constants as common_metrics
+    from llmperf.benchmark import throughput as benchmark
+    from llmperf.datasets.prompts import PromptDatasetSource
 
     class Tokenizer:
         def encode(self, text, add_special_tokens=False):
@@ -187,8 +212,8 @@ def test_history_identity(monkeypatch):
             stddev_output_tokens=0,
             max_num_completed_requests=1,
             prompt_dataset_source=PromptDatasetSource.builtin_sonnet(),
-            task_context={"payload_seed": 1, "conversation": "chat"},
-            conversation_messages=history,
+            task_context={"payload_seed": 1, "message_sources": ["previous"]},
+            input_messages=history,
             request_executor=lambda request: (
                 {
                     common_metrics.ERROR_CODE: None,

@@ -3,15 +3,15 @@ from unittest.mock import Mock
 
 import pytest
 
-from llmperf_backend.artifacts import (
+from llmperf_backend.artifacts.resolver import (
     ArtifactCaches,
     ArtifactValidationError,
     DatasetResolution,
     validate_dataset_artifact,
     validate_tokenizer_artifact,
 )
-from llmperf_backend.outbound import OutboundPolicy
-from llmperf_backend.artifacts import TokenizerResolution
+from llmperf_backend.artifacts.outbound import OutboundPolicy
+from llmperf_backend.artifacts.resolver import TokenizerResolution
 
 
 REVISION = "a" * 40
@@ -31,7 +31,7 @@ def test_shared_policy(tmp_path, monkeypatch):
     )
     configure = Mock(return_value=policy)
     monkeypatch.setattr(
-        "llmperf_backend.artifacts.configure_outbound_transport", configure
+        "llmperf_backend.artifacts.resolver.configure_outbound_transport", configure
     )
     monkeypatch.setenv("LLMPERF_DATASET_CACHE", str(tmp_path / "datasets"))
     monkeypatch.setenv("LLMPERF_TOKENIZER_CACHE", str(tmp_path / "tokenizers"))

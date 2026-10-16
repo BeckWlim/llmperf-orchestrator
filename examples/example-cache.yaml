@@ -1,0 +1,71 @@
+version: 1.0.0
+campaign:
+  name: example-cache-replay
+  description: Compare replay after zero or two warmups and a short quiet interval.
+  tags:
+    experiment: cache-replay
+wait: true
+task_definitions:
+- name: repeated-hit-surface
+  instances:
+    matrix:
+      warmup_count:
+      - 0
+      - 2
+      quiet_seconds:
+      - 1
+      - 2
+    trials: 1
+    seed: 33333
+  payloads:
+    replay:
+      seed: replay
+    cold:
+      seed: cold-control
+  workflow:
+  - invoke:
+      name: prime
+      payload: replay
+  - repeat:
+      name: warmups
+      count: $warmup_count
+      every: 0
+      node:
+        invoke:
+          name: warmup
+          payload: replay
+  - parallel:
+      name: observation
+      after:
+        value: $quiet_seconds
+        unit: s
+      branches:
+      - invoke:
+          name: probe
+          payload: replay
+      - invoke:
+          name: cold
+          role: cold_control
+          payload: cold
+  runner:
+    label: repeated-hit-surface
+    metadata:
+      purpose: cache-replay
+    provider: aliyun
+    model: deepseek-v4-pro
+    tokenizer:
+      id: deepseek-ai/DeepSeek-V3
+      revision: main
+      use_fast: true
+    timeout: 60
+    concurrent_requests: 1
+    mean_output_tokens: 8
+    stddev_output_tokens: 0
+    additional_sampling_params:
+      temperature: 0
+      stream_options:
+        include_usage: true
+    inputs:
+      default:
+        tokens: 2048
+    request: {}

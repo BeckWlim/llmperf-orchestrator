@@ -45,12 +45,12 @@ dev = [
 
 [project.scripts]
 llmperf-backend = "llmperf_backend.__main__:main"
-llmperfctl = "llmperf_cli.__main__:main"
-llmperf-cache-links = "llmperf_tools.huggingface_cache_links:main"
+llmperfctl = "llmperf_cli.commands.main:main"
+llmperf-cache-links = "llmperf_tools.huggingface.cache_links:main"
 
 [tool.setuptools.package-data]
-llmperf = ["sonnet.txt"]
-llmperf_backend = ["configs/*.yaml"]
+"llmperf.datasets" = ["sonnet.txt"]
+"llmperf_backend.configuration" = ["configs/*.yaml"]
 
 [tool.basedpyright]
 include = ["src", "tests"]

@@ -32,41 +32,40 @@ just templates. `metadata.runner_round` is reserved for Backend expansion.
 Optional `LLMPERF_PREPARATION_WORKERS` enables bounded chunk generation for ordinary
 bundled-sonnet and external `concatenate` workloads. Tokenization calibrates corpus estimates once per Runner before
 timed sending; chunk generation during sending does not tokenize. Local input counts are
-estimates and server usage remains authoritative. See `docs/RUNTIME.md` for CPU budgeting.
+estimates and server usage remains authoritative. See `docs/runtime.md` for CPU budgeting.
 
-## Runner benchmark
+## Runner and Worker template
 
 Provider profiles own endpoints and credentials. Workload YAML contains only `provider`
 and exact `model` IDs.
 
 ```yaml
-benchmark:
-  provider: aliyun
-  model: deepseek-v4-pro
-  tokenizer:
-    id: deepseek-ai/DeepSeek-V3
-    revision: main
-    use_fast: true
-  timeout_seconds: 60
-  concurrent_requests: 1
-  max_completed_requests: 20
-  mean_input_tokens: 2048
-  stddev_input_tokens: 0
-  shared_prefix_tokens: 0
-  dataset:
-    source: huggingface
-    id: organization/sharegpt
-    filename: sharegpt.json
-    revision: 0123456789abcdef0123456789abcdef01234567
-    adapter: sharegpt-user
-  dataset_prompt_mode: concatenate
-  dataset_repeat_count: 1
-  dataset_seed: 11111
-  mean_output_tokens: 8
-  stddev_output_tokens: 0
-  output_token_count: provider
-  additional_sampling_params:
-    temperature: 0
+timeout: 60
+concurrent_requests: 1
+provider: aliyun
+model: deepseek-v4-pro
+tokenizer:
+  id: deepseek-ai/DeepSeek-V3
+  revision: main
+  use_fast: true
+mean_output_tokens: 8
+stddev_output_tokens: 0
+output_token_count: provider
+additional_sampling_params:
+  temperature: 0
+inputs:
+  default:
+    tokens: 2048
+    dataset:
+      source: huggingface
+      id: organization/sharegpt
+      filename: sharegpt.json
+      revision: 0123456789abcdef0123456789abcdef01234567
+      adapter: sharegpt-user
+    dataset_prompt_mode: concatenate
+    dataset_seed: 11111
+request:
+  repeat: 20
 ```
 
 `dataset.adapter` is required and independent from artifact `source`. Use
@@ -80,7 +79,7 @@ External adapters normalize through Hugging Face Datasets into a persistent Arro
 index, then pass through the same seeded construction and evidence pipeline. LLMPerf
 incrementally materializes ShareGPT JSON arrays and JSONL because the upstream builder
 fully reads array inputs; Parquet, Arrow, and text use their standard builders. Omit
-`dataset` to select the bundled `src/llmperf/sonnet.txt` adapter. In `sample` mode, intact
+`dataset` to select the bundled `src/llmperf/datasets/sonnet.txt` adapter. In `sample` mode, intact
 records must already fit the requested token range.
 `concatenate` deterministically shuffles first turns, consumes each record once before
 cycling, joins diverse records, and truncates only the final segment to the requested token
@@ -113,11 +112,32 @@ resolved tokenizer provenance and `task_context` are Backend-owned fields.
 
 ## Task definition grammar
 
+Durations use `after`, `every`, `timeout`, or cache-probe `delay`: a number means seconds,
+and `{value: 500, unit: ms}` specifies units explicitly (`ms`, `s`, `m`, `h`, `d`).
+Payloads use `seed`. Old suffixed duration keys, `seed_namespace`, and flat `kind`/`sequence`
+authoring are rejected.
+
+Runner owns Provider/model/tokenizer, generation settings, and named `inputs`. Each input
+contains text or dataset settings and a new-input token target (`tokens: 128` or
+`tokens: {mean: 128, stddev: 16}`). Reused history is additional context, not part of that
+target. `request` owns only execution logic and message composition: `input`, `repeat`,
+`steps`, dependencies, and timing. Steps select a Runner input by name. Omitted input
+references select `default`. Omitting `repeat` and `steps` creates one Worker.
+`repeat` copies the complete step graph; it is planned work, not retries.
+`timeout` and optional `concurrent_requests` also belong to Runner.
+The old `benchmark`, `max_submissions`, `request_steps`, and `history_from` authoring
+fields are rejected. Internal resolved execution records still use `benchmark`.
+
+The canonical authoring reference is `docs/tasks.md`; runnable feature coverage is indexed
+in `docs/examples.md`. Use `instances.trials` with one `run` for independent batches; use
+`repeat` only for serial batches. A failed node terminates its whole TaskInstance and cancels
+queued siblings, so independent failure boundaries require separate instances.
+
 Use `run: {name: batch}` for a whole multi-request Runner. It inherits the definition's
-`runner` settings, including `max_completed_requests` and `concurrent_requests`. Put it
+`runner.request` template and Runner execution settings. Put it
 inside `repeat` for serial batches and use independent `instances.matrix` families for
 independent progression. Batch-only definitions omit `payloads`; `invoke` still requires
-an explicit payload and always sends one request. `run` supports `role` and `after_seconds`,
+an explicit payload and always sends one request. `run` supports `role` and `after`,
 but not conversation or payload fields. Both node kinds advance on committed success.
 
 Batch dataset seeds use `batch-v1`: task seed, sorted matrix coordinates, trial index,
@@ -127,15 +147,21 @@ integers. Legacy invoke payload seeds remain unchanged. See
 compile to 800 nodes and 204,800 target requests, with peak concurrency 64 when each batch
 allows eight requests. Counts inside a Runner must be included in safety estimates.
 
-`benchmark.concurrent_requests` bounds requests within an ordinary Runner. Backend
+`runner.concurrent_requests`, when specified, bounds outstanding Workers within a Runner.
+Omitting it leaves admission to Scheduler without a Runner window. Backend
 `scheduler.ray_actor_max_concurrency` bounds each shared actor (default eight). Eight actors
 provide 64 slots; `LLMPERF_RUNNERS_MAX=64` allows 64 atomic Runners to fill them. Dependencies
 and delays reserve no slots. Static preview groups are singletons.
 
-For multi-turn tests add `conversation: chat` to ordered invokes. History is scoped to one
-instance and commits with each result before the next turn. Parallel conversations need
-different names. Payloads may contain literal `text` in addition to `seed_namespace`.
-See `examples/example-multiturn.yaml` and `docs/RUNTIME.md`.
+For multi-turn or merged inputs, use `depends_on` on request steps or atomic invokes:
+`[{step: first, reuse_messages: true}, {step: second, reuse_messages: true}]`.
+The Runner waits for every dependency to succeed, concatenates marked source message lists
+in that order, and appends the current input. Duplicates and structured content are retained.
+`depends_on: [first]` waits without message reuse. Failed or cancelled predecessors cause
+Runner-owned cancellation of unsubmitted descendants; independent branches can continue.
+No named conversation object is needed. Outer `run` dependencies only wait; define message
+reuse within its `request.steps`. Payloads may contain literal `text` in addition to `seed`.
+See `examples/example-multiturn.yaml`, `examples/example-message-merge.yaml`, and `docs/runtime.md`.
 
 ```yaml
 task_definitions:
@@ -147,8 +173,8 @@ task_definitions:
       trials: 8
       seed: 20260818
     payloads:
-      replay: {seed_namespace: replay}
-      cold: {seed_namespace: cold-control}
+      replay: {seed: replay}
+      cold: {seed: cold-control}
     workflow:
       - invoke:
           name: prime
@@ -156,14 +182,14 @@ task_definitions:
       - repeat:
           name: warmups
           count: $warmup_count
-          every_seconds: 0
+          every: 0
           node:
             invoke:
               name: warmup
               payload: replay
       - parallel:
           name: observation
-          after_seconds: $quiet_seconds
+          after: $quiet_seconds
           branches:
             - invoke:
                 name: probe
@@ -190,7 +216,7 @@ The compiler and performance guard account for expanded nodes, not YAML line cou
 
 ```text
 instances = product(matrix dimension sizes) × trials
-requests  = sum(expanded invoke nodes across instances)
+requests  = sum(batch request targets) + number of expanded invoke nodes
 ```
 
 ### Workflow and atomic invoke
@@ -202,13 +228,13 @@ mapping, so the YAML hierarchy mirrors the compiler node hierarchy.
 - invoke:
     name: warm
     payload: replay
-    after_seconds: $delay_seconds
+    after: $delay_seconds
 ```
 
 - `name` contributes to the stable logical node path within an instance.
 - `role` is optional and defaults to `name`; it is analysis metadata only.
 - `payload` references a declared logical payload.
-- `after_seconds` starts after every dependency completes.
+- `after` starts after every dependency completes.
 
 ### Repeat
 
@@ -216,7 +242,7 @@ mapping, so the YAML hierarchy mirrors the compiler node hierarchy.
 - repeat:
     name: observations
     count: $observation_count
-    every_seconds: $interval_seconds
+    every: $interval_seconds
     node:
       invoke:
         name: warm
@@ -232,7 +258,7 @@ an unbounded runtime loop.
 ```yaml
 - parallel:
     name: observation
-    after_seconds: 300
+    after: 300
     branches:
       - invoke:
           name: probe
@@ -267,7 +293,7 @@ complete; they are not part of task authoring or graph semantics.
 Generated payload content is pseudo-random but reproducible. Its seed is derived from:
 
 ```text
-global task seed + sorted matrix coordinates + trial index + payload seed_namespace
+global task seed + sorted matrix coordinates + trial index + payload seed
 ```
 
 Use cases include bundled-sonnet prompt families, deterministic sampling or concatenation

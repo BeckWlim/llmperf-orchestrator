@@ -1,6 +1,11 @@
 import logging
 
-from llmperf.logging import ColorFormatter, LoggerNameFilter, RESET, route_library_logs
+from llmperf.configuration.logging import (
+    ColorFormatter,
+    LoggerNameFilter,
+    RESET,
+    route_library_logs,
+)
 
 
 def test_server_alias():

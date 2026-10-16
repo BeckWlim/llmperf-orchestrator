@@ -8,16 +8,16 @@ import pytest
 import ray
 from pydantic import ValidationError
 
-from llmperf.preparation import (
+from llmperf.datasets.preparation import (
     PreparedPrompt,
     PreparedStream,
     PromptPlan,
     calibrate,
     render_chunk,
 )
-from llmperf_backend.models import BenchmarkCampaignStart, SchedulerConfig
-from llmperf_backend.rounds import expand_rounds, ready_round_runners
-from llmperf.prompt_datasets import PromptDatasetSource
+from llmperf_backend.configuration.models import BenchmarkCampaignStart, SchedulerConfig
+from llmperf_backend.compiler.rounds import expand_rounds, ready_round_runners
+from llmperf.datasets.prompts import PromptDatasetSource
 
 
 class Tokenizer:
@@ -84,8 +84,8 @@ def test_sharegpt_chunks(tmp_path, monkeypatch):
 
 
 def test_bounded_calibration(tmp_path, monkeypatch):
-    from llmperf import preparation
-    from llmperf.prompt_datasets import PromptDataset
+    from llmperf.datasets import preparation
+    from llmperf.datasets.prompts import PromptDataset
 
     class Records:
         reads = 0
@@ -195,7 +195,7 @@ def test_round_validation():
     document = {
         "version": "1.0.0",
         "campaign": {"name": "rounds", "rounds": {"count": 100, "seed": 20261014}},
-        "runners": [{"benchmark": {"provider": "test", "model": "test"}}] * 8,
+        "runners": [{"request": {}, "provider": "test", "model": "test"}] * 8,
     }
     model = BenchmarkCampaignStart.model_validate(document)
     assert model.campaign.rounds is not None

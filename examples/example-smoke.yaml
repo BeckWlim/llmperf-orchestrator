@@ -1,20 +1,16 @@
-# Minimal end-to-end request for the configured Aliyun Provider.
-version: "1.0.0"
-
+version: 1.0.0
 label: example-smoke
-
 metadata:
   purpose: verify-provider-and-persistence
-
-benchmark:
-  provider: aliyun
-  model: deepseek-v4-pro
-  timeout_seconds: 30
-  max_completed_requests: 1
-  concurrent_requests: 1
-  mean_input_tokens: 64
-  stddev_input_tokens: 0
-  mean_output_tokens: 16
-  stddev_output_tokens: 0
-  additional_sampling_params:
-    temperature: 0
+provider: aliyun
+model: deepseek-v4-pro
+timeout: 30
+concurrent_requests: 1
+mean_output_tokens: 16
+stddev_output_tokens: 0
+additional_sampling_params:
+  temperature: 0
+inputs:
+  default:
+    tokens: 64
+request: {}

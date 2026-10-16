@@ -5,15 +5,14 @@ import stat
 
 import pytest
 
-from llmperf.user_config import (
+from llmperf.configuration.environment import (
     UserConfigError,
     backend_environment_path,
     read_environment_file,
 )
 from llmperf_backend.__main__ import build_parser, execute_config
-from llmperf_backend.config import (
+from llmperf_backend.configuration.loader import (
     load_environment,
-    load_provider_environment,
     resolve_environment_path,
 )
 
@@ -27,10 +26,13 @@ def test_config_crud(tmp_path, monkeypatch):
     path = backend_environment_path()
 
     configured = execute_config(_arguments("set", "LLMPERF_SERVER_HOST", "0.0.0.0"))
+    path.with_name("providers.yaml").write_text(
+        'version: "1.0.0"\nproviders: {aliyun: {models: [model], api_key_env: ALIYUN_API_KEY}}'
+    )
     provider_configured = execute_config(
         _arguments(
             "set",
-            "LLMPERF_PROVIDER_ALIYUN_KEY",
+            "ALIYUN_API_KEY",
             "secret with 'quote' and ${literal}",
         )
     )
@@ -42,15 +44,12 @@ def test_config_crud(tmp_path, monkeypatch):
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert read_environment_file(path) == {
-        "LLMPERF_PROVIDER_ALIYUN_KEY": "secret with 'quote' and ${literal}",
+        "ALIYUN_API_KEY": "secret with 'quote' and ${literal}",
         "LLMPERF_SERVER_HOST": "0.0.0.0",
     }
-    assert (
-        execute_config(_arguments("get", "LLMPERF_PROVIDER_ALIYUN_KEY"))["value"]
-        == "<redacted>"
-    )
+    assert execute_config(_arguments("get", "ALIYUN_API_KEY"))["value"] == "<redacted>"
     assert execute_config(_arguments("list"))["items"] == {
-        "LLMPERF_PROVIDER_ALIYUN_KEY": "<redacted>",
+        "ALIYUN_API_KEY": "<redacted>",
         "LLMPERF_SERVER_HOST": "0.0.0.0",
     }
     assert execute_config(_arguments("unset", "LLMPERF_SERVER_HOST"))["removed"] is True
@@ -68,6 +67,14 @@ def test_provider_file_setting(tmp_path, monkeypatch):
     assert removed["provider_reload_required"] is True
 
 
+def test_unreferenced_provider_setting(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    configured = execute_config(
+        _arguments("set", "LLMPERF_PROVIDER_OLD_URL", "http://localhost:8001/v1")
+    )
+    assert configured["provider_reload_required"] is False
+
+
 def test_proxy_redaction(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     proxy_url = "http://proxy-user:proxy-password@proxy.internal:3128"
@@ -81,29 +88,6 @@ def test_proxy_redaction(tmp_path, monkeypatch):
     assert listed["items"] == {"LLMPERF_PROXY": "<redacted>"}
     assert read_environment_file(backend_environment_path()) == {
         "LLMPERF_PROXY": proxy_url
-    }
-
-
-def test_provider_scope(tmp_path):
-    path = tmp_path / "backend.env"
-    path.write_text(
-        "LLMPERF_PROVIDER_ZHIPU_URL=https://file.example/v1\n"
-        "DATABASE_URL=postgresql+asyncpg:///must-not-reload\n",
-        encoding="utf-8",
-    )
-
-    environment = load_provider_environment(
-        path,
-        process_environment={
-            "LLMPERF_PROVIDER_ZHIPU_URL": "https://process.example/v1",
-            "LLMPERF_PROVIDER_ZHIPU_KEY": "process-secret",
-            "LLMPERF_SERVER_PORT": "9000",
-        },
-    )
-
-    assert environment == {
-        "LLMPERF_PROVIDER_ZHIPU_URL": "https://process.example/v1",
-        "LLMPERF_PROVIDER_ZHIPU_KEY": "process-secret",
     }
 
 
@@ -124,11 +108,11 @@ def test_secret_stdin(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr("sys.stdin", io.StringIO("stdin-secret\n"))
 
-    result = execute_config(_arguments("set", "LLMPERF_PROVIDER_ALIYUN_KEY", "--stdin"))
+    result = execute_config(_arguments("set", "ALIYUN_API_KEY", "--stdin"))
 
     assert result["value"] == "<redacted>"
     assert read_environment_file(backend_environment_path()) == {
-        "LLMPERF_PROVIDER_ALIYUN_KEY": "stdin-secret"
+        "ALIYUN_API_KEY": "stdin-secret"
     }
 
 

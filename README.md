@@ -32,7 +32,7 @@ flowchart LR
     subgraph Backend["Backend"]
         API["API + task compiler"]
         Planner["Planner"]
-        Runtime["Runtime coordinator + event bus"]
+        Runtime["Runtime coordinator + reconciliation notifier"]
         Scheduler["Scheduler"]
     end
     API --> DB[("PostgreSQL")]
@@ -71,7 +71,7 @@ psql -v ON_ERROR_STOP=1 -d llmperf -f sql/postgresql/init.sql
 
 ```bash
 llmperf-backend config set DATABASE_URL postgresql+asyncpg:///llmperf
-cp src/llmperf_backend/configs/providers.example.yaml ~/.config/llmperf/providers.yaml
+cp src/llmperf_backend/configuration/configs/providers.example.yaml ~/.config/llmperf/providers.yaml
 ```
 
 The copied file includes the Aliyun endpoint. Enter your API key without saving it in
@@ -80,7 +80,7 @@ shell history (Bash):
 ```bash
 read -rsp 'Aliyun API key: ' ALIYUN_API_KEY; echo
 printf '%s' "$ALIYUN_API_KEY" | \
-  llmperf-backend config set LLMPERF_PROVIDER_ALIYUN_KEY --stdin
+  llmperf-backend config set ALIYUN_API_KEY --stdin
 unset ALIYUN_API_KEY
 llmperf-backend config set LLMPERF_DEFAULT_PROVIDER aliyun
 llmperf-backend
@@ -96,7 +96,7 @@ llmperfctl provider list
 llmperfctl provider models aliyun
 ```
 
-For another Provider or Backend address, see the [configuration guide](docs/USAGE.md).
+For another Provider or Backend address, see the [configuration guide](docs/usage.md).
 
 ### Run and inspect
 
@@ -130,21 +130,15 @@ to prepare an HTML report.
 
 ## Examples and documentation
 
-- [Detailed usage and configuration](docs/USAGE.md)
-- [Smoke test](examples/example-smoke.yaml) · [64-request load](examples/example-load64.yaml)
-  · [Scheduled rounds](examples/example-runner-plan.yaml)
-  · [Parallel Runner rounds](examples/example-rounds.yaml)
-- [Cache retention](examples/example-cache-retention.yaml)
-  · [Cache promotion](examples/example-cache-promotion.yaml)
-  · [Long-context dataset](examples/example-sharegpt-long.yaml)
-- [Architecture and concurrency](docs/ARCHITECTURE.md)
-  · [Runtime and multi-turn usage](docs/RUNTIME.md)
-  · [Task compiler](docs/TASK_COMPILER_ARCHITECTURE.md)
-- [Configuration reference](.env.template) · [Provider file example](src/llmperf_backend/configs/providers.example.yaml)
-- [systemd deployment](deploy/systemd/README.md) · [Testing](docs/TESTING.md)
+- [Documentation index](docs/README.md) · [Setup and operations](docs/usage.md)
+- [Core workload examples](docs/examples.md) · [Task compiler and YAML rules](docs/tasks.md)
+- [Architecture and source layout](docs/architecture.md) · [Runtime and storage](docs/runtime.md)
+- [systemd deployment](deploy/systemd/README.md) · [Testing](docs/testing.md)
 
 Existing installations: the Backend checks required tables and columns. For older
-database layouts, follow the [cutover guidance](docs/RUNTIME.md#recovery-and-cutover).
+database layouts, follow the [cutover guidance](docs/runtime.md#recovery-and-cutover).
+Provider definitions now require a Provider file; migrate former `backend.env` profile
+fields using the [migration table](docs/usage.md#migrating-environment-defined-providers).
 
 ## Development
 
@@ -153,6 +147,12 @@ python -m pip install -e '.[dev]'
 python -m basedpyright
 pytest -q
 ```
+
+Runner owns Provider/model/tokenizer, generation settings, and named `inputs`.
+`request` defines Worker execution logic: repetition, steps, dependencies, timing, and
+message composition. Runner handles failure cancellation; Scheduler owns request slots.
+See the [definition rules](docs/tasks.md#runner-data-and-request-logic) and
+[message merge example](examples/example-message-merge.yaml).
 
 ## Credits and license
 

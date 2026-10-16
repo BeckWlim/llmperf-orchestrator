@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 import pytest
 from urllib.error import HTTPError
 
-from llmperf_cli.__main__ import (
+from llmperf_cli.commands.main import (
     ArtifactDownloadRenderer,
     _has_unsuccessful_runner,
     _validate_campaign_list,
@@ -35,9 +35,9 @@ from llmperf_cli.__main__ import (
     wait_for_campaign,
     wait_for_runners,
 )
-from llmperf_cli.auth import discover_private_key_providers
-from llmperf_cli.client import ClientError, LLMPerfClient
-from llmperf_cli.projections import adapt_cli_response, registered_routes
+from llmperf_cli.transport.auth import discover_private_key_providers
+from llmperf_cli.transport.client import ClientError, LLMPerfClient
+from llmperf_cli.presentation.projections import adapt_cli_response, registered_routes
 
 
 class StubClient(LLMPerfClient):
@@ -285,7 +285,7 @@ task_definitions:
     instances:
       trials: 1
     payloads:
-      replay: {seed_namespace: replay}
+      replay: {seed: replay}
     workflow:
       - invoke: {name: prime, payload: replay}
     runner: {}
@@ -419,7 +419,7 @@ task_definitions:
       trials: 1
     payloads:
       prompt:
-        seed_namespace: prompt
+        seed: prompt
     workflow:
       - invoke:
           name: prime
@@ -466,7 +466,7 @@ runner_plans:
     max_occurrences: 8
     recurrence:
       kind: interval
-      every_seconds: 30
+      every: 30
     runner:
       benchmark:
         model: glm-test
@@ -487,7 +487,7 @@ runner_plans:
 
     assert result["runners"] == []
     assert result["runner_plans"][0]["runner_plan_id"] == "plan-1"
-    assert client.plan_payloads[0]["recurrence"]["every_seconds"] == 30
+    assert client.plan_payloads[0]["recurrence"]["every"] == 30
 
 
 def test_sweep_campaign(tmp_path):
@@ -502,10 +502,10 @@ task_definitions:
     instances:
       matrix: {delay: [0, 60, 300]}
       trials: 2
-    payloads: {replay: {seed_namespace: replay}}
-    sequence:
-      - {kind: invoke, id: prime, role: prime, payload: replay}
-      - {kind: invoke, id: warm, role: warm, payload: replay, after_seconds: {dimension: delay}}
+    payloads: {replay: {seed: replay}}
+    workflow:
+      - {invoke: {name: prime, role: prime, payload: replay}}
+      - {invoke: {name: warm, role: warm, payload: replay, after: $delay}}
     runner:
       benchmark: {model: glm-test}
 """,
@@ -539,14 +539,14 @@ task_definitions:
   - name: residency
     instances:
       matrix: {observations: [24]}
-    payloads: {replay: {seed_namespace: replay}}
-    sequence:
-      - {kind: invoke, id: prime, role: prime, payload: replay}
-      - kind: repeat
-        id: observations
-        count: {dimension: observations}
-        interval_seconds: 3600
-        invoke: {kind: invoke, id: warm, role: warm, payload: replay}
+    payloads: {replay: {seed: replay}}
+    workflow:
+      - {invoke: {name: prime, role: prime, payload: replay}}
+      - repeat:
+          name: observations
+          count: $observations
+          every: {value: 1, unit: h}
+          node: {invoke: {name: warm, role: warm, payload: replay}}
     runner:
       benchmark: {model: glm-test}
 """,
@@ -563,7 +563,7 @@ task_definitions:
     result = start_campaign(FakeClient(), arguments)
 
     definition = result["task_definitions"][0]
-    assert definition["sequence"][1]["kind"] == "repeat"
+    assert "repeat" in definition["workflow"][1]
     assert definition["instances"]["matrix"]["observations"] == [24]
 
 
@@ -581,14 +581,14 @@ task_definitions:
         warmup_count: [0, 1, 2, 4]
         quiet_seconds: [0, 120, 600, 3600, 21600]
       trials: 5
-    payloads: {replay: {seed_namespace: replay}}
-    sequence:
-      - {kind: invoke, id: prime, role: prime, payload: replay}
-      - kind: repeat
-        id: warmups
-        count: {dimension: warmup_count}
-        invoke: {kind: invoke, id: warmup, role: warmup, payload: replay}
-      - {kind: invoke, id: probe, role: probe, payload: replay, after_seconds: {dimension: quiet_seconds}}
+    payloads: {replay: {seed: replay}}
+    workflow:
+      - {invoke: {name: prime, role: prime, payload: replay}}
+      - repeat:
+          name: warmups
+          count: $warmup_count
+          node: {invoke: {name: warmup, role: warmup, payload: replay}}
+      - {invoke: {name: probe, role: probe, payload: replay, after: $quiet_seconds}}
     runner:
       benchmark: {model: glm-test}
 """,
@@ -696,7 +696,7 @@ def test_key_fallback(monkeypatch):
             )
         return _FakeResponse({"items": []})
 
-    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
     client = LLMPerfClient(
         "http://127.0.0.1:8000",
         token_providers=[lambda: "first-token", lambda: "second-token"],
@@ -724,7 +724,7 @@ def test_forbidden_key(monkeypatch):
             BytesIO(b'{"detail":"superuser access required"}'),
         )
 
-    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
     client = LLMPerfClient(
         "http://127.0.0.1:8000",
         token_providers=[lambda: "first-token", lambda: "second-token"],
@@ -748,9 +748,9 @@ def test_auth_defaults(monkeypatch):
 def test_main_help():
     output = build_parser().format_help()
 
-    assert "Runner     One durable benchmark execution" in output
+    assert "Runner     One complete execution" in output
     assert "Planner    The backend component" in output
-    assert "Scheduler  The backend component" in output
+    assert "Scheduler  Admits ready Workers" in output
     assert "llmperfctl provider models <provider-id>" in output
     assert "llmperfctl runner start -f runner.yaml" in output
 
@@ -759,7 +759,7 @@ def test_main_help():
     ("arguments", "expected"),
     [
         (["provider", "--help"], "LLMPERF_DEFAULT_PROVIDER"),
-        (["runner", "--help"], "A Runner is one durable benchmark execution"),
+        (["runner", "--help"], "A Runner owns a complete execution"),
         (["campaign", "--help"], "See examples/example-campaign.yaml"),
         (["runner", "start", "--help"], "Validate Runner YAML"),
     ],
@@ -1184,7 +1184,7 @@ def test_full_list_request(monkeypatch):
         requested_urls.append(request.full_url)
         return _FakeResponse({"items": []})
 
-    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
     client = LLMPerfClient("http://127.0.0.1:8000")
 
     client.list_runners(status="failed", limit=5, offset=10, full=True)
@@ -1210,7 +1210,7 @@ def test_log_request(monkeypatch):
             }
         )
 
-    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
     document = LLMPerfClient("http://127.0.0.1:8000").get_runner_logs("runner-1")
 
     assert requested_urls == ["http://127.0.0.1:8000/api/v1/runners/runner-1/logs"]
@@ -1543,7 +1543,7 @@ def test_datetime_payload(monkeypatch):
             {"campaign": {"campaign_id": "campaign-1"}, "items": [], "runner_plans": []}
         )
 
-    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
     client = LLMPerfClient("http://127.0.0.1:8000")
 
     client.start_campaign(
@@ -1571,7 +1571,7 @@ def test_artifact_timeout(monkeypatch):
             }
         )
 
-    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
     client = LLMPerfClient("http://127.0.0.1:8000", timeout=120)
 
     client.validate_campaign_artifacts(
@@ -1632,7 +1632,7 @@ def test_artifact_progress(monkeypatch):
         captured["timeout"] = timeout
         return FakeStreamResponse()
 
-    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
     client = LLMPerfClient("http://127.0.0.1:8000", timeout=120)
 
     result = client.validate_campaign_artifacts(
@@ -1668,7 +1668,7 @@ def test_preview_client_query(monkeypatch):
             }
         )
 
-    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
     client = LLMPerfClient("http://127.0.0.1:8000")
 
     client.preview_campaign_tasks(
@@ -1698,7 +1698,7 @@ def test_provider_encoding(monkeypatch):
         requested_methods.append(request.get_method())
         return _FakeResponse({"models": []})
 
-    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
     client = LLMPerfClient("http://127.0.0.1:8000")
 
     client.list_provider_models("team/provider", refresh=True)
@@ -1777,7 +1777,7 @@ def test_request_timeout(monkeypatch):
     def fake_urlopen(request, timeout):
         raise socket.timeout("timed out")
 
-    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
     client = LLMPerfClient("http://127.0.0.1:8000", timeout=30)
 
     with pytest.raises(ClientError) as error:
@@ -1820,7 +1820,7 @@ def test_http_detail(monkeypatch):
             ),
         )
 
-    monkeypatch.setattr("llmperf_cli.client.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
     client = LLMPerfClient("http://127.0.0.1:8000")
 
     with pytest.raises(ClientError) as error:

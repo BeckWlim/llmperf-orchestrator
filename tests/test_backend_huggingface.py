@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from llmperf_backend.outbound import (
+from llmperf_backend.artifacts.outbound import (
     LLMPERF_NO_PROXY,
     LLMPERF_PROXY,
     OutboundConfigurationError,
@@ -22,8 +22,10 @@ def test_http_proxy(monkeypatch):
     configure = Mock()
     client = Mock()
     client_class = Mock(return_value=client)
-    monkeypatch.setattr("llmperf_backend.outbound.set_client_factory", configure)
-    monkeypatch.setattr("llmperf_backend.outbound.httpx.Client", client_class)
+    monkeypatch.setattr(
+        "llmperf_backend.artifacts.outbound.set_client_factory", configure
+    )
+    monkeypatch.setattr("llmperf_backend.artifacts.outbound.httpx.Client", client_class)
 
     policy = configure_outbound_transport({}, "http://proxy.internal:3128")
 
@@ -41,8 +43,10 @@ def test_http_default(monkeypatch):
     configure = Mock()
     client = Mock()
     client_class = Mock(return_value=client)
-    monkeypatch.setattr("llmperf_backend.outbound.set_client_factory", configure)
-    monkeypatch.setattr("llmperf_backend.outbound.httpx.Client", client_class)
+    monkeypatch.setattr(
+        "llmperf_backend.artifacts.outbound.set_client_factory", configure
+    )
+    monkeypatch.setattr("llmperf_backend.artifacts.outbound.httpx.Client", client_class)
 
     configure_outbound_transport({})
 
@@ -53,7 +57,9 @@ def test_http_default(monkeypatch):
 
 def test_empty_proxy(monkeypatch):
     configure = Mock()
-    monkeypatch.setattr("llmperf_backend.outbound.set_client_factory", configure)
+    monkeypatch.setattr(
+        "llmperf_backend.artifacts.outbound.set_client_factory", configure
+    )
 
     policy = configure_outbound_transport(
         {"HTTPS_PROXY": "http://proxy.internal:3128"}, ""
@@ -137,7 +143,7 @@ def test_proxy_bootstrap_import():
     }
     subprocess_environment[LLMPERF_PROXY] = "http://proxy.internal:3128"
     command = (
-        "import os; import llmperf_backend.artifacts; "
+        "import os; import llmperf_backend.artifacts.resolver; "
         "from huggingface_hub.constants import HF_HUB_DISABLE_XET; "
         "names = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', "
         "'http_proxy', 'https_proxy', 'all_proxy'); "

@@ -5,11 +5,12 @@ from typing import Any, Mapping
 
 import httpx
 
-from llmperf_backend.app import create_app
-from llmperf_backend.config import ConfigStore
-from llmperf_backend.artifacts import DatasetResolution
-from llmperf_backend.providers import ProviderRegistry
-from llmperf_backend.artifacts import TokenizerResolution
+from llmperf_backend.api.app import create_app
+from llmperf_backend.configuration.loader import ConfigStore
+from llmperf_backend.artifacts.resolver import DatasetResolution
+from llmperf_backend.providers.registry import ProviderRegistry
+from llmperf_backend.providers.files import ProviderFileProfile
+from llmperf_backend.artifacts.resolver import TokenizerResolution
 
 
 CONFIG = """
@@ -59,6 +60,42 @@ class FakeDatasetCache:
         )
 
 
+def test_input_reference_rejection(tmp_path):
+    config_path = tmp_path / "backend.yaml"
+    config_path.write_text(CONFIG, encoding="utf-8")
+    application = create_app(
+        ConfigStore(config_path),
+        provider_registry=ProviderRegistry(
+            [ProviderFileProfile(models=["test-model"]).resolve("test", {})]
+        ),
+        tokenizer_cache=FakeTokenizerCache(tmp_path / "unused-tokenizer"),
+        dataset_cache=FakeDatasetCache(tmp_path / "unused-dataset"),
+    )
+
+    async def exercise():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/v1/campaigns/validate-artifacts",
+                json={
+                    "campaign": {"name": "invalid-input"},
+                    "runners": [
+                        {
+                            "provider": "test",
+                            "model": "test-model",
+                            "request": {"input": "missing"},
+                        }
+                    ],
+                },
+            )
+            assert response.status_code == 422
+            assert "unknown Runner input" in response.text
+            assert "input" not in response.json()["detail"][0]
+
+    asyncio.run(exercise())
+
+
 def test_artifact_api(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_DATASETS_CACHE", str(tmp_path / "datasets-cache"))
     config_path = tmp_path / "backend.yaml"
@@ -75,11 +112,8 @@ def test_artifact_api(tmp_path, monkeypatch):
     )
     application = create_app(
         ConfigStore(config_path),
-        provider_registry=ProviderRegistry.from_environment(
-            {
-                "LLMPERF_PROVIDER_TEST_DISCOVERY": "static",
-                "LLMPERF_PROVIDER_TEST_MODELS": "test-model",
-            }
+        provider_registry=ProviderRegistry(
+            [ProviderFileProfile(models=["test-model"]).resolve("test", {})]
         ),
         tokenizer_cache=FakeTokenizerCache(tokenizer_directory),
         dataset_cache=FakeDatasetCache(dataset_path),
@@ -97,20 +131,24 @@ def test_artifact_api(tmp_path, monkeypatch):
                         "campaign": {"name": "artifact-preflight"},
                         "runners": [
                             {
-                                "benchmark": {
-                                    "provider": "test",
-                                    "model": "test-model",
-                                    "tokenizer": {
-                                        "id": "organization/tokenizer",
-                                        "revision": "a" * 40,
-                                    },
-                                    "dataset": {
-                                        "id": "organization/sharegpt",
-                                        "filename": "sharegpt.json",
-                                        "revision": "b" * 40,
-                                        "adapter": "sharegpt",
-                                    },
-                                }
+                                "request": {},
+                                "provider": "test",
+                                "model": "test-model",
+                                "tokenizer": {
+                                    "id": "organization/tokenizer",
+                                    "revision": "a" * 40,
+                                },
+                                "inputs": {
+                                    "default": {
+                                        "dataset": {
+                                            "id": "organization/sharegpt",
+                                            "filename": "sharegpt.json",
+                                            "revision": "b" * 40,
+                                            "adapter": "sharegpt",
+                                        },
+                                        "tokens": {"mean": 550, "stddev": 150},
+                                    }
+                                },
                             }
                         ],
                     },
@@ -161,11 +199,8 @@ def test_artifact_stream(tmp_path, monkeypatch):
     )
     application = create_app(
         ConfigStore(config_path),
-        provider_registry=ProviderRegistry.from_environment(
-            {
-                "LLMPERF_PROVIDER_TEST_DISCOVERY": "static",
-                "LLMPERF_PROVIDER_TEST_MODELS": "test-model",
-            }
+        provider_registry=ProviderRegistry(
+            [ProviderFileProfile(models=["test-model"]).resolve("test", {})]
         ),
         tokenizer_cache=FakeTokenizerCache(tokenizer_directory),
         dataset_cache=FakeDatasetCache(dataset_path),
@@ -185,7 +220,7 @@ def test_artifact_stream(tmp_path, monkeypatch):
                             {
                                 "name": "artifact-task",
                                 "instances": {"trials": 1},
-                                "payloads": {"replay": {"seed_namespace": "replay"}},
+                                "payloads": {"replay": {"seed": "replay"}},
                                 "workflow": [
                                     {
                                         "invoke": {
@@ -195,23 +230,25 @@ def test_artifact_stream(tmp_path, monkeypatch):
                                     }
                                 ],
                                 "runner": {
-                                    "benchmark": {
-                                        "provider": "test",
-                                        "model": "test-model",
-                                        "mean_input_tokens": 16,
-                                        "stddev_input_tokens": 0,
-                                        "mean_output_tokens": 8,
-                                        "stddev_output_tokens": 0,
-                                        "tokenizer": {
-                                            "id": "organization/tokenizer",
-                                            "revision": "a" * 40,
-                                        },
-                                        "dataset": {
-                                            "id": "organization/sharegpt",
-                                            "filename": "sharegpt.json",
-                                            "revision": "b" * 40,
-                                            "adapter": "sharegpt",
-                                        },
+                                    "request": {},
+                                    "provider": "test",
+                                    "model": "test-model",
+                                    "mean_output_tokens": 8,
+                                    "stddev_output_tokens": 0,
+                                    "tokenizer": {
+                                        "id": "organization/tokenizer",
+                                        "revision": "a" * 40,
+                                    },
+                                    "inputs": {
+                                        "default": {
+                                            "dataset": {
+                                                "id": "organization/sharegpt",
+                                                "filename": "sharegpt.json",
+                                                "revision": "b" * 40,
+                                                "adapter": "sharegpt",
+                                            },
+                                            "tokens": {"mean": 16, "stddev": 0},
+                                        }
                                     },
                                 },
                             }

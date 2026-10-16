@@ -3,11 +3,12 @@
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 from typing import Any, Dict
 
-from llmperf.logging import configure_logging
-from llmperf.user_config import (
+from llmperf.configuration.logging import configure_logging
+from llmperf.configuration.environment import (
     UserConfigError,
     backend_environment_path,
     display_environment_value,
@@ -15,8 +16,13 @@ from llmperf.user_config import (
     set_environment_value,
     unset_environment_value,
 )
-from llmperf_backend.config import PROVIDERS_FILE, load_config
-from llmperf_backend.outbound import (
+from llmperf_backend.configuration.loader import (
+    PROVIDERS_FILE,
+    load_config,
+    load_provider_profiles,
+)
+from llmperf_backend.providers.registry import ProviderConfigError
+from llmperf_backend.artifacts.outbound import (
     normalize_outbound_environment,
     configure_ray_direct,
 )
@@ -64,6 +70,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _is_provider_setting(name: str, environment_path: Path) -> bool:
+    if name == PROVIDERS_FILE:
+        return True
+    try:
+        profiles = load_provider_profiles(environment_path)
+    except (ProviderConfigError, UserConfigError):
+        return False
+    return any(profile.credential_source_env == name for profile in profiles)
+
+
 def execute_config(arguments: argparse.Namespace) -> Dict[str, Any]:
     path = backend_environment_path()
     if arguments.config_command == "path":
@@ -74,10 +90,7 @@ def execute_config(arguments: argparse.Namespace) -> Dict[str, Any]:
             raise UserConfigError("Provide exactly one of VALUE or --stdin")
         value = sys.stdin.read().rstrip("\r\n") if use_stdin else arguments.value
         set_environment_value(path, arguments.name, value)
-        provider_setting = (
-            arguments.name == PROVIDERS_FILE
-            or arguments.name.startswith("LLMPERF_PROVIDER_")
-        )
+        provider_setting = _is_provider_setting(arguments.name, path)
         return {
             "name": arguments.name,
             "value": display_environment_value(arguments.name, value),
@@ -86,11 +99,8 @@ def execute_config(arguments: argparse.Namespace) -> Dict[str, Any]:
             "provider_reload_required": provider_setting,
         }
     if arguments.config_command == "unset":
+        provider_setting = _is_provider_setting(arguments.name, path)
         removed = unset_environment_value(path, arguments.name)
-        provider_setting = (
-            arguments.name == PROVIDERS_FILE
-            or arguments.name.startswith("LLMPERF_PROVIDER_")
-        )
         return {
             "name": arguments.name,
             "removed": removed,
@@ -132,7 +142,7 @@ def serve() -> None:
         color=os.environ.get("LLMPERF_LOG_COLOR", "auto").lower(),
     )
     uvicorn.run(
-        "llmperf_backend.app:create_app",
+        "llmperf_backend.api.app:create_app",
         factory=True,
         host=config.server.host,
         port=config.server.port,

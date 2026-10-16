@@ -7,21 +7,88 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import select, text, update
 
-from llmperf_backend.models import DatabaseConfig
-from llmperf_backend.persistence import (
+from llmperf.benchmark.execution import RequestStep
+from llmperf.clients.models import RequestConfig
+from llmperf_backend.runtime.runner import WorkerResult
+from llmperf_backend.storage.messages import MessageRecord
+from llmperf_backend.configuration.models import DatabaseConfig
+from llmperf_backend.storage.repository import (
     Base,
     Database,
     RunnerRepository,
     ExecutionLeaseRecord,
     TaskAttemptRecord,
 )
-from llmperf_backend.runtime import RuntimeCoordinator
+from llmperf_backend.runtime.coordinator import RuntimeCoordinator
 
 pytestmark = pytest.mark.postgresql
 
 
+def test_worker_mailbox(postgresql_url):
+    from llmperf.benchmark.execution import RequestStep
+    from llmperf.clients.models import RequestConfig
+    from llmperf_backend.runtime.runner import WorkerResult
+    from llmperf_backend.storage.messages import MessageRecord
+
+    async def exercise():
+        database = Database(DatabaseConfig(url=postgresql_url))
+        try:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.create_schema()
+            repository = RunnerRepository(database)
+            await repository.acquire_runtime("worker-test")
+            runner = await repository.create_runner(
+                {
+                    "provider": "test",
+                    "model": "test",
+                    "repeat": 2,
+                    "concurrent_requests": None,
+                },
+                {},
+                "test",
+            )
+            assert runner is not None
+            runner_id = runner["runner_id"]
+            assert await repository.start_selected(runner_id, "test") is not None
+            request = RequestConfig(model="test", prompt=("hello", 1))
+            first = RequestStep("first", request)
+            assert await repository.reserve_worker(runner_id, first, None)
+            assert not await repository.reserve_worker(runner_id, first, None)
+            result = WorkerResult(
+                "first", ({}, "answer", request), datetime.now(timezone.utc)
+            )
+            assert await repository.commit_worker(runner_id, result)
+            assert await repository.commit_worker(runner_id, result)
+            messages = await repository.pending_messages(
+                runner_id, "runner", "test", 10
+            )
+            assert len(messages) == 1
+            assert messages[0].payload["generated_text"] == "answer"
+            await repository.acknowledge_message(runner_id, messages[0].id, "test")
+            assert not await repository.pending_messages(
+                runner_id, "runner", "test", 10
+            )
+            assert await repository.reserve_worker(
+                runner_id, RequestStep("second", request), None
+            )
+            with pytest.raises(ValueError, match="declared request expansion"):
+                await repository.reserve_worker(
+                    runner_id, RequestStep("third", request), None
+                )
+            async with database.sessions() as session:
+                stored = (await session.execute(select(MessageRecord))).scalars().all()
+                assert len(stored) == 1
+        finally:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.dispose()
+
+    asyncio.run(exercise())
+
+
 def test_round_recovery(postgresql_url):
-    from llmperf_backend.rounds import expand_rounds
+    from llmperf_backend.compiler.rounds import expand_rounds
 
     async def exercise():
         database = Database(DatabaseConfig(url=postgresql_url))
@@ -176,8 +243,8 @@ def test_history_recovery(postgresql_url):
                     "selection": "explicit",
                     "accuracy": "compatible",
                 },
-                "timeout_seconds": 10,
-                "max_completed_requests": 1,
+                "timeout": 10,
+                "repeat": 1,
                 "concurrent_requests": 1,
                 "mean_input_tokens": 2,
                 "stddev_input_tokens": 0,
@@ -195,20 +262,21 @@ def test_history_recovery(postgresql_url):
                     {
                         "definition": {
                             "name": "chat",
-                            "payloads": {"p": {"seed_namespace": "p", "text": "hello"}},
+                            "payloads": {"p": {"seed": "p", "text": "hello"}},
                             "workflow": [
                                 {
                                     "invoke": {
                                         "name": "first",
                                         "payload": "p",
-                                        "conversation": "chat",
                                     }
                                 },
                                 {
                                     "invoke": {
                                         "name": "second",
                                         "payload": "p",
-                                        "conversation": "chat",
+                                        "depends_on": [
+                                            {"step": "first", "reuse_messages": True}
+                                        ],
                                     }
                                 },
                             ],
@@ -225,35 +293,20 @@ def test_history_recovery(postgresql_url):
             coordinator = RuntimeCoordinator(repository)
             await coordinator.reconcile()
             first = await coordinator.next_runner("first")
-            assert first["benchmark"]["conversation_messages"] == []
+            assert "input_messages" not in first["benchmark"]
             assert (
                 not coordinator.order
             )  # A dependent turn is not an actor reservation.
-            result = [
-                {
-                    "error_code": None,
-                    "request_metadata": {"prompt_hash": "hash"},
-                    "conversation_turn": {
-                        "user": "hello",
-                        "assistant": "world",
-                        "parent_version": 0,
-                    },
-                }
-            ]
-            invalid_result = [
-                {
-                    **result[0],
-                    "conversation_turn": {
-                        "user": "hello",
-                        "assistant": "world",
-                        "parent_version": 2,
-                    },
-                }
-            ]
-            with pytest.raises(ValueError, match="version conflict"):
-                await repository.complete_runner(
-                    first["runner_id"], {}, invalid_result, 0, "", ""
-                )
+            request = RequestConfig(model="test", prompt=("hello", 1))
+            assert await repository.reserve_worker(
+                first["runner_id"], RequestStep("0", request), None
+            )
+            completion = WorkerResult(
+                "0", ({}, "world", request), datetime.now(timezone.utc)
+            )
+            assert await repository.commit_worker(first["runner_id"], completion)
+            assert await repository.commit_worker(first["runner_id"], completion)
+            result = [{"error_code": None, "request_metadata": {"prompt_hash": "hash"}}]
             await coordinator.reconcile()
             assert not coordinator.order
             assert await repository.complete_runner(
@@ -264,7 +317,7 @@ def test_history_recovery(postgresql_url):
             )
             await coordinator.reconcile()
             second = await coordinator.next_runner("first")
-            assert second["benchmark"]["conversation_messages"] == [
+            assert second["benchmark"]["input_messages"] == [
                 {"role": "user", "content": "hello"},
                 {"role": "assistant", "content": "world"},
             ]
@@ -298,7 +351,20 @@ def test_history_recovery(postgresql_url):
                 workload["campaign"]["campaign_id"], True
             )
             assert exported is not None
-            assert len(exported["conversation_messages"]) == 2
+            async with database.sessions() as session:
+                messages = (
+                    (
+                        await session.execute(
+                            select(MessageRecord).where(
+                                MessageRecord.topic == "worker.completed"
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                assert len(messages) == 1
+                assert messages[0].payload["generated_text"] == "world"
             await competitor.release_runtime()
         finally:
             async with database.engine.begin() as connection:

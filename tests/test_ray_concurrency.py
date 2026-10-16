@@ -11,19 +11,19 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 import ray
 
-from llmperf import common_metrics
-from llmperf import token_benchmark_ray as benchmark_module
-from llmperf.common import RAY_ACTOR_CONCURRENCY_ENV, RAY_ACTOR_CPUS_ENV
-from llmperf.prompt_datasets import PromptDatasetSource
-from llmperf.models import RequestConfig
-from llmperf.preparation import create_preparation_actor
-from llmperf_backend.request_pool import (
+from llmperf.metrics import constants as common_metrics
+from llmperf.benchmark import throughput as benchmark_module
+from llmperf.clients.factory import RAY_ACTOR_CONCURRENCY_ENV, RAY_ACTOR_CPUS_ENV
+from llmperf.datasets.prompts import PromptDatasetSource
+from llmperf.clients.models import RequestConfig
+from llmperf.datasets.preparation import create_preparation_actor
+from llmperf_backend.runtime.request_pool import (
     create_request_actor,
     create_request_router,
     SharedRequestExecutor,
 )
-from llmperf_backend.worker import AtomicWorker
-import llmperf_backend.worker as worker_module
+from llmperf_backend.runtime.worker import AtomicWorker
+import llmperf_backend.runtime.worker as worker_module
 
 
 pytestmark = pytest.mark.skipif(
@@ -162,8 +162,8 @@ def test_concurrent_http_streams(monkeypatch, mode, tmp_path):
                                     "provider": "test",
                                     "model": "test",
                                     "adapter": "openai",
-                                    "timeout_seconds": 120,
-                                    "max_completed_requests": 1,
+                                    "timeout": 120,
+                                    "repeat": 1,
                                     "concurrent_requests": 1,
                                     "mean_input_tokens": 1,
                                     "stddev_input_tokens": 0,

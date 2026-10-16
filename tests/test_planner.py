@@ -3,14 +3,14 @@ from datetime import datetime, timezone
 
 import pytest
 
-from llmperf_backend.models import PlannerConfig, RunnerPlanPreview
-from llmperf_backend.planner import (
+from llmperf_backend.configuration.models import PlannerConfig, RunnerPlanPreview
+from llmperf_backend.runtime.planner import (
     Planner,
     next_fire_at,
     next_fire_details,
     preview_fires,
 )
-from llmperf_backend.persistence import RunnerRepository
+from llmperf_backend.storage.repository import RunnerRepository
 
 
 UTC = timezone.utc
@@ -18,7 +18,7 @@ UTC = timezone.utc
 
 def test_interval_recurrence():
     start = datetime(2026, 8, 13, 0, 0, tzinfo=UTC)
-    recurrence = {"kind": "interval", "every_seconds": 600}
+    recurrence = {"kind": "interval", "every": 600}
 
     first = next_fire_at("Asia/Shanghai", recurrence, start)
     second = next_fire_at("Asia/Shanghai", recurrence, start, first)
@@ -94,7 +94,7 @@ def test_preview_boundary():
             "timezone": "Asia/Shanghai",
             "starts_at": "2026-08-13T00:00:00Z",
             "max_occurrences": 2,
-            "recurrence": {"kind": "interval", "every_seconds": 60},
+            "recurrence": {"kind": "interval", "every": 60},
             "count": 10,
         }
     )
@@ -119,7 +119,7 @@ def test_immediate_preview():
         "starts_at": None,
         "ends_at": None,
         "max_occurrences": 2,
-        "recurrence": {"kind": "interval", "every_seconds": 30},
+        "recurrence": {"kind": "interval", "every": 30},
     }
 
     items = preview_fires(timing, 2, default_starts_at=effective_start)
@@ -139,7 +139,7 @@ def test_immediate_plan():
             "starts_at": None,
             "ends_at": None,
             "max_occurrences": 8,
-            "recurrence": {"kind": "interval", "every_seconds": 30},
+            "recurrence": {"kind": "interval", "every": 30},
             "overlap_policy": "queue",
         },
         {"benchmark": {"provider": "aliyun", "model": "deepseek-v4-pro"}},
@@ -159,7 +159,7 @@ def test_overlap_policy():
                 "timezone": "Asia/Shanghai",
                 "starts_at": "2026-08-13T00:00:00Z",
                 "max_occurrences": 2,
-                "recurrence": {"kind": "interval", "every_seconds": 30},
+                "recurrence": {"kind": "interval", "every": 30},
                 "overlap_policy": "parallel",
             }
         )
@@ -171,7 +171,7 @@ def test_immediate_grace():
             {
                 "timezone": "Asia/Shanghai",
                 "max_occurrences": 2,
-                "recurrence": {"kind": "interval", "every_seconds": 30},
+                "recurrence": {"kind": "interval", "every": 30},
                 "misfire_grace_seconds": 0,
             }
         )

@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from llmperf_backend.persistence import (
+from llmperf_backend.storage.repository import (
     ExecutionNodeRecord,
     RunnerRecordFactory,
 )

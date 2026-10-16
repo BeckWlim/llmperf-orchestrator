@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from llmperf_backend.models import PerformanceGuardConfig
-from llmperf_backend.safety import (
+from llmperf_backend.configuration.models import PerformanceGuardConfig
+from llmperf_backend.compiler.safety import (
     RuntimePerformanceGuard,
     WorkloadSafetyError,
     assess_workload,
@@ -14,7 +14,7 @@ from llmperf_backend.safety import (
 
 NOW = datetime(2026, 8, 14, tzinfo=timezone.utc)
 BENCHMARK = {
-    "max_completed_requests": 10,
+    "repeat": 10,
     "concurrent_requests": 2,
     "mean_input_tokens": 100,
     "mean_output_tokens": 20,
@@ -28,7 +28,7 @@ def test_workload_costs():
             "starts_at": NOW,
             "ends_at": None,
             "max_occurrences": 3,
-            "recurrence": {"kind": "interval", "every_seconds": 60},
+            "recurrence": {"kind": "interval", "every": 60},
         },
         "runner_template": {"benchmark": BENCHMARK},
     }
@@ -39,13 +39,13 @@ def test_workload_costs():
                 "matrix": {"delay": [0, 60]},
                 "trials": 2,
             },
-            "payloads": {"replay": {"seed_namespace": "replay"}},
+            "payloads": {"replay": {"seed": "replay"}},
             "workflow": [
                 {"invoke": {"name": "prime", "payload": "replay"}},
                 {
                     "parallel": {
                         "name": "observation",
-                        "after_seconds": "$delay",
+                        "after": "$delay",
                         "branches": [
                             {"invoke": {"name": "warm", "payload": "replay"}},
                             {"invoke": {"name": "cold", "payload": "replay"}},
@@ -54,7 +54,7 @@ def test_workload_costs():
                 },
             ],
         },
-        "runner_template": {"benchmark": BENCHMARK},
+        "runner_template": {"benchmark": {**BENCHMARK, "repeat": 1}},
     }
 
     result = assess_workload(
@@ -81,7 +81,7 @@ def test_promotion_costs():
                 "matrix": {"warmups": [0, 2, 4], "quiet": [60, 300]},
                 "trials": 2,
             },
-            "payloads": {"replay": {"seed_namespace": "replay"}},
+            "payloads": {"replay": {"seed": "replay"}},
             "workflow": [
                 {"invoke": {"name": "prime", "payload": "replay"}},
                 {
@@ -94,7 +94,7 @@ def test_promotion_costs():
                 {
                     "parallel": {
                         "name": "observation",
-                        "after_seconds": "$quiet",
+                        "after": "$quiet",
                         "branches": [
                             {"invoke": {"name": "probe", "payload": "replay"}},
                             {"invoke": {"name": "cold", "payload": "replay"}},
@@ -103,7 +103,7 @@ def test_promotion_costs():
                 },
             ],
         },
-        "runner_template": {"benchmark": BENCHMARK},
+        "runner_template": {"benchmark": {**BENCHMARK, "repeat": 1}},
     }
 
     result = assess_workload(
@@ -125,15 +125,20 @@ def test_embedded_task_runner():
     task_definition = {
         "name": "embedded-runner",
         "instances": {"trials": 2},
-        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "payloads": {"replay": {"seed": "replay"}},
         "workflow": [{"invoke": {"name": "prime", "payload": "replay"}}],
-        "runner": {"benchmark": BENCHMARK},
+        "runner": {"benchmark": {**BENCHMARK, "repeat": 1}},
     }
 
     result = assess_workload(
         [],
         [],
-        [{"definition": task_definition, "runner_template": {"benchmark": BENCHMARK}}],
+        [
+            {
+                "definition": task_definition,
+                "runner_template": {"benchmark": {**BENCHMARK, "repeat": 1}},
+            }
+        ],
         PerformanceGuardConfig(),
         scheduler_slots=1,
         now=NOW,
@@ -146,7 +151,7 @@ def test_embedded_task_runner():
 def test_grouped_capacity():
     task = {
         "name": "load64",
-        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "payloads": {"replay": {"seed": "replay"}},
         "workflow": [
             {"invoke": {"name": "prime", "payload": "replay"}},
             {
@@ -164,7 +169,12 @@ def test_grouped_capacity():
     result = assess_workload(
         [],
         [],
-        [{"definition": task, "runner_template": {"benchmark": BENCHMARK}}],
+        [
+            {
+                "definition": task,
+                "runner_template": {"benchmark": {**BENCHMARK, "repeat": 1}},
+            }
+        ],
         PerformanceGuardConfig(max_runner_concurrency=64, max_effective_concurrency=64),
         scheduler_slots=64,
         ray_actor_capacity=8,
@@ -239,9 +249,7 @@ def test_ray_capacity():
     [(1, 64, 8, 8), (8, 8, 8, 8), (8, 1, 8, 1), (2, 9, 4, 3)],
 )
 def test_concurrent_actor_capacity(runners, concurrency, capacity, expected_demand):
-    benchmark = dict(
-        BENCHMARK, concurrent_requests=concurrency, max_completed_requests=100
-    )
+    benchmark = dict(BENCHMARK, concurrent_requests=concurrency, repeat=100)
     result = assess_workload(
         [{"benchmark": benchmark}] * runners,
         [],
@@ -256,7 +264,7 @@ def test_concurrent_actor_capacity(runners, concurrency, capacity, expected_dema
 
 
 def test_shared_actor_rounding():
-    benchmark = dict(BENCHMARK, concurrent_requests=9, max_completed_requests=100)
+    benchmark = dict(BENCHMARK, concurrent_requests=9, repeat=100)
     result = assess_workload(
         [{"benchmark": benchmark}] * 2,
         [],

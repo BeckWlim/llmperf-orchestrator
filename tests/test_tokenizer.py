@@ -2,7 +2,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from llmperf import utils
+from llmperf.datasets import tokenizer as utils
 
 
 @pytest.fixture(autouse=True)
@@ -67,9 +67,7 @@ def test_backend_compatibility(tmp_path, monkeypatch):
     fast_loader = Mock(return_value=object())
     monkeypatch.setenv(utils.TOKENIZER_PATH, str(tmp_path))
     monkeypatch.setattr(utils.AutoTokenizer, "from_pretrained", auto_loader)
-    monkeypatch.setattr(
-        utils.PreTrainedTokenizerFast, "from_pretrained", fast_loader
-    )
+    monkeypatch.setattr(utils.PreTrainedTokenizerFast, "from_pretrained", fast_loader)
 
     assert utils.get_tokenizer() is fast_loader.return_value
     fast_loader.assert_called_once_with(

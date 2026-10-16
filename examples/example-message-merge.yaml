@@ -1,0 +1,33 @@
+version: 1.0.0
+wait: true
+campaign:
+  name: message-merge
+runners:
+- label: combine-independent-results
+  provider: aliyun
+  model: deepseek-v4-pro
+  timeout: 60
+  mean_output_tokens: 32
+  stddev_output_tokens: 0
+  additional_sampling_params:
+    temperature: 0
+  inputs:
+    benefits:
+      text: Give one benefit of caching.
+    risks:
+      text: Give one risk of caching.
+    summary:
+      text: Summarize both answers in one sentence.
+  request:
+    steps:
+    - name: benefits
+      input: benefits
+    - name: risks
+      input: risks
+    - name: summary
+      depends_on:
+      - step: benefits
+        reuse_messages: true
+      - step: risks
+        reuse_messages: true
+      input: summary

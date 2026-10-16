@@ -4,13 +4,13 @@ from unittest.mock import Mock
 
 import pytest
 
-from llmperf_backend.artifacts import (
+from llmperf_backend.artifacts.resolver import (
     DatasetCache,
     DatasetResolutionError,
     artifact_progress_scope,
     is_immutable_huggingface_revision,
 )
-from llmperf_backend.outbound import STANDARD_PROXY_NAMES
+from llmperf_backend.artifacts.outbound import STANDARD_PROXY_NAMES
 
 
 DATASET_SPEC = {
@@ -45,9 +45,10 @@ def test_cache(tmp_path, monkeypatch):
         return str(artifact)
 
     loader = Mock(side_effect=download)
-    monkeypatch.setattr("llmperf_backend.artifacts.hf_hub_download", loader)
+    monkeypatch.setattr("llmperf_backend.artifacts.resolver.hf_hub_download", loader)
     monkeypatch.setattr(
-        "llmperf_backend.artifacts.try_to_load_from_cache", Mock(return_value=None)
+        "llmperf_backend.artifacts.resolver.try_to_load_from_cache",
+        Mock(return_value=None),
     )
     cache = DatasetCache(cache_directory=tmp_path, proxy_url="")
 
@@ -100,9 +101,10 @@ def test_download_progress(tmp_path, monkeypatch):
         artifact.write_bytes(b"data")
         return str(artifact)
 
-    monkeypatch.setattr("llmperf_backend.artifacts.hf_hub_download", download)
+    monkeypatch.setattr("llmperf_backend.artifacts.resolver.hf_hub_download", download)
     monkeypatch.setattr(
-        "llmperf_backend.artifacts.try_to_load_from_cache", Mock(return_value=None)
+        "llmperf_backend.artifacts.resolver.try_to_load_from_cache",
+        Mock(return_value=None),
     )
     cache = DatasetCache(cache_directory=tmp_path, proxy_url="")
 
@@ -150,10 +152,12 @@ def test_offline_cache(tmp_path, monkeypatch):
     artifact.write_text("[]", encoding="utf-8")
     downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
     monkeypatch.setattr(
-        "llmperf_backend.artifacts.try_to_load_from_cache",
+        "llmperf_backend.artifacts.resolver.try_to_load_from_cache",
         Mock(return_value=str(artifact)),
     )
-    monkeypatch.setattr("llmperf_backend.artifacts.hf_hub_download", downloader)
+    monkeypatch.setattr(
+        "llmperf_backend.artifacts.resolver.hf_hub_download", downloader
+    )
     cache = DatasetCache(
         cache_directory=tmp_path,
         local_files_only=True,
@@ -176,9 +180,12 @@ def test_offline_cache(tmp_path, monkeypatch):
 def test_offline_miss(tmp_path, monkeypatch):
     downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
     monkeypatch.setattr(
-        "llmperf_backend.artifacts.try_to_load_from_cache", Mock(return_value=None)
+        "llmperf_backend.artifacts.resolver.try_to_load_from_cache",
+        Mock(return_value=None),
     )
-    monkeypatch.setattr("llmperf_backend.artifacts.hf_hub_download", downloader)
+    monkeypatch.setattr(
+        "llmperf_backend.artifacts.resolver.hf_hub_download", downloader
+    )
     cache = DatasetCache(
         cache_directory=tmp_path,
         local_files_only=True,
@@ -209,9 +216,12 @@ def test_offline_fallback(tmp_path, monkeypatch):
     artifact.write_text("[]", encoding="utf-8")
     downloader = Mock(side_effect=AssertionError("unexpected Hub lookup"))
     monkeypatch.setattr(
-        "llmperf_backend.artifacts.try_to_load_from_cache", Mock(return_value=None)
+        "llmperf_backend.artifacts.resolver.try_to_load_from_cache",
+        Mock(return_value=None),
     )
-    monkeypatch.setattr("llmperf_backend.artifacts.hf_hub_download", downloader)
+    monkeypatch.setattr(
+        "llmperf_backend.artifacts.resolver.hf_hub_download", downloader
+    )
     cache = DatasetCache(
         cache_directory=tmp_path,
         local_files_only=True,
@@ -245,9 +255,10 @@ def test_shared_huggingface_proxy(tmp_path, monkeypatch):
     artifact.parent.mkdir(parents=True)
     artifact.write_text("[]", encoding="utf-8")
     loader = Mock(return_value=str(artifact))
-    monkeypatch.setattr("llmperf_backend.artifacts.hf_hub_download", loader)
+    monkeypatch.setattr("llmperf_backend.artifacts.resolver.hf_hub_download", loader)
     monkeypatch.setattr(
-        "llmperf_backend.artifacts.try_to_load_from_cache", Mock(return_value=None)
+        "llmperf_backend.artifacts.resolver.try_to_load_from_cache",
+        Mock(return_value=None),
     )
     cache = DatasetCache(
         cache_directory=tmp_path,

@@ -4,9 +4,12 @@ import sys
 
 import pytest
 
-import llmperf_cli.__main__ as cli_main
-from llmperf.user_config import cli_environment_path, read_environment_file
-from llmperf_cli.environment import (
+import llmperf_cli.commands.main as cli_main
+from llmperf.configuration.environment import (
+    cli_environment_path,
+    read_environment_file,
+)
+from llmperf_cli.configuration.environment import (
     load_cli_environment,
     resolve_cli_environment_path,
 )

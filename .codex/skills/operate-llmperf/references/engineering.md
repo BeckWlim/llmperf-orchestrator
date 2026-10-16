@@ -2,34 +2,57 @@
 
 ## Architecture boundaries
 
-- `models.py`: strict general API/YAML models and configuration constraints.
-- `task_compiler.py`: task-specific Pydantic AST, `BaseNode` hierarchy, bounded workflow
+- `configuration/models.py`: strict general API/YAML models and configuration constraints.
+- `compiler/tasks.py`: task-specific Pydantic AST, `BaseNode` hierarchy, bounded workflow
   expansion, UUID-free compilation table, and runtime assembly.
-- `persistence.py`: durable metadata, fenced attempts, checkpoints, messages, results and export.
-- `planner.py`: materialize due RunnerPlan occurrences.
-- `runtime.py`: bounded event bus, cached DAG readiness, timers and fair ready queue.
-- `scheduler.py`: supervise Worker handles and the shared request pool.
-- `worker.py`: local atomic handles or retry-free batch Ray tasks.
-- `request_pool.py`: fair shared capacity and isolated per-request Ray adapters.
-- `preparation.py`: initialization-only corpus calibration and bounded prompt chunks.
-- `rounds.py`: deterministic Runner expansion and runtime round eligibility.
-- `safety.py`: estimate expanded Runners, requests, tokens, and effective concurrency.
+- `compiler/requests.py`: Worker template repetition, step dependencies, ordered message
+  source selection, and planned Worker/token accounting.
+- `storage/repository.py`: durable metadata, fenced attempts, checkpoints, messages, results and export.
+- `runtime/planner.py`: materialize due RunnerPlan occurrences.
+- `runtime/coordinator.py`: reconciliation hints, cached DAG readiness, timers and fair ready queue.
+- `runtime/scheduler.py`: supervise Worker handles and the shared request pool.
+- `runtime/runner.py`: async progression, dependency checks, descendant cancellation,
+  message assembly, and optional outstanding-Worker ceiling.
+- `runtime/preparation.py`: Runner input preparation, named input selection, calculation, and aggregation.
+- `runtime/dispatch.py`: bounded one-request Workers and durable output publication.
+- `runtime/messages.py`: durable Runner mailbox, completion and cancellation envelopes.
+- `runtime/triggers.py`: readiness conditions and asynchronous timer event sources.
+- `runtime/worker.py`: benchmark calculation helpers and standalone execution handles.
+- `runtime/request_pool.py`: fair shared capacity and isolated per-request Ray adapters.
+- `llmperf/datasets/preparation.py`: initialization-only corpus calibration and bounded prompt chunks.
+- `compiler/rounds.py`: deterministic Runner expansion and runtime round eligibility.
+- `compiler/safety.py`: estimate expanded Runners, requests, tokens, and effective concurrency.
 - `llmperf_cli`: command parsing, HTTP boundaries, polling, logs, and rendering.
-- `cache_probe.py`, `usage.py`, `cache_analysis.py`: within-Runner KV-cache evidence.
+- `llmperf/datasets/probes.py`, `llmperf/metrics/usage.py`, `llmperf/metrics/cache.py`: within-Runner KV-cache evidence.
 
 Keep compiler, Planner, RuntimeCoordinator and Scheduler distinct. Planner materializes
 scheduled occurrences. The coordinator owns dependencies, timers and a fair ready queue;
 Scheduler owns the fixed shared Ray pool and bounded Worker handles. Waiting never occupies
-a request slot. See `docs/RUNTIME.md` for the concrete runtime and storage contract.
+a request slot. See `docs/runtime.md` for the concrete runtime and storage contract.
 
-Atomic invokes use lightweight Backend handles and cached tokenizers; ordinary batch Runners
-and compiled `run` batches
-use retry-free Ray tasks. Both share request actors across Runners. Never mutate process
+Runner preparation uses cached tokenizers; both atomic invokes and compiled `run` batches
+submit one-request Workers through the same dispatcher. All share request actors across Runners. Never mutate process
 credentials, initialize Ray in a Worker, or connect an actor to PostgreSQL. Default capacity
 is eight actors times eight requests; the active Runner bound is independent.
 
-Runtime guards stop new admission. Commit results and conversation messages before releasing
+Runtime guards stop new admission. Commit results and generic Worker messages before releasing
 successors. Recover interrupted execution as indeterminate without automatic Provider replay.
+
+Runner owns Provider/model/tokenizer, generation settings, and named `inputs` with per-input
+new-token budgets. `runner.request` defines execution logic and message composition, with
+one Worker by default. Steps reference named inputs; `repeat` and `steps` declare finite
+work. `depends_on` waits for success; `reuse_messages: true` on a
+dependency also copies its structured messages. Multiple sources concatenate in declared
+order without deduplication. Runner owns cancellation when a predecessor fails; the bus
+stores and delivers events, and Workers never wait for other Workers. Runner `timeout`
+and optional `concurrent_requests` stay outside `request`. There is no submission-budget
+authoring field or automatic retry count.
+
+Keep helper functions in the module that owns their behavior. Named-input preparation
+belongs in `runtime/preparation.py`, timer sources with `runtime/triggers.py`, private
+sampling in benchmark throughput, and task evidence projection in metrics results.
+Retain separate shared models/protocols when they prevent dependency cycles or define a
+cross-layer contract; small file size alone is not a reason to merge those boundaries.
 
 Optional preparation actors reserve one CPU each from `ray_num_cpus`; request actors use
 the remaining CPU budget. Calibration is once per ordinary Runner, before its timed loop.

@@ -1,41 +1,33 @@
-version: "1.0.0"
+version: 1.0.0
 wait: true
 campaign:
   name: multi-turn-smoke
-task_definitions:
-  - name: conversation
-    instances:
-      trials: 1
-      seed: 11111
-    payloads:
-      opening:
-        seed_namespace: opening
-        text: "Remember the word ORCHID. Reply with a brief acknowledgement."
-      followup:
-        seed_namespace: followup
-        text: "What word did I ask you to remember?"
-    workflow:
-      - invoke:
-          name: first
-          payload: opening
-          conversation: chat
-      - invoke:
-          name: second
-          payload: followup
-          conversation: chat
-    runner:
-      benchmark:
-        # Select a configured Provider/model and its matching explicit tokenizer.
-        provider: aliyun
-        model: deepseek-v4-pro
-        tokenizer:
-          id: deepseek-ai/DeepSeek-V3
-        mean_input_tokens: 64
-        stddev_input_tokens: 0
-        mean_output_tokens: 16
-        stddev_output_tokens: 0
-        concurrent_requests: 1
-        max_completed_requests: 1
-        output_token_count: provider
-        additional_sampling_params:
-          temperature: 0
+runners:
+- label: conversation
+  provider: aliyun
+  model: deepseek-v4-pro
+  tokenizer:
+    id: deepseek-ai/DeepSeek-V3
+  timeout: 60
+  mean_output_tokens: 16
+  stddev_output_tokens: 0
+  output_token_count: provider
+  additional_sampling_params:
+    temperature: 0
+  inputs:
+    opening:
+      text: Remember the word ORCHID. Reply with a brief acknowledgement.
+    followup:
+      text: What word did I ask you to remember?
+  request:
+    steps:
+    - name: opening
+      input: opening
+    - name: followup
+      depends_on:
+      - step: opening
+        reuse_messages: true
+      after:
+        value: 500
+        unit: ms
+      input: followup

@@ -2,8 +2,11 @@ from pathlib import Path
 
 import yaml
 
-from llmperf_backend.models import BenchmarkCampaignStart, BenchmarkRunnerCreate
-from llmperf_backend.task_compiler import TaskCompileContext, TaskCompiler
+from llmperf_backend.configuration.models import (
+    BenchmarkCampaignStart,
+    BenchmarkRunnerCreate,
+)
+from llmperf_backend.compiler.tasks import TaskCompileContext, TaskCompiler
 
 EXAMPLES = Path(__file__).parents[1] / "examples"
 
@@ -34,7 +37,7 @@ def test_examples_contract():
                     definition_id=f"{path.stem}:{definition_index}",
                     definition_name=definition.name,
                     definition=definition.recipe(),
-                    runner_template=definition.runner.model_dump(mode="json"),
+                    runner_template=definition.runner.execution_document(),
                 )
             )
             compilation_table = compiler.compile()
@@ -44,10 +47,10 @@ def test_examples_contract():
 
         for plan in document.get("runner_plans", []):
             assert plan["max_occurrences"] <= 2
-            assert plan["recurrence"]["every_seconds"] <= 2
+            assert plan["recurrence"]["every"] <= 2
 
         for definition in document.get("task_definitions", []):
             instances = definition["instances"]
-            assert instances["trials"] == 1
+            assert 1 <= instances["trials"] <= 2
             for values in instances.get("matrix", {}).values():
                 assert max(values) <= 2

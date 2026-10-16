@@ -9,15 +9,15 @@ from typing import Any, Dict
 from pydantic import ValidationError
 import yaml
 
-from llmperf_backend.models import (
+from llmperf_backend.configuration.models import (
     BenchmarkCampaignStart,
     BenchmarkRunnerCreate,
     PerformanceGuardConfig,
     dump_model,
 )
 from llmperf.version import PROTOCOL_VERSION
-from llmperf_backend.rounds import expand_rounds
-from llmperf_backend.safety import WorkloadSafetyError, assess_workload
+from llmperf_backend.compiler.rounds import expand_rounds
+from llmperf_backend.compiler.safety import WorkloadSafetyError, assess_workload
 
 
 def load_document(path: Path) -> Dict[str, Any]:
@@ -63,11 +63,10 @@ def validate_document(
         raise ValueError(f"YAML version must be {PROTOCOL_VERSION!r}")
     if "campaign" not in document:
         runner = BenchmarkRunnerCreate.model_validate(document)
-        benchmark = runner.benchmark
-        provider = benchmark.provider if benchmark is not None else "<backend-default>"
-        model = benchmark.model if benchmark is not None else "<backend-default>"
+        provider = runner.provider or "<backend-default>"
+        model = runner.model or "<backend-default>"
         assessment = assess_workload(
-            [dump_model(runner)],
+            [runner.execution_document() if runner.request is not None or runner.inputs is not None else {"benchmark": None}],
             [],
             [],
             guard,
@@ -84,7 +83,7 @@ def validate_document(
         key: value for key, value in document.items() if key not in {"wait", "export"}
     }
     campaign = BenchmarkCampaignStart.model_validate(payload)
-    runner_templates = [dump_model(runner) for runner in campaign.runners]
+    runner_templates = [runner.execution_document() if runner.request is not None or runner.inputs is not None else {"benchmark": None} for runner in campaign.runners]
     rounds = campaign.campaign.rounds
     expanded_runners = (
         expand_rounds(runner_templates, rounds.count, rounds.seed)
@@ -94,13 +93,15 @@ def validate_document(
     plans = []
     for runner_plan in campaign.runner_plans:
         item = dump_model(runner_plan)
-        runner = item.pop("runner")
+        item.pop("runner")
+        runner = runner_plan.runner.execution_document() if runner_plan.runner.request is not None or runner_plan.runner.inputs is not None else {"benchmark": None}
         item.pop("name", None)
         plans.append({"plan": item, "runner_template": runner})
     tasks = []
     for definition in campaign.task_definitions:
         item = dump_model(definition)
-        runner = item.pop("runner")
+        item.pop("runner")
+        runner = definition.runner.execution_document() if definition.runner.request is not None or definition.runner.inputs is not None else {"benchmark": None}
         tasks.append({"definition": item, "runner_template": runner})
     assessment = assess_workload(
         expanded_runners,

@@ -4,7 +4,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from llmperf_tools.huggingface_cache_links import (
+from llmperf_tools.huggingface.cache_links import (
     MANIFEST_SCHEMA,
     CacheLinkError,
     audit_links,

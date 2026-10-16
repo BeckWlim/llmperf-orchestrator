@@ -21,7 +21,7 @@ models without remote discovery. Use `--json` for the stable projection. Use
 `provider models --refresh` only when remote refresh is necessary and authorized. Catalog
 visibility does not prove inference access; a 1x1 smoke does.
 
-## Provider document (preferred)
+## Provider document
 
 Store all profiles in one `~/.config/llmperf/providers.yaml` or `providers.json` file:
 
@@ -31,7 +31,7 @@ providers:
   acme:
     adapter: openai
     base_url: https://api.example.com/v1
-    api_key_env: LLMPERF_PROVIDER_ACME_KEY
+    api_key_env: ACME_API_KEY
     models: [model-a, model-b]
     discovery:
       mode: static
@@ -52,50 +52,28 @@ Fix the configuration and reload. Failed reloads preserve the active profiles.
 `LLMPERF_PROVIDERS_FILE` selects an explicit file. Relative paths resolve beside the Backend
 environment file. Otherwise one `providers.yaml`, `providers.yml`, or `providers.json` in
 that directory is discovered; multiple files require explicit selection. A selected file
-is authoritative, and legacy environment definition fields do not override it. Without a
-Provider file, legacy environment profiles remain supported. Use `llmperfctl provider reload`
+is authoritative. Environment-defined profiles have been removed; without a Provider file,
+Provider loading fails. Environment variables supply only explicitly referenced credentials. Use `llmperfctl provider reload`
 after edits or credential rotation; a failed reload preserves the active generation.
 
-## Legacy environment Profile
+## Definition rules and migration
 
-Environment keys use `LLMPERF_PROVIDER_<ID>_<FIELD>`. Uppercase underscores in ID normalize
-to lowercase hyphens.
+Use `adapter` to select `openai`, `anthropic`, `litellm`, `sagemaker`, or `vertexai`.
+It defaults to `openai` and is never inferred from the URL or model name. The Backend
+injects it into the frozen Runner; workload YAML contains only Provider and model IDs.
+The `anthropic` and `litellm` adapters require the `litellm` optional dependency;
+`sagemaker` requires its optional dependency.
 
-```bash
-llmperf-backend config set LLMPERF_PROVIDER_ACME_URL https://api.example.com/v1
-llmperf-backend config set LLMPERF_PROVIDER_ACME_ADAPTER openai
-printf '%s' "$ACME_API_KEY" | \
-  llmperf-backend config set LLMPERF_PROVIDER_ACME_KEY --stdin
-llmperf-backend config set LLMPERF_PROVIDER_ACME_DISCOVERY openai
-llmperf-backend config set LLMPERF_DEFAULT_PROVIDER acme
-llmperf-backend config list
-```
+URLs must be HTTP(S) without userinfo, query, or fragment. `discovery.mode` is `openai`,
+`static`, or `disabled`. Use `models: [model-a, model-b]` with `mode: static` when no
+compatible `/models` endpoint exists. Static models are an admission allow-list; unknown
+exact IDs fail with 422. `discovery.path` defaults to `/models` and
+`discovery.cache_ttl_seconds` accepts integers from 0 to 86400.
 
-URLs must be HTTP(S) without userinfo, query, or fragment. The default discovery path is
-`/models`. Checked-in workloads should select a Provider explicitly instead of depending on
-the Backend default.
-
-Supported adapters are `openai`, `anthropic`, `litellm`, `sagemaker`, and `vertexai`.
-The Profile exclusively owns adapter selection; workload YAML does not expose `llm_api`.
-`LLMPERF_PROVIDER_<ID>_ADAPTER` selects it explicitly and defaults to `openai` when
-omitted. Adapter selection is never inferred from URL or model name. At submission, the
-Backend resolves the workload's `provider` ID, injects canonical `adapter` into the frozen
-Runner benchmark, and the Worker selects the corresponding client. `DISCOVERY` is an
-independent catalog policy and does not select or change the request adapter. The
-`anthropic` and `litellm` adapters require the `litellm` optional dependency; `sagemaker`
-requires its optional dependency.
-
-Use a static catalog when no compatible `/models` endpoint exists:
-
-```bash
-llmperf-backend config set LLMPERF_PROVIDER_ACME_DISCOVERY static
-llmperf-backend config set LLMPERF_PROVIDER_ACME_MODELS model-a,model-b
-```
-
-`DISCOVERY` is `openai`, `static`, or `disabled`. Static models are an admission allow-list;
-unknown exact IDs fail with 422 and are never guessed. `PATH` overrides discovery path and
-`TTL` controls cache seconds from 0 to 86400. Install optional dependencies before using an
-optional adapter.
+Move all former `LLMPERF_PROVIDER_<ID>_*` profile fields into the Provider file before
+updating the Backend. See the migration table in [Usage](../../../../docs/usage.md#migrating-environment-defined-providers).
+An old key variable can remain when explicitly referenced by `api_key_env`; it never
+creates a profile by itself. Retain backend settings such as `LLMPERF_DEFAULT_PROVIDER`.
 
 ## Reload and Worker injection
 

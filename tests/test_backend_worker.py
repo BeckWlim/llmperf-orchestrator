@@ -7,20 +7,25 @@ from types import SimpleNamespace
 
 import pytest
 
-from llmperf import common_metrics
-from llmperf.common import RAY_ACTOR_CPUS_ENV, _ray_client_class, construct_clients
-import llmperf_backend.worker as worker_module
-from llmperf_backend.models import BenchmarkConfig, dump_model
-from llmperf_backend.persistence import (
+from llmperf.metrics import constants as common_metrics
+from llmperf.clients.factory import (
+    RAY_ACTOR_CPUS_ENV,
+    _ray_client_class,
+    construct_clients,
+)
+import llmperf_backend.runtime.worker as worker_module
+from llmperf_backend.configuration.models import BenchmarkConfig, dump_model
+from llmperf_backend.storage.repository import (
     FAILED,
     SUCCEEDED,
     BenchmarkRunnerRecord,
     _runner_list_dict,
     json_safe,
 )
-from llmperf_backend.worker import (
+import llmperf_backend.runtime.preparation as preparation_module
+from llmperf_backend.runtime.preparation import calculate
+from llmperf_backend.runtime.worker import (
     Worker,
-    _calculate,
     benchmark_actor_count,
     runtime_environment,
     summarize_outcome,
@@ -111,19 +116,19 @@ def test_finite_float():
 def test_shared_ray_options(monkeypatch, count_mode):
     received_options = {}
 
-    def calculate(**options):
+    def capture_options(**options):
         received_options.update(options)
         return {"ok": True}, []
 
-    fake_benchmark = SimpleNamespace(get_token_throughput_latencies=calculate)
+    fake_benchmark = SimpleNamespace(get_token_throughput_latencies=capture_options)
     import sys
 
-    monkeypatch.setitem(sys.modules, "llmperf.token_benchmark_ray", fake_benchmark)
+    monkeypatch.setitem(sys.modules, "llmperf.benchmark.throughput", fake_benchmark)
 
     benchmark = dump_model(BenchmarkConfig(provider="test", model="test"))
     benchmark["adapter"] = "openai"
     benchmark["output_token_count"] = count_mode
-    result = _calculate(
+    result = calculate(
         benchmark,
         {
             "backend": "ray",
@@ -177,14 +182,14 @@ def test_worker_environment():
 def test_worker_actor_count():
     benchmark = dump_model(BenchmarkConfig(provider="test", model="test"))
     benchmark["concurrent_requests"] = 8
-    benchmark["max_completed_requests"] = 3
+    benchmark["repeat"] = 3
     assert benchmark_actor_count(benchmark) == 3
     benchmark["cache_probe"] = {"trials": 2}
     assert benchmark_actor_count(benchmark) == 2
     assert benchmark_actor_count(benchmark, 8) == 1
     benchmark["cache_probe"] = None
     benchmark["concurrent_requests"] = 64
-    benchmark["max_completed_requests"] = 640
+    benchmark["repeat"] = 640
     assert benchmark_actor_count(benchmark, 8) == 8
     benchmark["concurrent_requests"] = 65
     assert benchmark_actor_count(benchmark, 8) == 9
@@ -236,7 +241,7 @@ def test_worker_task_failure(monkeypatch):
     def fail(benchmark, execution_runtime):
         raise RuntimeError("benchmark failed")
 
-    monkeypatch.setattr(worker_module, "_calculate", fail)
+    monkeypatch.setattr(preparation_module, "calculate", fail)
 
     result = worker_module.execute_worker_task({}, {"backend": "ray"}, 4096)
 

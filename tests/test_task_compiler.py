@@ -2,13 +2,13 @@ from itertools import count
 
 import pytest
 
-from llmperf_backend.app import _compile_campaign_task_preview
-from llmperf_backend.models import (
+from llmperf_backend.api.app import _compile_campaign_task_preview
+from llmperf_backend.configuration.models import (
     BenchmarkCampaignStart,
     CompiledBenchmarkConfig,
     TaskDefinitionCreate,
 )
-from llmperf_backend.task_compiler import (
+from llmperf_backend.compiler.tasks import (
     BaseNode,
     CompilationTable,
     ParallelNode,
@@ -57,8 +57,8 @@ def _definition():
                 "seed": 456,
             },
             "payloads": {
-                "replay": {"seed_namespace": "replay"},
-                "cold": {"seed_namespace": "cold"},
+                "replay": {"seed": "replay"},
+                "cold": {"seed": "cold"},
             },
             "workflow": [
                 {"invoke": {"name": "prime", "payload": "replay"}},
@@ -66,7 +66,7 @@ def _definition():
                     "repeat": {
                         "name": "warmups",
                         "count": "$warmup_count",
-                        "every_seconds": 3,
+                        "every": 3,
                         "node": {
                             "invoke": {
                                 "name": "warmup",
@@ -78,7 +78,7 @@ def _definition():
                 {
                     "parallel": {
                         "name": "observe",
-                        "after_seconds": "$quiet_seconds",
+                        "after": "$quiet_seconds",
                         "branches": [
                             {
                                 "invoke": {
@@ -185,6 +185,71 @@ def test_parallel_assembly():
     assert assemblies[0].nodes[-1].dispatch_id != assemblies[1].nodes[-1].dispatch_id
 
 
+def test_message_fanin_assembly():
+    definition = TaskDefinitionCreate.model_validate(
+        {
+            "name": "fanin",
+            "instances": {"trials": 2},
+            "payloads": {"p": {"seed": "p"}},
+            "workflow": [
+                {
+                    "parallel": {
+                        "name": "sources",
+                        "branches": [
+                            {"invoke": {"name": "left", "payload": "p"}},
+                            {"invoke": {"name": "right", "payload": "p"}},
+                            {"invoke": {"name": "gate", "payload": "p"}},
+                        ],
+                    }
+                },
+                {
+                    "invoke": {
+                        "name": "join",
+                        "payload": "p",
+                        "depends_on": [
+                            {"step": "sources.right", "reuse_messages": True},
+                            {"step": "sources.left", "reuse_messages": True},
+                            "sources.gate",
+                        ],
+                    }
+                },
+            ],
+            "runner": {},
+        }
+    )
+    context = TaskCompileContext(
+        definition_id="fanin",
+        definition_name=definition.name,
+        definition=definition.recipe(),
+        runner_template=_runner_template(),
+    )
+    table = TaskCompiler(context).compile()
+    assemblies = TaskAssembler(context, table).assemble()
+    assert len(assemblies) == 2
+    for instance in assemblies:
+        merged = instance.nodes[-1]
+        assert merged.dependencies == tuple(
+            node.dispatch_id for node in instance.nodes[:3]
+        )
+        task_context = merged.runner_template["benchmark"]["task_context"]
+        assert task_context["message_sources"] == ["sources.right", "sources.left"]
+        assert "conversation" not in task_context
+    assert assemblies[0].nodes[-1].dependencies != assemblies[1].nodes[-1].dependencies
+
+
+def test_invoke_template_shape():
+    template = _runner_template()
+    template["benchmark"]["repeat"] = 2
+    context = TaskCompileContext(
+        definition_id="invalid",
+        definition_name="invalid",
+        definition=_definition().recipe(),
+        runner_template=template,
+    )
+    with pytest.raises(ValueError, match="single Worker template"):
+        TaskCompiler(context).compile()
+
+
 def test_node_hierarchy():
     compiler = _compiler()
 
@@ -211,7 +276,7 @@ def test_grouped_preview():
 
 
 def test_model_ownership():
-    assert TaskDefinitionCreate.__module__ == "llmperf_backend.task_compiler"
+    assert TaskDefinitionCreate.__module__ == "llmperf_backend.compiler.tasks"
 
 
 def test_table_assembly():
@@ -289,7 +354,7 @@ def test_nested_sequence():
     definition = TaskDefinitionCreate.model_validate(
         {
             "name": "nested",
-            "payloads": {"replay": {"seed_namespace": "replay"}},
+            "payloads": {"replay": {"seed": "replay"}},
             "workflow": [
                 {
                     "parallel": {
@@ -344,32 +409,16 @@ def test_nested_sequence():
     )
 
 
-def test_legacy_normalization():
-    definition = TaskDefinitionCreate.model_validate(
-        {
-            "name": "legacy",
-            "payloads": {"replay": {"seed_namespace": "replay"}},
-            "sequence": [
-                {
-                    "kind": "invoke",
-                    "id": "prime",
-                    "role": "prime",
-                    "payload": "replay",
-                }
-            ],
-            "runner": {},
-        }
-    )
-    normalized_document = definition.model_dump(mode="json")
-
-    assert "workflow" in normalized_document
-    assert "sequence" not in normalized_document
-    assert normalized_document["instances"] == {
-        "matrix": {},
-        "trials": 1,
-        "seed": 11111,
-    }
-    assert normalized_document["workflow"][0]["invoke"]["name"] == "prime"
+def test_legacy_rejected():
+    with pytest.raises(ValueError, match="Extra inputs"):
+        TaskDefinitionCreate.model_validate(
+            {
+                "name": "legacy",
+                "runner": {},
+                "payloads": {"replay": {"seed": "replay"}},
+                "sequence": [{"kind": "invoke", "id": "prime", "payload": "replay"}],
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -383,7 +432,7 @@ def test_legacy_normalization():
 def test_flat_expansion_rejected(field, value):
     payload = {
         "name": "flat-expansion",
-        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "payloads": {"replay": {"seed": "replay"}},
         "workflow": [{"invoke": {"name": "probe", "payload": "replay"}}],
         "runner": {},
         field: value,
@@ -405,14 +454,14 @@ def test_preview_compilation_debug():
                         "trials": 2,
                         "seed": 7,
                     },
-                    "payloads": {"replay": {"seed_namespace": "replay"}},
+                    "payloads": {"replay": {"seed": "replay"}},
                     "workflow": [
                         {"invoke": {"name": "prime", "payload": "replay"}},
                         {
                             "invoke": {
                                 "name": "probe",
                                 "payload": "replay",
-                                "after_seconds": "$delay",
+                                "after": "$delay",
                             }
                         },
                     ],
@@ -443,13 +492,13 @@ def test_invalid_reference():
     payload = {
         "name": "invalid-reference",
         "instances": {"matrix": {"known": [1]}},
-        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "payloads": {"replay": {"seed": "replay"}},
         "workflow": [
             {
                 "invoke": {
                     "name": "probe",
                     "payload": "replay",
-                    "after_seconds": "$missing",
+                    "after": "$missing",
                 }
             }
         ],
@@ -463,7 +512,7 @@ def test_invalid_reference():
 def test_invalid_primitive():
     payload = {
         "name": "invalid-primitive",
-        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "payloads": {"replay": {"seed": "replay"}},
         "workflow": [
             {
                 "invoke": {"name": "probe", "payload": "replay"},
@@ -483,13 +532,13 @@ def test_invalid_primitive():
 def test_task_span_boundary():
     boundary_payload = {
         "name": "boundary",
-        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "payloads": {"replay": {"seed": "replay"}},
         "workflow": [
             {
                 "invoke": {
                     "name": "probe",
                     "payload": "replay",
-                    "after_seconds": 86_400,
+                    "after": 86_400,
                 }
             }
         ],
@@ -499,19 +548,19 @@ def test_task_span_boundary():
     definition = TaskDefinitionCreate.model_validate(boundary_payload)
 
     assert definition.workflow[0].invoke is not None
-    assert definition.workflow[0].invoke.after_seconds == 86_400
+    assert definition.workflow[0].invoke.after.resolve({}) == 86_400
 
 
 def test_task_span_limit():
     excessive_payload = {
         "name": "too-long",
-        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "payloads": {"replay": {"seed": "replay"}},
         "workflow": [
             {
                 "invoke": {
                     "name": "probe",
                     "payload": "replay",
-                    "after_seconds": 86_401,
+                    "after": 86_401,
                 }
             }
         ],

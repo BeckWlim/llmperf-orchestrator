@@ -9,23 +9,39 @@ import threading
 import pytest
 from typing import Any, Dict, Optional, Sequence, Tuple
 
-from llmperf import common_metrics
-from llmperf.utils import TOKENIZER_FAST, TOKENIZER_PATH
-import llmperf_backend.scheduler as scheduler_module
-from llmperf_backend.models import DatabaseConfig, SchedulerConfig
-from llmperf_backend.outbound import RAY_GRPC_ENABLE_HTTP_PROXY
-from llmperf_backend.providers import ProviderRegistry
-from llmperf_backend.scheduler import (
+from llmperf.metrics import constants as common_metrics
+from llmperf.datasets.tokenizer import TOKENIZER_FAST, TOKENIZER_PATH
+import llmperf_backend.runtime.scheduler as scheduler_module
+from llmperf_backend.configuration.models import DatabaseConfig, SchedulerConfig
+from llmperf_backend.artifacts.outbound import RAY_GRPC_ENABLE_HTTP_PROXY
+from llmperf_backend.providers.registry import ProviderRegistry
+from llmperf_backend.providers.files import ProviderFileProfile
+from llmperf_backend.runtime.scheduler import (
     Scheduler,
     WORKER_RAY_ACTOR_CPUS,
 )
-from llmperf_backend.artifacts import DatasetResolution
-from llmperf_backend.artifacts import TokenizerResolution
-from llmperf_backend.worker import Worker, WORKER_DATASET_PATH
+from llmperf_backend.artifacts.resolver import DatasetResolution
+from llmperf_backend.artifacts.resolver import TokenizerResolution
+from llmperf_backend.runtime.worker import Worker, WORKER_DATASET_PATH
 
 
 class UnusedRepository:
     """Complete Scheduler repository stub that rejects unexpected persistence calls."""
+
+    async def reserve_worker(self, runner_id, step, window) -> bool:
+        raise AssertionError("reserve_worker is not expected")
+
+    async def commit_worker(self, runner_id, result) -> bool:
+        raise AssertionError("commit_worker is not expected")
+
+    async def publish_message(self, message) -> bool:
+        raise AssertionError("publish_message is not expected")
+
+    async def pending_messages(self, runner_id, destination, consumer, limit):
+        raise AssertionError("pending_messages is not expected")
+
+    async def acknowledge_message(self, runner_id, message_id, consumer) -> None:
+        raise AssertionError("acknowledge_message is not expected")
 
     async def runtime_snapshot(self, runner_id: Optional[str] = None) -> Dict[str, Any]:
         raise AssertionError("runtime_snapshot is not expected")
@@ -124,13 +140,17 @@ def test_worker_status(tmp_path: Path):
         UnusedRepository(),
         SchedulerConfig(),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
-        ProviderRegistry.from_environment(
-            {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
+        ProviderRegistry(
+            [
+                ProviderFileProfile(base_url="http://127.0.0.1:8001/v1").resolve(
+                    "test", {}
+                )
+            ]
         ),
     )
 
     assert scheduler.status()["status"] == "stopped"
-    assert scheduler.status()["worker_kind"] == "ray_task"
+    assert scheduler.status()["worker_kind"] == "atomic_requests"
     assert scheduler.status()["active_workers"] == 0
     assert scheduler.status()["busy_slots"] == 0
     assert scheduler.status()["live_slots"] == 0
@@ -144,8 +164,12 @@ def test_tokenizer_injection(tmp_path: Path):
         UnusedRepository(),
         SchedulerConfig(),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
-        ProviderRegistry.from_environment(
-            {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
+        ProviderRegistry(
+            [
+                ProviderFileProfile(base_url="http://127.0.0.1:8001/v1").resolve(
+                    "test", {}
+                )
+            ]
         ),
         cache,
     )
@@ -177,8 +201,12 @@ def test_dataset_injection(tmp_path: Path):
         UnusedRepository(),
         SchedulerConfig(),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
-        ProviderRegistry.from_environment(
-            {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
+        ProviderRegistry(
+            [
+                ProviderFileProfile(base_url="http://127.0.0.1:8001/v1").resolve(
+                    "test", {}
+                )
+            ]
         ),
         dataset_cache=cache,
     )
@@ -211,8 +239,12 @@ def test_actor_environment(tmp_path: Path):
             ray_actor_max_concurrency=8,
         ),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
-        ProviderRegistry.from_environment(
-            {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
+        ProviderRegistry(
+            [
+                ProviderFileProfile(base_url="http://127.0.0.1:8001/v1").resolve(
+                    "test", {}
+                )
+            ]
         ),
     )
     runner = {
@@ -261,8 +293,12 @@ def test_embedded_ray(tmp_path: Path, monkeypatch):
         UnusedRepository(),
         SchedulerConfig(),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
-        ProviderRegistry.from_environment(
-            {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
+        ProviderRegistry(
+            [
+                ProviderFileProfile(base_url="http://127.0.0.1:8001/v1").resolve(
+                    "test", {}
+                )
+            ]
         ),
     )
 
@@ -287,7 +323,7 @@ def test_embedded_ray(tmp_path: Path, monkeypatch):
     assert calls["init"]["num_cpus"] == 8
     assert calls["init"]["object_store_memory"] == 268_435_456
     assert status["ray_mode"] == "embedded"
-    assert status["worker_kind"] == "ray_task"
+    assert status["worker_kind"] == "atomic_requests"
     assert status["ray_runtime"]["status"] == "healthy"
     assert status["ray_runtime"]["object_store_available_ratio"] == 1.0
     assert status["ray_runtime"]["claim_blocked"] is False
@@ -363,8 +399,8 @@ def _execution_runner():
             "provider": "test",
             "model": "test-model",
             "adapter": "openai",
-            "timeout_seconds": 10,
-            "max_completed_requests": 1,
+            "timeout": 10,
+            "repeat": 1,
             "concurrent_requests": 1,
             "mean_input_tokens": 10,
             "stddev_input_tokens": 0,
@@ -424,8 +460,12 @@ def test_worker_execution(tmp_path: Path, monkeypatch, batch):
         repository,
         SchedulerConfig(poll_interval_seconds=0.001),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
-        ProviderRegistry.from_environment(
-            {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
+        ProviderRegistry(
+            [
+                ProviderFileProfile(base_url="http://127.0.0.1:8001/v1").resolve(
+                    "test", {}
+                )
+            ]
         ),
     )
     scheduler._ray_module = object()
@@ -471,8 +511,12 @@ def test_async_worker_wait():
         repository,
         SchedulerConfig(poll_interval_seconds=0.001),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
-        ProviderRegistry.from_environment(
-            {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
+        ProviderRegistry(
+            [
+                ProviderFileProfile(base_url="http://127.0.0.1:8001/v1").resolve(
+                    "test", {}
+                )
+            ]
         ),
     )
     worker = Worker(SimpleNamespace(get=get_result), object(), "runner-1", 1, 1.0)
@@ -501,8 +545,12 @@ def test_preworker_cancel(tmp_path: Path, monkeypatch):
             artifact_resolution_timeout_seconds=1,
         ),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
-        ProviderRegistry.from_environment(
-            {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
+        ProviderRegistry(
+            [
+                ProviderFileProfile(base_url="http://127.0.0.1:8001/v1").resolve(
+                    "test", {}
+                )
+            ]
         ),
     )
 
@@ -531,8 +579,12 @@ def test_artifact_timeout(tmp_path: Path, monkeypatch):
             artifact_resolution_timeout_seconds=0.002,
         ),
         DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
-        ProviderRegistry.from_environment(
-            {"LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"}
+        ProviderRegistry(
+            [
+                ProviderFileProfile(base_url="http://127.0.0.1:8001/v1").resolve(
+                    "test", {}
+                )
+            ]
         ),
     )
 

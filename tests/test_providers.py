@@ -3,24 +3,38 @@ import json
 
 import pytest
 
-from llmperf_backend.providers import (
+from llmperf_backend.providers.registry import (
     ProviderConfigError,
     ProviderModelDiscovery,
     ProviderRegistry,
 )
-from llmperf_backend.config import load_provider_profiles
-from llmperf_backend.provider_files import load_provider_file
+from llmperf_backend.configuration.loader import load_provider_profiles
+from llmperf_backend.providers.files import load_provider_file
 
-PROVIDER_ENVIRONMENT = {
-    "LLMPERF_PROVIDER_DEEPSEEK_URL": "https://models.example/v1",
-    "LLMPERF_PROVIDER_DEEPSEEK_KEY": "deepseek-secret",
-    "LLMPERF_PROVIDER_GLM_URL": "https://glm.example/v1",
-    "LLMPERF_PROVIDER_GLM_KEY": "glm-secret",
-    "LLMPERF_PROVIDER_CATALOG_MODELS": "static-b,static-a",
-    "LLMPERF_PROVIDER_ANTHROPIC_ADAPTER": "anthropic",
-    "LLMPERF_PROVIDER_ANTHROPIC_KEY": "anthropic-secret",
-    "LLMPERF_PROVIDER_ANTHROPIC_MODELS": "claude-test",
+PROVIDER_PROFILES = {
+    "deepseek": {
+        "base_url": "https://models.example/v1",
+        "api_key_env": "DEEPSEEK_KEY",
+    },
+    "glm": {"base_url": "https://glm.example/v1", "api_key_env": "GLM_KEY"},
+    "catalog": {"models": ["static-b", "static-a"]},
+    "anthropic": {
+        "adapter": "anthropic",
+        "api_key_env": "ANTHROPIC_KEY",
+        "models": ["claude-test"],
+    },
 }
+PROVIDER_CREDENTIALS = {
+    "DEEPSEEK_KEY": "deepseek-secret",
+    "GLM_KEY": "glm-secret",
+    "ANTHROPIC_KEY": "anthropic-secret",
+}
+
+
+def provider_registry(tmp_path):
+    path = tmp_path / "providers.json"
+    path.write_text(json.dumps({"version": "1.0.0", "providers": PROVIDER_PROFILES}))
+    return ProviderRegistry(load_provider_file(path, PROVIDER_CREDENTIALS))
 
 
 @pytest.mark.parametrize("suffix", ["yaml", "yml", "json"])
@@ -145,7 +159,7 @@ def test_loader_failure(caplog):
 
 @pytest.mark.parametrize("key", ["inline-secret", "", "   "])
 def test_inline_credentials(tmp_path, key):
-    from llmperf_backend.provider_files import ProviderFileProfile
+    from llmperf_backend.providers.files import ProviderFileProfile
 
     path = tmp_path / "providers.json"
     path.write_text(
@@ -202,43 +216,15 @@ def test_shared_provider_parser(tmp_path):
             }
         )
     )
-    legacy = ProviderRegistry.from_environment(
-        {
-            "LLMPERF_PROVIDER_TEST_ADAPTER": " ANTHROPIC ",
-            "LLMPERF_PROVIDER_TEST_URL": "https://example.com/v1/",
-            "LLMPERF_PROVIDER_TEST_KEY": "  secret  ",
-            "LLMPERF_PROVIDER_TEST_MODELS": "a, b",
-            "LLMPERF_PROVIDER_TEST_DISCOVERY": " STATIC ",
-            "LLMPERF_PROVIDER_TEST_PATH": "catalog",
-            "LLMPERF_PROVIDER_TEST_TTL": "42",
-            "LLMPERF_PROVIDER_TEST_URLVAR": "CUSTOM_URL",
-            "LLMPERF_PROVIDER_TEST_KEYVAR": "CUSTOM_KEY",
-        }
-    )
-    assert legacy.require("test") == load_provider_file(path, {})[0]
-
-
-@pytest.mark.parametrize(
-    "field, value",
-    [
-        ("ADAPTER", "invalid"),
-        ("DISCOVERY", "invalid"),
-        ("TTL", "-1"),
-        ("TTL", "86401"),
-        ("TTL", "secret-literal"),
-        ("URLVAR", ""),
-        ("KEYVAR", ""),
-    ],
-)
-def test_invalid_legacy_fields(field, value):
-    with pytest.raises(ProviderConfigError) as failure:
-        ProviderRegistry.from_environment(
-            {
-                "LLMPERF_PROVIDER_TEST_MODELS": "a",
-                f"LLMPERF_PROVIDER_TEST_{field}": value,
-            }
-        )
-    assert "secret-literal" not in str(failure.value)
+    profile = load_provider_file(path, {})[0]
+    assert profile.adapter == "anthropic"
+    assert profile.api_base == "https://example.com/v1"
+    assert profile.api_key == "secret"
+    assert profile.static_models == ("a", "b")
+    assert profile.models_path == "/catalog"
+    assert profile.model_cache_ttl_seconds == 42
+    assert profile.api_base_env == "CUSTOM_URL"
+    assert profile.api_key_env == "CUSTOM_KEY"
 
 
 def test_file_reload(tmp_path):
@@ -288,10 +274,8 @@ def test_file_reload(tmp_path):
 def test_provider_file_selection(tmp_path):
     environment_path = tmp_path / "backend.env"
     environment_path.write_text("LLMPERF_PROVIDER_LEGACY_MODELS=a\n")
-    assert (
-        load_provider_profiles(environment_path, process_environment={})[0].provider_id
-        == "legacy"
-    )
+    with pytest.raises(ProviderConfigError, match="No Provider file found"):
+        load_provider_profiles(environment_path, process_environment={})
     provider_path = tmp_path / "providers.yaml"
     provider_path.write_text('version: "1.0.0"\nproviders: {new: {models: [a]}}')
     assert (
@@ -313,8 +297,8 @@ def test_provider_file_selection(tmp_path):
         )
 
 
-def test_public_profile():
-    registry = ProviderRegistry.from_environment(PROVIDER_ENVIRONMENT)
+def test_public_profile(tmp_path):
+    registry = provider_registry(tmp_path)
 
     profiles = {item["id"]: item for item in registry.list_public()}
     assert set(profiles) == {"anthropic", "catalog", "deepseek", "glm"}
@@ -348,10 +332,12 @@ def test_public_profile():
         registry.resolve_benchmark({"provider": "catalog", "model": "static-c"})
 
 
-def test_model_preview():
-    registry = ProviderRegistry.from_environment(
-        {"LLMPERF_PROVIDER_TEST_MODELS": "model-d,model-c,model-b,model-a"}
+def test_model_preview(tmp_path):
+    path = tmp_path / "providers.yaml"
+    path.write_text(
+        'version: "1.0.0"\nproviders: {test: {models: [model-d, model-c, model-b, model-a]}}'
     )
+    registry = ProviderRegistry(load_provider_file(path, {}))
 
     profile = registry.list_public()[0]
 
@@ -359,10 +345,13 @@ def test_model_preview():
     assert profile["model_discovery"]["static_model_count"] == 4
 
 
-def test_worker_credentials():
-    registry = ProviderRegistry.from_environment(PROVIDER_ENVIRONMENT)
-    base_environment = dict(PROVIDER_ENVIRONMENT)
+def test_worker_credentials(tmp_path):
+    registry = provider_registry(tmp_path)
+    base_environment = dict(PROVIDER_CREDENTIALS)
     base_environment["UNRELATED"] = "retained"
+    base_environment["LLMPERF_PROVIDER_OBSOLETE_KEY"] = "obsolete-secret"
+    base_environment["LLMPERF_AUTH_KEY"] = "control-secret"
+    base_environment["DATABASE_URL"] = "database-secret"
 
     environment = registry.worker_environment("glm", base_environment)
 
@@ -372,28 +361,42 @@ def test_worker_credentials():
     assert not any(name.startswith("LLMPERF_PROVIDER_") for name in environment)
     assert "deepseek-secret" not in environment.values()
     assert "anthropic-secret" not in environment.values()
+    assert "obsolete-secret" not in environment.values()
+    assert "control-secret" not in environment.values()
+    assert "database-secret" not in environment.values()
 
 
 @pytest.mark.parametrize(
-    "environment",
+    "settings",
     [
-        {"LLMPERF_PROVIDER_BAD_URL": "https://models.example/v1?key=x"},
-        {"LLMPERF_PROVIDER_BAD_KEYVAR": "INVALID-NAME"},
+        {},
+        {
+            "LLMPERF_PROVIDER_TEST_URL": "https://models.example/v1",
+            "LLMPERF_PROVIDER_TEST_KEY": "private-secret",
+        },
     ],
 )
-def test_unsafe_routing(environment):
-    with pytest.raises(ProviderConfigError):
-        ProviderRegistry.from_environment(environment)
-
-
-def test_unknown_provider_fields():
-    with pytest.raises(ProviderConfigError, match="At least one provider"):
-        ProviderRegistry.from_environment(
-            {
-                "LLMPERF_PROVIDER_DEEPSEEK_APIBASE": "https://models.example/v1",
-                "LLMPERF_PROVIDER_DEEPSEEK_APIKEY": "old-secret",
-            }
-        )
+def test_no_environment_profiles(tmp_path, settings, caplog):
+    environment_path = tmp_path / "backend.env"
+    environment_path.write_text(
+        "".join(f"{name}={value}\n" for name, value in settings.items())
+    )
+    for process_values in ({}, settings):
+        with pytest.raises(ProviderConfigError, match="Environment-defined") as failure:
+            load_provider_profiles(environment_path, process_environment=process_values)
+        assert "private-secret" not in str(failure.value)
+    registry = ProviderRegistry.from_loader(
+        lambda: load_provider_profiles(environment_path, process_environment={})
+    )
+    assert registry.list_public() == []
+    assert registry.public_document()["configuration_error"]
+    assert "private-secret" not in caplog.text
+    (tmp_path / "providers.yaml").write_text(
+        'version: "1.0.0"\nproviders: {test: {models: [model]}}'
+    )
+    registry.reload()
+    assert registry.require("test").api_key == ""
+    assert registry.public_document()["configuration_error"] is None
 
 
 class _FakeResponse:
@@ -409,8 +412,8 @@ class _FakeResponse:
         )
 
 
-def test_remote_discovery(monkeypatch):
-    registry = ProviderRegistry.from_environment(PROVIDER_ENVIRONMENT)
+def test_remote_discovery(monkeypatch, tmp_path):
+    registry = provider_registry(tmp_path)
     requests = []
 
     def fake_urlopen(request, timeout):
@@ -418,7 +421,7 @@ def test_remote_discovery(monkeypatch):
         assert timeout == 10.0
         return _FakeResponse()
 
-    monkeypatch.setattr("llmperf_backend.providers.urlopen", fake_urlopen)
+    monkeypatch.setattr("llmperf_backend.providers.registry.urlopen", fake_urlopen)
     discovery = ProviderModelDiscovery(registry)
 
     models = discovery._fetch_openai_models(registry.require("deepseek"))
@@ -429,8 +432,8 @@ def test_remote_discovery(monkeypatch):
     assert requests[0].get_header("Authorization") == "Bearer deepseek-secret"
 
 
-def test_static_discovery():
-    registry = ProviderRegistry.from_environment(PROVIDER_ENVIRONMENT)
+def test_static_discovery(tmp_path):
+    registry = provider_registry(tmp_path)
     discovery = ProviderModelDiscovery(registry)
 
     first = asyncio.run(discovery.models("catalog"))
@@ -441,52 +444,41 @@ def test_static_discovery():
     assert second["cached"] is True
 
 
-def test_atomic_reload():
+def test_atomic_reload(tmp_path):
+    path = tmp_path / "providers.json"
     active = {
-        "LLMPERF_PROVIDER_TEST_URL": "https://old.example/v1",
-        "LLMPERF_PROVIDER_TEST_KEY": "old-secret",
-        "LLMPERF_PROVIDER_TEST_KEYVAR": "TEST_PROVIDER_KEY",
-    }
-    registry = ProviderRegistry.from_environment(
-        active, reload_loader=lambda: dict(active)
-    )
-
-    active.update(
-        {
-            "LLMPERF_PROVIDER_TEST_URL": "https://new.example/v1",
-            "LLMPERF_PROVIDER_TEST_KEY": "new-secret",
-            "LLMPERF_PROVIDER_EXTRA_MODELS": "model-b,model-a",
+        "test": {
+            "base_url": "https://old.example/v1",
+            "api_key": "old-secret",
+            "worker_api_key_env": "TEST_PROVIDER_KEY",
         }
-    )
-    result = registry.reload()
-
-    assert result["generation"] == 1
-    assert result["changes"] == {
-        "added": ["extra"],
-        "updated": ["test"],
-        "removed": [],
     }
+    path.write_text(json.dumps({"version": "1.0.0", "providers": active}))
+    registry = ProviderRegistry.from_loader(lambda: load_provider_file(path, {}))
+    active["test"]["base_url"] = "https://new.example/v1"
+    active["test"]["api_key"] = "new-secret"
+    updated = {**active, "extra": {"models": ["model-b", "model-a"]}}
+    path.write_text(json.dumps({"version": "1.0.0", "providers": updated}))
+    result = registry.reload()
+    assert result["generation"] == 1
+    assert result["changes"] == {"added": ["extra"], "updated": ["test"], "removed": []}
     assert "new-secret" not in json.dumps(result)
     environment = registry.worker_environment("test", {})
     assert environment["OPENAI_API_BASE"] == "https://new.example/v1"
     assert environment["TEST_PROVIDER_KEY"] == "new-secret"
-
-    active["LLMPERF_PROVIDER_TEST_URL"] = "not-a-url"
+    active["test"]["base_url"] = "not-a-url"
+    path.write_text(json.dumps({"version": "1.0.0", "providers": active}))
     with pytest.raises(ProviderConfigError):
         registry.reload()
     assert registry.generation == 1
     assert registry.require("test").api_base == "https://new.example/v1"
-
-    for name in (
-        "LLMPERF_PROVIDER_TEST_URL",
-        "LLMPERF_PROVIDER_TEST_KEY",
-        "LLMPERF_PROVIDER_TEST_KEYVAR",
-    ):
-        active.pop(name, None)
+    path.write_text(
+        json.dumps({"version": "1.0.0", "providers": {"extra": updated["extra"]}})
+    )
     removed = registry.reload()
     assert removed["changes"]["removed"] == ["test"]
-    environment = registry.worker_environment(
+    remaining_environment = registry.worker_environment(
         "extra", {"TEST_PROVIDER_KEY": "must-not-leak", "KEEP": "yes"}
     )
-    assert "TEST_PROVIDER_KEY" not in environment
-    assert environment["KEEP"] == "yes"
+    assert "TEST_PROVIDER_KEY" not in remaining_environment
+    assert remaining_environment["KEEP"] == "yes"

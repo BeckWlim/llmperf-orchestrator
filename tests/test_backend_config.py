@@ -4,19 +4,19 @@ import os
 import pytest
 
 from llmperf import __version__ as runtime_version
-from llmperf.user_config import backend_environment_path
-from llmperf.utils import RESULTS_VERSION
+from llmperf.configuration.environment import backend_environment_path
+from llmperf.metrics.results import RESULTS_VERSION
 from llmperf.version import PROTOCOL_VERSION, RELEASE_VERSION, TASK_FORMAT_VERSION
 from llmperf_cli import __version__ as cli_version
 
-from llmperf_backend.config import (
+from llmperf_backend.configuration.loader import (
     ConfigError,
     ConfigStore,
     load_config,
     load_config_text,
 )
-from llmperf_backend.config import load_environment
-from llmperf_backend.models import (
+from llmperf_backend.configuration.loader import load_environment
+from llmperf_backend.configuration.models import (
     AppConfig,
     BenchmarkConfig,
     BenchmarkCampaignStart,
@@ -46,7 +46,7 @@ def test_defaults():
     assert config.environment == "test"
     assert config.server.port == 9000
     assert config.benchmark.concurrent_requests == 2
-    assert config.benchmark.timeout_seconds == 90
+    assert config.benchmark.timeout.seconds == 90
     assert config.planner.enabled is True
     assert config.planner.batch_size == 20
     assert config.scheduler.ray_num_cpus == 8
@@ -239,7 +239,7 @@ def test_campaign_workload():
                     "name": "every-30s",
                     "timezone": "Asia/Shanghai",
                     "max_occurrences": 8,
-                    "recurrence": {"kind": "interval", "every_seconds": 30},
+                    "recurrence": {"kind": "interval", "every": 30},
                     "runner": {},
                 }
             ],
@@ -259,44 +259,35 @@ def test_campaign_workload():
                         "trials": 2,
                     },
                     "payloads": {
-                        "replay": {"seed_namespace": "replay"},
-                        "cold": {"seed_namespace": "cold"},
+                        "replay": {"seed": "replay"},
+                        "cold": {"seed": "cold"},
                     },
-                    "sequence": [
+                    "workflow": [
+                        {"invoke": {"name": "prime", "payload": "replay"}},
                         {
-                            "kind": "invoke",
-                            "id": "prime",
-                            "role": "prime",
-                            "payload": "replay",
+                            "repeat": {
+                                "name": "hits",
+                                "count": "$hits",
+                                "node": {
+                                    "invoke": {"name": "warm", "payload": "replay"}
+                                },
+                            }
                         },
                         {
-                            "kind": "repeat",
-                            "id": "hits",
-                            "count": {"dimension": "hits"},
-                            "invoke": {
-                                "kind": "invoke",
-                                "id": "warm",
-                                "role": "warm",
-                                "payload": "replay",
-                            },
-                        },
-                        {
-                            "kind": "parallel",
-                            "after_seconds": {"dimension": "delay"},
-                            "invokes": [
-                                {
-                                    "kind": "invoke",
-                                    "id": "probe",
-                                    "role": "probe",
-                                    "payload": "replay",
-                                },
-                                {
-                                    "kind": "invoke",
-                                    "id": "cold",
-                                    "role": "cold_control",
-                                    "payload": "cold",
-                                },
-                            ],
+                            "parallel": {
+                                "name": "observation",
+                                "after": "$delay",
+                                "branches": [
+                                    {"invoke": {"name": "probe", "payload": "replay"}},
+                                    {
+                                        "invoke": {
+                                            "name": "cold",
+                                            "role": "cold_control",
+                                            "payload": "cold",
+                                        }
+                                    },
+                                ],
+                            }
                         },
                     ],
                     "runner": {},
@@ -315,13 +306,14 @@ def test_campaign_workload():
                 "task_definitions": [
                     {
                         "name": "bad",
-                        "payloads": {"known": {"seed_namespace": "known"}},
-                        "sequence": [
+                        "payloads": {"known": {"seed": "known"}},
+                        "workflow": [
                             {
-                                "kind": "invoke",
-                                "id": "node",
-                                "role": "warm",
-                                "payload": "missing",
+                                "invoke": {
+                                    "name": "node",
+                                    "role": "warm",
+                                    "payload": "missing",
+                                }
                             }
                         ],
                         "runner": {},

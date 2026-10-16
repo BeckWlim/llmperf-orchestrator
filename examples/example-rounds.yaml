@@ -1,21 +1,24 @@
-# Two rounds with two concurrent Runner templates. Increase count for soak tests.
-version: "1.0.0"
+version: 1.0.0
 campaign:
   name: parallel-rounds
-  rounds: {count: 2, seed: 20261014}
+  rounds:
+    count: 2
+    seed: 20261014
 wait: true
 runners:
-  - label: family-a
-    benchmark: &request
-      provider: default
-      model: meta-llama/Llama-2-7b-chat-hf
-      timeout_seconds: 30
-      max_completed_requests: 2
-      concurrent_requests: 2
-      mean_input_tokens: 256
-      stddev_input_tokens: 0
+- label: family-a
+  provider: default
+  model: meta-llama/Llama-2-7b-chat-hf
+  timeout: 30
+  concurrent_requests: 2
+  mean_output_tokens: 8
+  stddev_output_tokens: 0
+  inputs:
+    default:
       shared_prefix_tokens: 200
-      mean_output_tokens: 8
-      stddev_output_tokens: 0
-  - label: family-b
-    benchmark: *request
+      tokens: 256
+  request:
+    repeat: 2
+- label: family-b
+  request:
+    repeat: 2

@@ -4,18 +4,18 @@ import asyncio
 
 import pytest
 
-from llmperf import common_metrics
-from llmperf import token_benchmark_ray as benchmark_module
-from llmperf.prompt_datasets import PromptDatasetSource
-from llmperf_backend.models import (
+from llmperf.metrics import constants as common_metrics
+from llmperf.benchmark import throughput as benchmark_module
+from llmperf.datasets.prompts import PromptDatasetSource
+from llmperf_backend.configuration.models import (
     BatchBenchmarkConfig,
     DatabaseConfig,
     PerformanceGuardConfig,
 )
-from llmperf_backend.safety import assess_workload
-from llmperf_backend.persistence import Base, Database, RunnerRepository
-from llmperf_backend.runtime import RuntimeCoordinator
-from llmperf_backend.task_compiler import (
+from llmperf_backend.compiler.safety import assess_workload
+from llmperf_backend.storage.repository import Base, Database, RunnerRepository
+from llmperf_backend.runtime.coordinator import RuntimeCoordinator
+from llmperf_backend.compiler.tasks import (
     TaskAssembler,
     TaskCompileContext,
     TaskCompiler,
@@ -59,7 +59,7 @@ def batch_template():
                 "selection": "explicit",
                 "accuracy": "compatible",
             },
-            "max_completed_requests": 256,
+            "repeat": 256,
             "concurrent_requests": 8,
             "mean_input_tokens": 32768,
             "stddev_input_tokens": 0,
@@ -92,7 +92,7 @@ def test_batch_compilation():
             benchmark = BatchBenchmarkConfig.model_validate(
                 node.runner_template["benchmark"]
             )
-            assert benchmark.max_completed_requests == 256
+            assert benchmark.repeat == 256
             assert benchmark.concurrent_requests == 8
             assert benchmark.shared_prefix_tokens == 26214
             assert benchmark.dataset_seed == benchmark.task_context.dataset_seed

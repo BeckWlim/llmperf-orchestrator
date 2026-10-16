@@ -1,4 +1,4 @@
-from llmperf.task_analysis import build_task_analyses
+from llmperf.metrics.results import build_task_analyses
 
 
 def test_generic_task_join():

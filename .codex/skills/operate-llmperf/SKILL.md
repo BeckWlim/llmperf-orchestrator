@@ -32,8 +32,8 @@ Apply these invariants:
    ordinary queued Runners; it never occupies a Scheduler slot while waiting.
 3. The runtime coordinator owns dependencies and due times and feeds a fair in-memory
    ready queue. Scheduler owns Worker handles, bounded admission, and the shared Ray pool.
-4. Scheduler is the only Ray driver. Atomic invokes use lightweight Backend handles;
-   ordinary batch Runners use retry-free Ray tasks. All share the request actor pool.
+4. Scheduler is the only Ray driver. Each Runner owns preparation and an async listener;
+   it submits one-request Workers through bounded Scheduler admission. All share the request actor pool.
    `scheduler.ray_actor_max_concurrency` defaults to `8`; eight actors give 64 request slots.
    Actors isolate per-request credentials and messages. Never mutate process environment
    to switch Providers or connect PostgreSQL inside a Worker task or actor.
@@ -43,12 +43,18 @@ Apply these invariants:
    the stable provider ID and model ID in workload YAML.
 7. Each compiled invoke sends one request and completes independently. A compiled `run`
    dispatches a multi-request Runner and advances after its aggregate success commits.
-   Batch nodes retain their request limits and use ordinary batch Workers. Parallel invokes
+   Batch nodes expand `request.repeat` and `request.steps` into atomic Workers. Parallel invokes
    share actor capacity dynamically instead of waiting for a static group. Role names are
-   metadata. Multi-turn successors require committed history. Readiness checks required tables and columns without a version marker. Older
+   metadata. `depends_on` requires committed success; `reuse_messages` optionally combines
+   source message lists in declaration order. Runner cancels unsubmitted descendants of a
+   failed or cancelled Worker. Readiness checks required tables and columns without a version marker. Older
    layouts need explicit migration or a fresh database; do not replay interrupted work.
 8. Distinguish Campaign lifecycle `status` from aggregate execution `outcome`.
    Never infer that `completed` means every Runner succeeded.
+9. The Runner message bus persists outputs and timer events. The reconciliation notifier
+   only carries disposable wakeup hints. An omitted `concurrent_requests` leaves capacity
+   to Scheduler; an explicit value bounds outstanding Workers. Interrupted Runners are
+   indeterminate, not resumed automatically from mailbox receipts.
 
 ## Run the performance safety gate
 
@@ -163,8 +169,10 @@ Select the durable shape:
   call out the request budget before a materially larger multi-round or multi-delay run.
 - Never invent, display, log, or commit credentials. Have the user supply secrets through
   `llmperf-backend config set ... --stdin` or configure them manually.
-- Provider changes require a Backend restart. Do not restart an externally managed service
-  unless the user authorized it; state the exact remaining action instead.
+- Define Providers in the Backend-owned `providers.yaml`; environment-defined profiles
+  are not supported. Provider file edits and referenced credential rotation use
+  `llmperfctl provider reload`. Backend code updates and non-Provider configuration changes
+  require a restart. Do not restart an externally managed service unless authorized.
 - Do not infer inference support from `/models`; require a successful 1x1 smoke Runner.
 
 ## Diagnose from the first concrete failure

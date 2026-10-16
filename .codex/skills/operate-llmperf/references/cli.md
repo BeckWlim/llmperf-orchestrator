@@ -33,12 +33,12 @@ only when request distributions or outliers are needed.
 ## Campaign and task operations
 
 ```bash
-llmperfctl campaign preview -f examples/example-cache-promotion.yaml
-llmperfctl campaign preview -f examples/example-cache-promotion.yaml \
+llmperfctl campaign preview -f examples/example-cache.yaml
+llmperfctl campaign preview -f examples/example-cache.yaml \
   --limit 50 --node-limit 200 --debug
 llmperfctl campaign validate -f examples/example-campaign.yaml --artifact-timeout 3600
 llmperfctl campaign start -f examples/example-campaign.yaml
-llmperfctl campaign start -f examples/example-cache-promotion.yaml --wait
+llmperfctl campaign start -f examples/example-cache.yaml --wait
 llmperfctl campaign list
 llmperfctl campaign status CAMPAIGN_ID
 llmperfctl campaign cancel CAMPAIGN_ID

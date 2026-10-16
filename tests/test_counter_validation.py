@@ -2,10 +2,10 @@
 
 import pytest
 
-from llmperf import common_metrics
-from llmperf.cache_analysis import summarize_cache_counters
-from llmperf.token_benchmark_ray import metrics_summary
-from llmperf.usage import normalize_counter, normalize_usage
+from llmperf.metrics import constants as common_metrics
+from llmperf.metrics.cache import summarize_cache_counters
+from llmperf.benchmark.throughput import metrics_summary
+from llmperf.metrics.usage import normalize_counter, normalize_usage
 
 
 @pytest.mark.parametrize("counter", [float("nan"), float("inf"), float("-inf")])

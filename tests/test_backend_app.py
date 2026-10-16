@@ -1,4 +1,5 @@
 import asyncio
+import json
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from typing import Any, Optional
@@ -6,13 +7,14 @@ from typing import Any, Optional
 import httpx
 import pytest
 
-from llmperf_backend.app import create_app
-from llmperf_backend.config import ConfigStore
-from llmperf_backend.models import DatabaseConfig
-from llmperf_backend.persistence import Base, Database
-from llmperf_backend.providers import ProviderRegistry
-from llmperf_backend.artifacts import DatasetResolution
-from llmperf_backend.artifacts import TokenizerResolution
+from llmperf_backend.api.app import create_app
+from llmperf_backend.configuration.loader import ConfigStore
+from llmperf_backend.configuration.models import DatabaseConfig
+from llmperf_backend.storage.repository import Base, Database
+from llmperf_backend.providers.registry import ProviderRegistry
+from llmperf_backend.providers.files import load_provider_file
+from llmperf_backend.artifacts.resolver import DatasetResolution
+from llmperf_backend.artifacts.resolver import TokenizerResolution
 
 CONFIG = """
 version: "1.0.0"
@@ -129,7 +131,7 @@ def make_client(
     database_url: str,
     tokenizer_cache=None,
     dataset_cache=None,
-    provider_environment=None,
+    provider_path=None,
     auto_create_schema: bool = True,
     provider_registry=None,
 ) -> ASGITestClient:
@@ -141,12 +143,13 @@ def make_client(
         ),
         encoding="utf-8",
     )
-    effective_provider_environment = provider_environment or {
-        "LLMPERF_PROVIDER_TEST_URL": "http://127.0.0.1:8001/v1"
-    }
-    providers = ProviderRegistry.from_environment(
-        effective_provider_environment,
-        reload_loader=lambda: dict(effective_provider_environment),
+    selected_provider_path = provider_path or tmp_path / "test-providers.yaml"
+    if provider_path is None:
+        selected_provider_path.write_text(
+            'version: "1.0.0"\nproviders: {test: {base_url: "http://127.0.0.1:8001/v1"}}'
+        )
+    providers = ProviderRegistry.from_loader(
+        lambda: load_provider_file(selected_provider_path, {})
     )
     if tokenizer_cache is None:
         tokenizer_directory = tmp_path / "tokenizer"
@@ -189,13 +192,13 @@ def clean_postgres(postgresql_url):
 
 @pytest.fixture
 def client_factory(tmp_path: Path, postgresql_url):
-    def factory(tokenizer_cache=None, dataset_cache=None, provider_environment=None):
+    def factory(tokenizer_cache=None, dataset_cache=None, provider_path=None):
         return make_client(
             tmp_path,
             postgresql_url,
             tokenizer_cache=tokenizer_cache,
             dataset_cache=dataset_cache,
-            provider_environment=provider_environment,
+            provider_path=provider_path,
         )
 
     return factory
@@ -228,8 +231,6 @@ def test_existing_schema(tmp_path, postgresql_url):
 
 
 def test_provider_startup(tmp_path, postgresql_url):
-    from llmperf_backend.provider_files import load_provider_file
-
     provider_path = tmp_path / "providers.yaml"
     registry = ProviderRegistry.from_loader(
         lambda: load_provider_file(provider_path, {})
@@ -251,21 +252,25 @@ def test_provider_startup(tmp_path, postgresql_url):
         assert client.get("/health").json()["status"] == "ok"
 
 
-def test_provider_reload(client_factory):
-    provider_environment = {
-        "LLMPERF_PROVIDER_TEST_URL": "http://old.example/v1",
-        "LLMPERF_PROVIDER_TEST_KEY": "old-secret",
-        "LLMPERF_PROVIDER_TEST_DISCOVERY": "static",
-        "LLMPERF_PROVIDER_TEST_MODELS": "glm-5.2",
+def test_provider_reload(client_factory, tmp_path):
+    provider_path = tmp_path / "reload-providers.json"
+    profile = {
+        "base_url": "http://old.example/v1",
+        "api_key": "old-secret",
+        "discovery": {"mode": "static"},
+        "models": ["glm-5.2"],
     }
-    with client_factory(provider_environment=provider_environment) as client:
+    document = {"version": "1.0.0", "providers": {"test": profile}}
+    provider_path.write_text(json.dumps(document))
+    with client_factory(provider_path=provider_path) as client:
         listed = client.get("/api/v1/providers")
         assert listed.status_code == 200
         assert listed.json()["generation"] == 0
         assert listed.json()["items"][0]["base_url"] == "http://old.example/v1"
 
-        provider_environment["LLMPERF_PROVIDER_TEST_URL"] = "http://new.example/v1"
-        provider_environment["LLMPERF_PROVIDER_TEST_KEY"] = "new-secret"
+        profile["base_url"] = "http://new.example/v1"
+        profile["api_key"] = "new-secret"
+        provider_path.write_text(json.dumps(document))
         reloaded = client.post("/api/v1/providers/reload")
 
         assert reloaded.status_code == 200
@@ -279,13 +284,14 @@ def test_provider_reload(client_factory):
 
         invalid_runner = client.post(
             "/api/v1/runners",
-            json={"benchmark": {"provider": "test", "model": "glm5.2"}},
+            json={"request": {}, "provider": "test", "model": "glm5.2"},
         )
         assert invalid_runner.status_code == 422
         assert "configured models: glm-5.2" in invalid_runner.text
         assert client.get("/api/v1/runners").json()["items"] == []
 
-        provider_environment["LLMPERF_PROVIDER_TEST_URL"] = "invalid"
+        profile["base_url"] = "invalid"
+        provider_path.write_text(json.dumps(document))
         rejected = client.post("/api/v1/providers/reload")
         assert rejected.status_code == 422
         assert client.get("/api/v1/providers").json()["generation"] == 1
@@ -441,11 +447,9 @@ def test_atomic_campaign_start(client_factory):
                 "campaign": {"name": "invalid-study"},
                 "runners": [
                     {
-                        "benchmark": {
-                            "provider": "test",
-                            "model": "test-model",
-                            "unknown_field": True,
-                        }
+                        "request": {"unknown_field": True},
+                        "provider": "test",
+                        "model": "test-model",
                     }
                 ],
             },
@@ -485,7 +489,7 @@ def test_atomic_campaign_start(client_factory):
                         "max_occurrences": 8,
                         "recurrence": {
                             "kind": "interval",
-                            "every_seconds": 30,
+                            "every": 30,
                         },
                         "overlap_policy": "queue",
                         "runner": {"label": "periodic"},
@@ -515,14 +519,14 @@ def test_preview_persistence_free(client_factory):
                     "trials": 2,
                     "seed": 7,
                 },
-                "payloads": {"prompt": {"seed_namespace": "prompt"}},
+                "payloads": {"prompt": {"seed": "prompt"}},
                 "workflow": [
                     {"invoke": {"name": "prime", "payload": "prompt"}},
                     {
                         "invoke": {
                             "name": "probe",
                             "payload": "prompt",
-                            "after_seconds": "$delay",
+                            "after": "$delay",
                         }
                     },
                 ],
@@ -567,7 +571,7 @@ def test_compiled_dataset(tmp_path: Path, client_factory):
     dataset_cache = FakeDatasetCache(dataset_path, revision="b" * 40)
     task = {
         "name": "dataset-replay",
-        "payloads": {"replay": {"seed_namespace": "replay"}},
+        "payloads": {"replay": {"seed": "replay"}},
         "sequence": [
             {
                 "kind": "invoke",
@@ -577,23 +581,23 @@ def test_compiled_dataset(tmp_path: Path, client_factory):
             }
         ],
         "runner": {
-            "benchmark": {
-                "provider": "test",
-                "model": "test-model",
-                "stddev_input_tokens": 0,
-                "stddev_output_tokens": 0,
-                "dataset": {
-                    "id": "organization/sharegpt",
-                    "filename": "sharegpt.json",
-                    "revision": "release",
-                    "adapter": "sharegpt",
-                },
-                "dataset_prompt_mode": "concatenate",
-                "tokenizer": {
-                    "id": "organization/model-tokenizer",
-                    "revision": "release",
-                },
-            }
+            "request": {},
+            "provider": "test",
+            "model": "test-model",
+            "stddev_output_tokens": 0,
+            "tokenizer": {"id": "organization/model-tokenizer", "revision": "release"},
+            "inputs": {
+                "default": {
+                    "dataset": {
+                        "id": "organization/sharegpt",
+                        "filename": "sharegpt.json",
+                        "revision": "release",
+                        "adapter": "sharegpt",
+                    },
+                    "dataset_prompt_mode": "concatenate",
+                    "tokens": {"mean": 550, "stddev": 0},
+                }
+            },
         },
     }
 
@@ -662,15 +666,14 @@ def test_runner_tokenizer(tmp_path: Path, client_factory):
         created = client.post(
             "/api/v1/runners",
             json={
-                "benchmark": {
-                    "provider": "test",
-                    "model": "test-model",
-                    "tokenizer": {
-                        "id": "organization/model-tokenizer",
-                        "revision": "release",
-                        "use_fast": False,
-                    },
-                }
+                "request": {},
+                "provider": "test",
+                "model": "test-model",
+                "tokenizer": {
+                    "id": "organization/model-tokenizer",
+                    "revision": "release",
+                    "use_fast": False,
+                },
             },
         )
 
@@ -697,16 +700,20 @@ def test_runner_dataset(tmp_path: Path, client_factory):
         created = client.post(
             "/api/v1/runners",
             json={
-                "benchmark": {
-                    "provider": "test",
-                    "model": "test-model",
-                    "dataset": {
-                        "id": "organization/sharegpt",
-                        "filename": "sharegpt.json",
-                        "revision": "release",
-                        "adapter": "sharegpt",
-                    },
-                }
+                "request": {},
+                "provider": "test",
+                "model": "test-model",
+                "inputs": {
+                    "default": {
+                        "dataset": {
+                            "id": "organization/sharegpt",
+                            "filename": "sharegpt.json",
+                            "revision": "release",
+                            "adapter": "sharegpt",
+                        },
+                        "tokens": {"mean": 550, "stddev": 150},
+                    }
+                },
             },
         )
 
@@ -733,7 +740,7 @@ def test_runner_plan(client_factory):
                 "timezone": "Asia/Shanghai",
                 "starts_at": "2026-08-13T00:00:00Z",
                 "max_occurrences": 2,
-                "recurrence": {"kind": "interval", "every_seconds": 3600},
+                "recurrence": {"kind": "interval", "every": 3600},
                 "overlap_policy": "skip",
                 "runner": {"label": "planned"},
             },

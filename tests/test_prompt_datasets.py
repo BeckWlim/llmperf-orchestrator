@@ -3,8 +3,8 @@ import json
 from datasets import Dataset
 import pytest
 
-from llmperf import prompt_datasets as prompt_dataset_module
-from llmperf.prompt_datasets import (
+from llmperf.datasets import prompts as prompt_dataset_module
+from llmperf.datasets.prompts import (
     HuggingFacePromptRecords,
     PromptDatasetSource,
     load_prompt_dataset,

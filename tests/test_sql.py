@@ -9,8 +9,8 @@ from sqlalchemy.dialects import postgresql
 pytest.importorskip("sqlalchemy")
 pytest.importorskip("asyncpg")
 
-from llmperf_backend.models import DatabaseConfig
-from llmperf_backend.persistence import (
+from llmperf_backend.configuration.models import DatabaseConfig
+from llmperf_backend.storage.repository import (
     Base,
     Database,
     RunnerRepository,
@@ -30,8 +30,8 @@ def _benchmark(model):
             "selection": "explicit",
             "accuracy": "compatible",
         },
-        "timeout_seconds": 10,
-        "max_completed_requests": 1,
+        "timeout": 10,
+        "repeat": 1,
         "concurrent_requests": 1,
         "mean_input_tokens": 40,
         "stddev_input_tokens": 0,
@@ -69,8 +69,8 @@ def test_postgres_lifecycle(postgresql_url):
                 {
                     "model": "glm-test",
                     "adapter": "openai",
-                    "timeout_seconds": 10,
-                    "max_completed_requests": 1,
+                    "timeout": 10,
+                    "repeat": 1,
                     "concurrent_requests": 1,
                     "mean_input_tokens": 40,
                     "stddev_input_tokens": 0,
@@ -128,7 +128,7 @@ def test_postgres_lifecycle(postgresql_url):
                     "starts_at": datetime.now(timezone.utc) - timedelta(seconds=31),
                     "ends_at": None,
                     "max_occurrences": 2,
-                    "recurrence": {"kind": "interval", "every_seconds": 30},
+                    "recurrence": {"kind": "interval", "every": 30},
                     "overlap_policy": "queue",
                     "misfire_grace_seconds": 60,
                 },
@@ -171,7 +171,7 @@ def test_postgres_lifecycle(postgresql_url):
                     "starts_at": datetime.now(timezone.utc) - timedelta(seconds=31),
                     "ends_at": None,
                     "max_occurrences": 2,
-                    "recurrence": {"kind": "interval", "every_seconds": 30},
+                    "recurrence": {"kind": "interval", "every": 30},
                     "overlap_policy": "skip",
                     "misfire_grace_seconds": 60,
                 },
@@ -224,7 +224,7 @@ def test_task_advancement(postgresql_url):
                         "definition": {
                             "name": "postgres-task",
                             "instances": {"trials": 1, "seed": 7},
-                            "payloads": {"replay": {"seed_namespace": "replay"}},
+                            "payloads": {"replay": {"seed": "replay"}},
                             "workflow": [
                                 {
                                     "invoke": {
@@ -250,7 +250,7 @@ def test_task_advancement(postgresql_url):
                 "bootstrap-test",
             )
             campaign_id = workload["campaign"]["campaign_id"]
-            from llmperf_backend.runtime import RuntimeCoordinator
+            from llmperf_backend.runtime.coordinator import RuntimeCoordinator
 
             coordinator = RuntimeCoordinator(repository)
             await coordinator.reconcile()
@@ -325,7 +325,7 @@ def test_campaign_claim_fairness(postgresql_url):
                 campaign_id=campaign_b["campaign_id"],
             )
 
-            from llmperf_backend.runtime import RuntimeCoordinator
+            from llmperf_backend.runtime.coordinator import RuntimeCoordinator
 
             coordinator = RuntimeCoordinator(repository)
             await coordinator.reconcile()

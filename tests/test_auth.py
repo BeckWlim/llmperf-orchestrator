@@ -7,9 +7,9 @@ jwt = pytest.importorskip("jwt")
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from llmperf_backend.auth import TokenVerifier
-from llmperf_backend.models import AuthConfig
-from llmperf_cli.auth import PrivateKeyTokenProvider
+from llmperf_backend.api.auth import TokenVerifier
+from llmperf_backend.configuration.models import AuthConfig
+from llmperf_cli.transport.auth import PrivateKeyTokenProvider
 
 
 class UnusedRepository:
