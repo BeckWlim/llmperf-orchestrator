@@ -3,10 +3,11 @@
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
-from llmperf.datasets.preparation import PreparationHandle, create_preparation_actor
+from llmperf.datasets.preparation import PreparationHandle
 import logging
 import os
 import socket
+import time
 from sqlalchemy.exc import SQLAlchemyError
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 from uuid import uuid4
@@ -46,6 +47,7 @@ from llmperf_backend.runtime.coordinator import RuntimeCoordinator, RuntimeRepos
 from llmperf_backend.runtime.dispatch import DispatchRepository, WorkerDispatcher
 from llmperf_backend.runtime.preparation import RunnerPreparation
 from llmperf_backend.runtime.request_pool import (
+    PoolStatus,
     create_request_actor,
     create_request_router,
     RequestActorHandle,
@@ -140,9 +142,17 @@ class Scheduler:
         self._request_router: Optional[RouterHandle] = None
         self._request_actors: List[RequestActorHandle] = []
         self._preparation_actors: List[PreparationHandle] = []
-        self._pool_status: Dict[str, int] = {}
+        self._pool_status: PoolStatus = {
+            "actor_count": 0,
+            "request_capacity": 0,
+            "executing_requests": 0,
+            "available_slots": 0,
+            "queued_requests": 0,
+            "runners": {},
+        }
+        self._pool_observed_at: Optional[float] = None
         self._atomic_executor = ThreadPoolExecutor(
-            max_workers=config.max_concurrent_runners,
+            max_workers=config.preparation_threads,
             thread_name_prefix="llmperf-invoke",
         )
 
@@ -205,6 +215,8 @@ class Scheduler:
             "scheduler_id": self.scheduler_id,
             "status": state,
             "max_concurrent_runners": self.config.max_concurrent_runners,
+            "preparation_threads": self.config.preparation_threads,
+            "worker_runtime": self.worker_status(),
             "live_slots": self._pool_status.get("request_capacity", 0),
             "busy_slots": self._pool_status.get("executing_requests", 0),
             "active_runners": active_runners,
@@ -225,6 +237,61 @@ class Scheduler:
             "preparation_buffer_chunks": self.config.preparation_buffer_chunks,
             "ray_runtime": dict(self._ray_status),
             "performance_guard": self.performance_guard.status(),
+        }
+
+    def worker_status(
+        self, runner_ids: Optional[Sequence[str]] = None
+    ) -> Dict[str, Any]:
+        """Observe creation and physical execution separately; snapshots are not durable."""
+        selected = set(runner_ids) if runner_ids is not None else None
+        pool_runners = self._pool_status.get("runners", {})
+        visible = (
+            set(self._active_workers) | set(pool_runners)
+            if selected is None
+            else selected
+        )
+        runners: Dict[str, Dict[str, Any]] = {}
+        for runner_id in visible:
+            preparation = self._active_workers.get(runner_id)
+            progress = (
+                preparation.progress()
+                if isinstance(preparation, RunnerPreparation)
+                else {}
+            )
+            admission_waiting = sum(
+                owner == runner_id
+                for owner, _ in (self._dispatcher.waiting if self._dispatcher else ())
+            )
+            pool_progress = pool_runners.get(runner_id, {})
+            runners[runner_id] = {
+                **progress,
+                "admission_waiting": admission_waiting,
+                "queued": pool_progress.get("queued", 0),
+                "running": pool_progress.get("running", 0),
+            }
+        snapshot_age = (
+            time.monotonic() - self._pool_observed_at
+            if self._pool_observed_at is not None
+            else None
+        )
+        return {
+            "runners": runners,
+            "pool_ready": self._ray_healthy and snapshot_age is not None,
+            "snapshot_age_seconds": snapshot_age,
+            "slots_busy": self._pool_status.get("executing_requests"),
+            "slots_total": self._pool_status.get("request_capacity"),
+            "slots_free": self._pool_status.get("available_slots"),
+            "admission_waiting": sum(
+                item["admission_waiting"] for item in runners.values()
+            ),
+            "queued": sum(item["queued"] for item in runners.values()),
+            "running": sum(item["running"] for item in runners.values()),
+            "preparation_queued": sum(
+                item.get("phase") == "preparation_queued" for item in runners.values()
+            ),
+            "preparing": sum(
+                item.get("phase") == "preparing" for item in runners.values()
+            ),
         }
 
     async def _start_ray_runtime(self) -> None:
@@ -276,9 +343,9 @@ class Scheduler:
             )
             for _ in range(actor_count)
         ]
-        self._preparation_actors = [
-            create_preparation_actor() for _ in range(self.config.preparation_workers)
-        ]
+        # Complete Workers prepare inside request actors after slot allocation.
+        # Keep the existing request-actor CPU layout; no separate prefetch actors.
+        self._preparation_actors = []
         self._request_router = create_request_router(
             self._request_actors,
             self.config.ray_actor_max_concurrency,
@@ -294,6 +361,7 @@ class Scheduler:
             ),
         )
         self._pool_status = await self._request_router.status.remote()
+        self._pool_observed_at = time.monotonic()
         self._dispatcher = WorkerDispatcher(
             self._request_router,
             self.repository,
@@ -320,7 +388,15 @@ class Scheduler:
         self._request_actors.clear()
         self._preparation_actors.clear()
         self._request_router = None
-        self._pool_status.clear()
+        self._pool_status = {
+            "actor_count": 0,
+            "request_capacity": 0,
+            "executing_requests": 0,
+            "available_slots": 0,
+            "queued_requests": 0,
+            "runners": {},
+        }
+        self._pool_observed_at = None
 
     async def _sample_ray_runtime(self) -> None:
         ray = self._ray_module
@@ -367,6 +443,7 @@ class Scheduler:
                     self._request_router.status.remote(),
                     self.config.ray_health_timeout_seconds,
                 )
+                self._pool_observed_at = time.monotonic()
             self._ray_healthy = (
                 float(self._ray_status["cluster_resources"].get("CPU", 0)) > 0
             )
@@ -658,12 +735,18 @@ class Scheduler:
                 self.config.log_bytes_limit,
                 self._request_router,
             )
-            LOGGER.info(
-                "Started Ray Worker task=%s for Runner %s with %d actor(s)",
-                worker.task_id(),
-                runner_id,
-                actor_count,
-            )
+            if isinstance(worker, RunnerPreparation):
+                LOGGER.info(
+                    "Started Runner %s: creating Worker recipes; Ray actors prepare after slot admission",
+                    runner_id,
+                )
+            else:
+                LOGGER.info(
+                    "Started Ray Worker task=%s for Runner %s with %d actor(s)",
+                    worker.task_id(),
+                    runner_id,
+                    actor_count,
+                )
             payload = await self._wait_worker(worker, runner_id)
             if payload is None:
                 await self._cancel_worker(worker)

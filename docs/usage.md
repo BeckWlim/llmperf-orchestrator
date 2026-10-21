@@ -14,9 +14,11 @@ All shell commands below run from the repository root.
 - **Concurrent Campaign fairness** — claims prefer Campaigns with fewer running
   Runners while Ray independently queues request Actors, so one Campaign does not
   monopolize Scheduler slots or require all of its Actors to start together.
-- **Fail-closed performance guard** — every Runner uses isolated Ray actors on one
-  shared embedded or external runtime; workload admission bounds actor capacity,
-  Runner fan-out, Provider requests, token budget, and effective concurrency.
+- **Runtime protection with optional campaign budgets** — static validation and
+  concurrency checks stay on. Whole-submission Runner, request, and token totals
+  are advisory by default; enable campaign admission explicitly to enforce them.
+  See [settings, defaults, and rejection meanings](runtime.md#performance-guard).
+  Runners share Ray request actors with per-request credential isolation.
 - **Reproducible experiments** — Provider/model selections, benchmark parameters,
   and immutable tokenizer and dataset revisions are frozen into every Runner.
 - **Composable workload input** — a bounded Workload Compiler maps readable `workflow`
@@ -212,6 +214,51 @@ llmperfctl runner start -f examples/example-smoke.yaml --wait
 ```
 
 ### 3. Run a multi-round Campaign
+
+Use `runner_groups` for readable matrices across globally ordered phases:
+
+```yaml
+campaign:
+  name: phased-study
+  rounds:
+    count: 8
+    seed: date
+    prefix_seed_scope: family
+    phases: [load, pressure, read]
+runner_groups:
+  - name: target
+    phase: load
+    matrix: &families
+      group: [1, 2]
+      member: [1, 2, 3, 4]
+    runner: &target
+      provider: your-provider
+      model: your-model
+      concurrent_requests: 8
+      inputs:
+        default: {tokens: 4096, shared_prefix_tokens: 3276}
+      request: {repeat: 1}
+  - name: pressure
+    phase: pressure
+    matrix:
+      member: [1, 2, 3, 4, 5, 6, 7, 8]
+    runner:
+      <<: *target
+      inputs:
+        default: {tokens: 4096, shared_prefix_tokens: 0}
+  - name: target
+    phase: read
+    matrix: *families
+    runner: *target
+```
+
+Each phase completes before the next becomes eligible. Reusing group name and
+coordinates preserves the prefix across phases/cycles; suffixes change. Phase names
+carry no built-in cache behavior. `seed: date` is frozen per API request; use an integer
+for reproducible preview/submission. `campaign preview` shows the resolved seed,
+phase order, matrix sizes and cycle count without preparing or submitting requests.
+The expanded limit is 10,000 Runners. See [limitations](limitations.md#matrix-phases-and-long-running-experiments)
+for recovery/failure semantics and the optional larger `workloads/*-recall.yaml` profiles.
 
 For independent family sequences, use the bounded
 [`example-batch-sequence.yaml`](../examples/example-batch-sequence.yaml). Each `run` step

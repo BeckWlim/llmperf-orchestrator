@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import httpx
+import pytest
 
 from llmperf_backend.api.app import create_app
 from llmperf_backend.configuration.loader import ConfigStore
@@ -58,6 +59,60 @@ class FakeDatasetCache:
             path=self.path,
             cached=True,
         )
+
+
+@pytest.mark.parametrize("enforce_campaign_limits", [False, True])
+def test_campaign_admission(tmp_path, enforce_campaign_limits):
+    guard_config = "\nperformance_guard:\n  max_campaign_provider_requests: 1\n"
+    if enforce_campaign_limits:
+        guard_config += "  campaign_admission_enabled: true\n"
+    config_path = tmp_path / "backend.yaml"
+    config_path.write_text(CONFIG + guard_config, encoding="utf-8")
+    tokenizer_directory = tmp_path / "tokenizer"
+    tokenizer_directory.mkdir()
+    tokenizer_directory.joinpath("tokenizer.json").write_text(
+        '{"version":"1.0"}', encoding="utf-8"
+    )
+    application = create_app(
+        ConfigStore(config_path),
+        provider_registry=ProviderRegistry(
+            [ProviderFileProfile(models=["test-model"]).resolve("test", {})]
+        ),
+        tokenizer_cache=FakeTokenizerCache(tokenizer_directory),
+    )
+
+    async def exercise():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/v1/campaigns/validate-artifacts",
+                json={
+                    "campaign": {"name": "budget-check"},
+                    "runners": [
+                        {
+                            "provider": "test",
+                            "model": "test-model",
+                            "tokenizer": {"id": "organization/tokenizer"},
+                            "inputs": {"default": {"tokens": 128}},
+                            "request": {"repeat": 2},
+                            "concurrent_requests": 1,
+                        }
+                    ],
+                },
+            )
+            if enforce_campaign_limits:
+                assert response.status_code == 422
+                assessment = response.json()["detail"]["performance_safety"]
+                assert assessment["campaign_admission_enabled"] is True
+                assert assessment["blocking_risks"] == [
+                    {"code": "provider_requests_limit", "value": 2, "limit": 1}
+                ]
+            else:
+                assert response.status_code == 200
+                assert response.json()["valid"] is True
+
+    asyncio.run(exercise())
 
 
 def test_input_reference_rejection(tmp_path):

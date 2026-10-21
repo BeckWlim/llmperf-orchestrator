@@ -54,8 +54,26 @@ def test_defaults():
     assert config.scheduler.ray_actor_max_concurrency == 8
     assert config.scheduler.ray_object_store_memory_bytes == 268_435_456
     assert config.scheduler.artifact_resolution_timeout_seconds == 60.0
+    assert config.performance_guard.enabled is True
+    assert config.performance_guard.campaign_admission_enabled is False
     assert config.performance_guard.min_ray_object_store_available_ratio == 0.1
     assert config.performance_guard.resume_ray_object_store_available_ratio == 0.2
+
+
+@pytest.mark.parametrize("admission_enabled", [False, True])
+def test_admission_environment(tmp_path, monkeypatch, admission_enabled):
+    from llmperf_backend.configuration.loader import DEFAULT_CONFIG_PATH
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("LLMPERF_ENV_FILE", raising=False)
+    monkeypatch.delenv("LLMPERF_BACKEND_CONFIG", raising=False)
+    monkeypatch.setenv("LLMPERF_PERFORMANCE_GUARD_ENABLED", "true")
+    monkeypatch.setenv(
+        "LLMPERF_CAMPAIGN_ADMISSION_ENABLED", str(admission_enabled).lower()
+    )
+    config = load_config(DEFAULT_CONFIG_PATH)
+    assert config.performance_guard.enabled is True
+    assert config.performance_guard.campaign_admission_enabled is admission_enabled
 
 
 @pytest.mark.parametrize("concurrency", [0, -1, 1025, 1.5])

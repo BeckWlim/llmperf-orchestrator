@@ -36,6 +36,7 @@ class WorkerDispatcher:
         self.active: Dict[tuple[str, str], asyncio.Task[None]] = {}
         self.cancelled: set[str] = set()
         self.errors: Dict[str, BaseException] = {}
+        self.waiting: set[tuple[str, str]] = set()
 
     def register(
         self, runner_id: str, environment: Mapping[str, str]
@@ -48,7 +49,12 @@ class WorkerDispatcher:
     async def submit(
         self, runner_id: str, step: RequestStep, window: Optional[int]
     ) -> None:
-        await self._capacity.acquire()
+        waiting_key = (runner_id, step.step_id)
+        self.waiting.add(waiting_key)
+        try:
+            await self._capacity.acquire()
+        finally:
+            self.waiting.discard(waiting_key)
         handed_off = False
         try:
             if runner_id in self.cancelled:

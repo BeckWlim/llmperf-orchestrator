@@ -706,6 +706,7 @@ def concatenate_prompt_requests(
     get_token_length: Callable[[str], int],
     seed: int = 11111,
     shared_prefix_tokens: int = 0,
+    shared_prefix_seed: Optional[int] = None,
 ) -> Tuple[List[Prompt], List[PromptEvidence]]:
     """Fill token budgets from one seeded, no-replacement record cursor."""
 
@@ -713,7 +714,10 @@ def concatenate_prompt_requests(
     cursor = _RecordCursor(dataset, rng)
 
     def construct(
-        target_tokens: int, initial_text: str, include_instruction: bool
+        target_tokens: int,
+        initial_text: str,
+        include_instruction: bool,
+        record_cursor: _RecordCursor,
     ) -> Tuple[str, int, List[Dict[str, Any]]]:
         text = initial_text
         if include_instruction:
@@ -723,7 +727,7 @@ def concatenate_prompt_requests(
         actual_tokens = get_token_length(text)
         segments = []
         while actual_tokens < target_tokens:
-            record_index, record, cycle = cursor.next()
+            record_index, record, cycle = record_cursor.next()
             separator = dataset.separator if text and not text.endswith("\n\n") else ""
             piece = separator + record
             complete_tokens = get_token_length(text + piece)
@@ -761,8 +765,16 @@ def concatenate_prompt_requests(
     shared_prefix = ""
     shared_segments: List[Dict[str, Any]] = []
     if shared_prefix_tokens:
+        prefix_cursor = (
+            cursor
+            if shared_prefix_seed is None
+            else _RecordCursor(dataset, random.Random(shared_prefix_seed))
+        )
         shared_prefix, _, shared_segments = construct(
-            shared_prefix_tokens, "", include_instruction=True
+            shared_prefix_tokens,
+            "",
+            include_instruction=True,
+            record_cursor=prefix_cursor,
         )
 
     prompts = []
@@ -773,6 +785,7 @@ def concatenate_prompt_requests(
             target_tokens,
             shared_prefix,
             include_instruction=not bool(shared_prefix),
+            record_cursor=cursor,
         )
         segments = [*shared_segments, *suffix_segments]
         prompts.append((text, actual_tokens))
@@ -786,6 +799,15 @@ def concatenate_prompt_requests(
                     "segments": segments,
                     "target_input_tokens": target_tokens,
                     "actual_input_tokens": actual_tokens,
+                    **(
+                        {
+                            "shared_prefix_seed": shared_prefix_seed,
+                            "prefix_hash": "sha256:"
+                            + hashlib.sha256(shared_prefix.encode()).hexdigest(),
+                        }
+                        if shared_prefix_seed is not None
+                        else {}
+                    ),
                 }
             )
         )
@@ -855,6 +877,7 @@ def prepare_prompt_requests(
     get_token_length: Callable[[str], int],
     seed: int,
     shared_prefix_tokens: int = 0,
+    shared_prefix_seed: Optional[int] = None,
 ) -> Tuple[List[Prompt], List[PromptEvidence]]:
     """Load and construct prompts through the same pipeline for every source."""
 
@@ -873,6 +896,7 @@ def prepare_prompt_requests(
             get_token_length,
             seed,
             shared_prefix_tokens,
+            shared_prefix_seed,
         )
     if effective_mode == "sample":
         return sample_prompt_requests(

@@ -67,6 +67,11 @@ Before submission, read `scheduler status` and validate with the active slot/Ray
   --max-runner-concurrency RUNNER_LIMIT --max-effective-concurrency TOTAL_LIMIT
 ```
 
+Static validation and concurrency checks remain enabled. Campaign totals are advisory
+by default: `LLMPERF_CAMPAIGN_ADMISSION_ENABLED=false`. Add
+`--enforce-campaign-limits` for an explicit check against the script's packaged
+campaign budgets; use Backend validation for the deployment's actual settings.
+Do not shrink a requested experiment solely to satisfy advisory total budgets.
 Treat a non-zero result as a stop condition. Report planned Runner count, estimated
 Provider requests, mean-token budget, maximum Runner concurrency, effective concurrency,
 and warnings. In addition:

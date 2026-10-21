@@ -2,6 +2,12 @@
 
 ## Architecture boundaries
 
+Read `docs/limitations.md` for family seed and runtime capacity boundaries. Trials
+generate and submit; they do not shuffle admission. Runner controls Worker readiness,
+while shared Worker scheduling owns fairness. Defaults are 1024 active Runners,
+eight aggregation threads, and 64 Worker slots. Preserve bounded async submission;
+prepare input only inside an admitted Ray request actor invocation.
+
 - `configuration/models.py`: strict general API/YAML models and configuration constraints.
 - `compiler/tasks.py`: task-specific Pydantic AST, `BaseNode` hierarchy, bounded workflow
   expansion, UUID-free compilation table, and runtime assembly.
@@ -13,7 +19,8 @@
 - `runtime/scheduler.py`: supervise Worker handles and the shared request pool.
 - `runtime/runner.py`: async progression, dependency checks, descendant cancellation,
   message assembly, and optional outstanding-Worker ceiling.
-- `runtime/preparation.py`: Runner input preparation, named input selection, calculation, and aggregation.
+- `runtime/preparation.py`: lightweight Runner progression, legacy calculation helpers, and aggregation.
+- `runtime/worker_input.py`: Worker recipes and actor-local input preparation/cache.
 - `runtime/dispatch.py`: bounded one-request Workers and durable output publication.
 - `runtime/messages.py`: durable Runner mailbox, completion and cancellation envelopes.
 - `runtime/triggers.py`: readiness conditions and asynchronous timer event sources.
@@ -21,6 +28,9 @@
 - `runtime/request_pool.py`: fair shared capacity and isolated per-request Ray adapters.
 - `llmperf/datasets/preparation.py`: initialization-only corpus calibration and bounded prompt chunks.
 - `compiler/rounds.py`: deterministic Runner expansion and runtime round eligibility.
+- Matrix phases are generic completion barriers, not cache-tier policies. Keep roles
+  in YAML, preserve family identity by group name/coordinates, and persist date-based
+  seeds before execution. Do not reread the clock or move fairness into Runner logic.
 - `compiler/safety.py`: estimate expanded Runners, requests, tokens, and effective concurrency.
 - `llmperf_cli`: command parsing, HTTP boundaries, polling, logs, and rendering.
 - `llmperf/datasets/probes.py`, `llmperf/metrics/usage.py`, `llmperf/metrics/cache.py`: within-Runner KV-cache evidence.
@@ -30,7 +40,7 @@ scheduled occurrences. The coordinator owns dependencies, timers and a fair read
 Scheduler owns the fixed shared Ray pool and bounded Worker handles. Waiting never occupies
 a request slot. See `docs/runtime.md` for the concrete runtime and storage contract.
 
-Runner preparation uses cached tokenizers; both atomic invokes and compiled `run` batches
+Ray request actors prepare inputs with cached tokenizers; both atomic invokes and compiled `run` batches
 submit one-request Workers through the same dispatcher. All share request actors across Runners. Never mutate process
 credentials, initialize Ray in a Worker, or connect an actor to PostgreSQL. Default capacity
 is eight actors times eight requests; the active Runner bound is independent.
@@ -54,13 +64,13 @@ sampling in benchmark throughput, and task evidence projection in metrics result
 Retain separate shared models/protocols when they prevent dependency cycles or define a
 cross-layer contract; small file size alone is not a reason to merge those boundaries.
 
-Optional preparation actors reserve one CPU each from `ray_num_cpus`; request actors use
-the remaining CPU budget. Calibration is once per ordinary Runner, before its timed loop.
-Bundled-sonnet and external concatenate workloads use the estimated chunk path through
-the existing dataset loader. External calibration samples at most 128 records with a
-4,096-character cap each; actors access the full memory-mapped corpus. Exact replay and
-sample mode retain existing preparation. Round barriers derive from durable Runner metadata
-and status, and consume no request slots while waiting.
+The preparation-worker setting retains CPU headroom when sizing the request pool;
+Backend no longer starts separate preparation actors. Each request actor serializes
+CPU preparation and overlaps Provider I/O. One physical slot covers one complete
+Worker. Ordinary concatenate recipes retain calibrated indexed generation; other
+generated inputs use versioned deterministic request seeds. Round barriers consume
+no request slots while waiting. Runtime lease checks renew valid ownership but never
+revive an expired or superseded lease.
 
 ## Persistence
 

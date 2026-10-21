@@ -15,6 +15,7 @@ from sqlalchemy.engine import make_url
 from pydantic import ValidationError
 
 from llmperf.version import PROTOCOL_VERSION
+from llmperf_backend.api.progress import attach_progress
 from llmperf_backend.compiler.requests import planned_worker_count
 from llmperf_backend.artifacts.resolver import (
     ArtifactCaches,
@@ -183,7 +184,7 @@ def _compile_campaign_task_preview(
         "campaign": payload.campaign.name,
         "debug": include_debug,
         "summary": {
-            "immediate_runners": len(payload.runners)
+            "immediate_runners": payload.immediate_runner_count
             * (payload.campaign.rounds.count if payload.campaign.rounds else 1),
             "runner_plans": len(payload.runner_plans),
             "task_definitions": len(payload.task_definitions),
@@ -192,6 +193,29 @@ def _compile_campaign_task_preview(
             "previewed_instances": previewed_instances,
         },
         "task_definitions": definition_previews,
+        "rounds": (
+            dump_model(payload.campaign.rounds) if payload.campaign.rounds else None
+        ),
+        "runner_groups": [
+            {
+                "name": group.name,
+                "phase": group.phase
+                or (
+                    payload.campaign.rounds.phases[0]
+                    if payload.campaign.rounds
+                    else "default"
+                ),
+                "matrix": group.matrix,
+                "families": group.count,
+                "cycles": (
+                    payload.campaign.rounds.count if payload.campaign.rounds else 1
+                ),
+                "workers_per_runner": planned_worker_count(
+                    group.runner.execution_benchmark()
+                ),
+            }
+            for group in payload.runner_groups
+        ],
     }
 
 
@@ -551,13 +575,25 @@ def create_app(
             )
             for runner in payload.runners
         ]
-        from llmperf_backend.compiler.rounds import expand_rounds
+        from llmperf_backend.compiler.rounds import expand_rounds, expand_runner_group
+
+        for group in payload.runner_groups:
+            resolved_group_template = await resolve_runner(
+                request, group.runner, default_benchmark, artifact_resolutions
+            )
+            resolved_runner_templates.extend(
+                expand_runner_group(
+                    resolved_group_template, group.name, group.matrix, group.phase
+                )
+            )
 
         resolved_runners = (
             expand_rounds(
                 resolved_runner_templates,
                 payload.campaign.rounds.count,
                 payload.campaign.rounds.seed,
+                payload.campaign.rounds.prefix_seed_scope,
+                payload.campaign.rounds.phases,
             )
             if payload.campaign.rounds is not None
             else resolved_runner_templates
@@ -1136,6 +1172,12 @@ def create_app(
         offset: int = Query(default=0, ge=0),
     ) -> Dict[str, Any]:
         items = await request.app.state.runner_repository.list_campaigns(limit, offset)
+        await attach_progress(
+            items,
+            request.app.state.runner_repository,
+            request.app.state.scheduler,
+            campaigns=True,
+        )
         return {"items": items, "limit": limit, "offset": offset}
 
     @api.get("/campaigns/{campaign_id}", tags=["campaigns"])
@@ -1145,6 +1187,12 @@ def create_app(
         )
         if campaign is None:
             raise HTTPException(status_code=404, detail="Campaign not found")
+        await attach_progress(
+            [campaign],
+            request.app.state.runner_repository,
+            request.app.state.scheduler,
+            campaigns=True,
+        )
         return campaign
 
     @api.post("/campaigns/{campaign_id}/cancel", tags=["campaigns"])
@@ -1198,6 +1246,12 @@ def create_app(
             full=full,
             campaign_id=campaign_id,
         )
+        await attach_progress(
+            runners,
+            request.app.state.runner_repository,
+            request.app.state.scheduler,
+            campaigns=False,
+        )
         return {
             "items": runners,
             "limit": limit,
@@ -1211,6 +1265,12 @@ def create_app(
         runner = await request.app.state.runner_repository.get_runner(runner_id)
         if runner is None:
             raise HTTPException(status_code=404, detail="Runner not found")
+        await attach_progress(
+            [runner],
+            request.app.state.runner_repository,
+            request.app.state.scheduler,
+            campaigns=False,
+        )
         return runner
 
     @api.get("/runners/{runner_id}/logs", tags=["runners"])

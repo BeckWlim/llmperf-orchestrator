@@ -346,6 +346,13 @@ Runners; neither promises random selection or fairness between matrix coordinate
 
 ## Seeds, prefixes, and replay
 
+For run-only workflows, `instances.prefix_seed_scope: family` keeps the prefix seed
+fixed across trials of one matrix coordinate. Suffix seeds derive from that family
+seed, trial index, and node path. Named inputs namespace the prefix by input name.
+The default `trial` scope retains the algorithm below. Neither mode shuffles
+submission or implements fairness in Runner/trial logic.
+See [limitations](limitations.md) for creation, queue, deadline, and cache boundaries.
+
 Batch seeds use the `batch-v1` algorithm:
 
 ```text

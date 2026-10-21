@@ -5,14 +5,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
-from concurrent.futures import Executor, Future
+from concurrent.futures import Executor
 from datetime import datetime, timezone
 import threading
 import traceback
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from llmperf.benchmark.execution import RequestStep
+from llmperf.benchmark.execution import (
+    RequestStep,
+    PreparedBatch,
+    BenchmarkStages,
+    BenchmarkResult,
+)
 from llmperf.clients.base import LLMResponse
 from llmperf.clients.factory import actor_concurrency
 from llmperf.datasets.preparation import PreparationHandle
@@ -85,6 +91,15 @@ def prepare_named_inputs(
         seed = int.from_bytes(
             hashlib.sha256(seed_material.encode()).digest()[:8], "big"
         )
+        family_prefix_seed = benchmark.get("shared_prefix_seed")
+        named_prefix_seed = (
+            int.from_bytes(
+                hashlib.sha256(f"{family_prefix_seed}:{name}".encode()).digest()[:8],
+                "big",
+            )
+            if family_prefix_seed is not None
+            else None
+        )
         prompts, evidence = prepare_prompt_requests(
             source=source,
             prompt_mode=definition.dataset_prompt_mode,
@@ -96,6 +111,7 @@ def prepare_named_inputs(
             get_token_length=lambda value: len(tokenizer.encode(value)),
             seed=seed,
             shared_prefix_tokens=definition.shared_prefix_tokens,
+            shared_prefix_seed=named_prefix_seed,
         )
         prepared_by_name[name] = [
             (prompt, {**item, "input_name": name})
@@ -109,7 +125,7 @@ def prepare_named_inputs(
     return ordered
 
 
-def calculate(
+def _calculation_options(
     benchmark: Dict[str, Any],
     execution_runtime: Optional[Mapping[str, Any]] = None,
     request_router: Optional[RouterHandle] = None,
@@ -117,11 +133,10 @@ def calculate(
     tokenizer_override: Optional[TokenizerEncoder] = None,
     preparation_actors: Sequence[PreparationHandle] = (),
     batch_executor: Optional[BatchExecutor] = None,
-) -> Tuple[Dict[str, Any], Sequence[Dict[str, Any]]]:
-    """Run one benchmark inside an already connected Ray worker process."""
+) -> Dict[str, Any]:
+    """Resolve preparation inputs without executing Provider requests."""
 
     from llmperf.datasets.prompts import PromptDatasetSource
-    from llmperf.benchmark.throughput import get_token_throughput_latencies
 
     worker_environment = (
         os.environ if execution_environment is None else execution_environment
@@ -152,7 +167,7 @@ def calculate(
         if benchmark.get("inputs") and benchmark.get("steps") is not None
         else None
     )
-    summary, requests = get_token_throughput_latencies(
+    return dict(
         model=benchmark["model"],
         llm_api=benchmark["adapter"],
         test_timeout_s=duration_seconds(benchmark["timeout"]),
@@ -163,6 +178,7 @@ def calculate(
         mean_input_tokens=benchmark["mean_input_tokens"],
         stddev_input_tokens=benchmark["stddev_input_tokens"],
         shared_prefix_tokens=benchmark.get("shared_prefix_tokens", 0),
+        shared_prefix_seed=benchmark.get("shared_prefix_seed"),
         prompt_dataset_source=prompt_dataset_source,
         dataset_prompt_mode=benchmark.get("dataset_prompt_mode", "sample"),
         dataset_repeat_count=benchmark.get("dataset_repeat_count", 1),
@@ -201,6 +217,11 @@ def calculate(
             (execution_runtime or {}).get("preparation_buffer_chunks", 8)
         ),
     )
+
+
+def _attach_runtime(
+    summary: Dict[str, Any], execution_runtime: Optional[Mapping[str, Any]]
+) -> None:
     runtime = dict(execution_runtime or {})
     runtime.setdefault("backend", "ray")
     runtime.setdefault("worker_kind", "ray_task")
@@ -209,7 +230,111 @@ def calculate(
     )
     runtime.setdefault("ray_actor_max_concurrency", actor_concurrency())
     summary["execution_runtime"] = runtime
+
+
+def calculate(
+    benchmark: Dict[str, Any],
+    execution_runtime: Optional[Mapping[str, Any]] = None,
+    request_router: Optional[RouterHandle] = None,
+    execution_environment: Optional[Mapping[str, str]] = None,
+    tokenizer_override: Optional[TokenizerEncoder] = None,
+    preparation_actors: Sequence[PreparationHandle] = (),
+    batch_executor: Optional[BatchExecutor] = None,
+) -> Tuple[Dict[str, Any], Sequence[Dict[str, Any]]]:
+    from llmperf.benchmark.throughput import get_token_throughput_latencies
+
+    options = _calculation_options(
+        benchmark,
+        execution_runtime,
+        request_router,
+        execution_environment,
+        tokenizer_override,
+        preparation_actors,
+        batch_executor,
+    )
+    summary, requests = get_token_throughput_latencies(**options)
+    _attach_runtime(summary, execution_runtime)
     return summary, requests
+
+
+def aggregate_workers(
+    benchmark: Mapping[str, Any],
+    responses: List[LLMResponse],
+    started_at: float,
+    finished_at: float,
+    timed_out: bool,
+    cancelled_ids: Sequence[str] = (),
+) -> BenchmarkResult:
+    from llmperf.benchmark.throughput import metrics_summary
+    from llmperf.metrics import constants
+    from llmperf.metrics.cache import analyze_cache_probe
+
+    metrics = [response[0] for response in responses]
+    for item in metrics:
+        item.setdefault(constants.ERROR_CODE, None)
+        item.setdefault(constants.TTFT, None)
+        item.setdefault(constants.E2E_LAT, 0.0)
+        item.setdefault(constants.NUM_INPUT_TOKENS, None)
+        item.setdefault(constants.NUM_OUTPUT_TOKENS, None)
+        item.setdefault(constants.REQ_OUTPUT_THROUGHPUT, None)
+    summary = {
+        name: benchmark.get(name)
+        for name in (
+            "model",
+            "mean_input_tokens",
+            "stddev_input_tokens",
+            "shared_prefix_tokens",
+            "mean_output_tokens",
+            "stddev_output_tokens",
+            "additional_sampling_params",
+            "tokenizer",
+            "task_context",
+            "task_contexts",
+            "output_token_count",
+        )
+    }
+    summary.update(
+        num_concurrent_requests=benchmark.get("concurrent_requests"),
+        timed_out=timed_out,
+        results=metrics_summary(metrics, started_at, finished_at),
+        prompt_dataset={
+            "seed": benchmark.get("dataset_seed", 11111),
+            "prompt_mode": benchmark.get("dataset_prompt_mode", "sample"),
+            "generation": "worker-index-v1",
+        },
+        duration_scope="worker_admission_preparation_and_execution",
+    )
+    probe = benchmark.get("cache_probe")
+    if probe:
+        analysis = analyze_cache_probe(
+            metrics,
+            bootstrap_samples=int(probe.get("bootstrap_samples", 2000)),
+            confidence_level=float(probe.get("confidence_level", 0.95)),
+            seed=int(benchmark.get("dataset_seed", 11111)),
+            minimum_counter_coverage=float(probe.get("minimum_counter_coverage", 0.8)),
+        )
+        analysis["quality_flags"] = {
+            "timed_out": timed_out,
+            "skipped_dependency_requests": len(cancelled_ids),
+            "tokenizer_mismatch_requests": sum(
+                bool(item.get("tokenizer_mismatch")) for item in metrics
+            ),
+        }
+        if analysis["quality_flags"]["tokenizer_mismatch_requests"]:
+            analysis["verdict_before_quality_guard"] = analysis["verdict"]
+            analysis["verdict"] = "inconclusive"
+        summary.update(
+            cache_probe=probe,
+            cache_probe_analysis=analysis,
+            cache_probe_plan={
+                "requests": planned_worker_count(benchmark),
+                "families": int(probe["trials"]),
+                "prompt_hash_algorithm": "sha256",
+                "persist_prompt_text": bool(probe.get("persist_prompt_text", False)),
+                "skipped_request_ids": list(cancelled_ids),
+            },
+        )
+    return summary, metrics
 
 
 class RunnerPreparation:
@@ -221,9 +346,13 @@ class RunnerPreparation:
         self.dispatcher = dispatcher
         self.preparation_actors: Sequence[PreparationHandle] = ()
         self.local_task: Optional[asyncio.Future[Dict[str, Any]]] = None
-        self._dispatch_future: Optional[Future[List[LLMResponse]]] = None
+        self._dispatch_future: Optional[asyncio.Task[List[LLMResponse]]] = None
         self._cancelled = threading.Event()
-        self._lock = threading.Lock()
+        self.phase = "creating"
+        self.created_workers = 0
+
+    def progress(self) -> Dict[str, Any]:
+        return {"phase": self.phase, "created": self.created_workers}
 
     def start(
         self,
@@ -238,62 +367,57 @@ class RunnerPreparation:
         loop = asyncio.get_running_loop()
         bus = self.dispatcher.register(self.runner_id, runtime_environment(environment))
 
-        async def run_steps(
-            steps: Sequence[RequestStep], window: int, timeout_seconds: float
-        ) -> List[LLMResponse]:
-            resolved_steps = compile_requests(benchmark, steps)
-            runtime = RunnerRuntime(
-                self.runner_id,
-                WorkflowTaskLogic(resolved_steps, datetime.now(timezone.utc)),
-                self.dispatcher,
-                bus,
-                timeout_seconds,
-                # Existing explicit workload concurrency becomes the optional limit.
-                max_outstanding_workers=benchmark.get("concurrent_requests"),
-            )
-            try:
-                return await runtime.run()
-            except asyncio.CancelledError:
-                failure = self.dispatcher.errors.get(self.runner_id)
-                if failure is not None:
-                    raise RuntimeError("Worker result publication failed") from failure
-                raise
+        async def execute_workers() -> Dict[str, Any]:
+            from llmperf_backend.runtime.worker_input import worker_steps
+            import time
 
-        def execute_batch(
-            steps: Sequence[RequestStep], window: int, timeout_seconds: float
-        ) -> List[LLMResponse]:
-            with self._lock:
+            try:
                 if self._cancelled.is_set():
-                    raise RuntimeError("Runner cancelled before submission")
-                dispatch_future = asyncio.run_coroutine_threadsafe(
-                    run_steps(steps, window, timeout_seconds), loop
+                    raise asyncio.CancelledError
+                self.phase = "creating"
+                # Only recipes and dependencies are built here. CPU preparation is
+                # performed by the request actor after the router grants its slot.
+                steps = worker_steps(benchmark, calibrated=True)
+                self.created_workers = len(steps)
+                self.phase = "submitting"
+                runtime = RunnerRuntime(
+                    self.runner_id,
+                    WorkflowTaskLogic(steps, datetime.now(timezone.utc)),
+                    self.dispatcher,
+                    bus,
+                    duration_seconds(benchmark["timeout"]),
+                    max_outstanding_workers=benchmark.get("concurrent_requests"),
                 )
-                self._dispatch_future = dispatch_future
-            return dispatch_future.result()
-
-        def prepare_and_aggregate() -> Dict[str, Any]:
-            try:
-                tokenizer = _prepared_tokenizer(
-                    environment[TOKENIZER_PATH],
-                    environment.get(TOKENIZER_FAST, "true").lower() == "true",
-                )
-                summary, requests = calculate(
+                started_at = time.monotonic()
+                self._dispatch_future = asyncio.create_task(runtime.run())
+                responses = await self._dispatch_future
+                finished_at = time.monotonic()
+                self.phase = "aggregating"
+                summary, requests = await loop.run_in_executor(
+                    self.executor,
+                    aggregate_workers,
                     benchmark,
-                    execution_runtime,
-                    request_router,
-                    environment,
-                    tokenizer,
-                    preparation_actors=self.preparation_actors,
-                    batch_executor=execute_batch,
+                    responses,
+                    started_at,
+                    finished_at,
+                    runtime.timed_out,
+                    tuple(runtime.cancelled_steps),
                 )
+                _attach_runtime(summary, execution_runtime)
+                summary["worker_creation"] = {"created": self.created_workers}
+                self.phase = "finished"
                 return {
                     "ok": True,
                     "summary": summary,
-                    "requests": list(requests),
+                    "requests": requests,
                     "stdout": "",
                     "stderr": "",
                 }
+            except asyncio.CancelledError:
+                self.phase = "cancelled"
+                raise
             except Exception as exc:
+                self.phase = "failed"
                 return {
                     "ok": False,
                     "error": f"{type(exc).__name__}: {exc}",
@@ -301,7 +425,7 @@ class RunnerPreparation:
                     "stderr": traceback.format_exc()[-log_limit:],
                 }
 
-        self.local_task = loop.run_in_executor(self.executor, prepare_and_aggregate)
+        self.local_task = asyncio.create_task(execute_workers())
 
     def ready(self) -> bool:
         return self.local_task is not None and self.local_task.done()
@@ -315,10 +439,11 @@ class RunnerPreparation:
         return f"runner:{self.runner_id}"
 
     def cancel(self, force: bool = False) -> None:
-        with self._lock:
-            self._cancelled.set()
-            if self._dispatch_future is not None:
-                self._dispatch_future.cancel()
+        self._cancelled.set()
+        if self._dispatch_future is not None:
+            self._dispatch_future.cancel()
+        if self.local_task is not None:
+            self.local_task.cancel()
 
     def close(self) -> None:
         self.cancel()

@@ -1,12 +1,20 @@
 # LLMPerf workload YAML
 
+For run-only tasks, `instances.prefix_seed_scope: family` fixes the prefix across
+trials and derives suffix seeds from the family seed, trial, and node path. Default
+`trial` scope preserves previous generation. Trials do not shuffle submission;
+Runner creates eligible Workers, and shared Worker scheduling owns admission.
+See `docs/limitations.md` before interpreting competition or cache hits.
+
 ## Choose the smallest durable shape
 
 - `runners`: immediate independent benchmark points.
+- `runner_groups`: named Runner templates expanded across integer matrices.
 - `runner_plans`: bounded recurring or calendar Runner templates.
 - `task_definitions`: finite causal graphs compiled from atomic invokes.
 
-One Campaign may contain all three. Do not create experiment-specific runtime protocols.
+One Campaign may combine these shapes; rounds accept only immediate Runners/groups.
+Do not create experiment-specific runtime protocols.
 
 ```yaml
 version: "1.0.0"
@@ -28,6 +36,22 @@ seeds derived from the base seed, round, and template index. The next round wait
 all members of the current round are terminal. This shape cannot include RunnerPlans or
 task definitions. Safety checks count the full expansion (at most 10,000 Runners), not
 just templates. `metadata.runner_round` is reserved for Backend expansion.
+
+For matrix phases, use `runner_groups: [{name, phase, matrix, runner}]` and
+`campaign.rounds: {count: 8, seed: date, prefix_seed_scope: family,
+phases: [load, pressure, read]}`. Phase names are arbitrary labels. Every member must
+be terminal before the next phase runs; success is not required. Family scope retains
+prefixes for the same group name and sorted coordinates; input settings must match too.
+Cycle, phase and request index change suffixes. Independent pressure groups can set
+`shared_prefix_tokens: 0`; the framework never infers tiers or guarantees eviction.
+
+`seed: date` or an omitted seed resolves UTC date/time plus a random nonce once.
+The numeric seed persists in each Runner's `metadata.runner_round.seed`. Midnight
+does not reseed. Preview/validation/start resolve independently; pin an integer for
+exact reproduction. `count` is finite (at most 1,000), with at most 10,000 expanded
+Runners persisted upfront. Group matrices allow up to eight dimensions, each with
+1–100 unique integers. `metadata.runner_group` is Backend-owned. See `docs/usage.md`
+and `docs/limitations.md` for authoring and long-test measurement boundaries.
 
 Optional `LLMPERF_PREPARATION_WORKERS` enables bounded chunk generation for ordinary
 bundled-sonnet and external `concatenate` workloads. Tokenization calibrates corpus estimates once per Runner before

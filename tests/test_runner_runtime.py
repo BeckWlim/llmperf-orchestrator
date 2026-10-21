@@ -1,9 +1,11 @@
 """Runner message-driven submission and dependency behavior without Provider calls."""
 
 import asyncio
+import pytest
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Sequence
 from unittest.mock import AsyncMock, Mock
+from concurrent.futures import ThreadPoolExecutor
 
 from pydantic import TypeAdapter, JsonValue
 
@@ -477,5 +479,141 @@ def test_dispatch_pipeline():
         assert reused_metrics["local_input_tokens"] is None
         assert reused_metrics["number_input_tokens"] is None
         await dispatcher.unregister("runner")
+
+    asyncio.run(run())
+
+
+def test_admission_fairness():
+    """A submitting Runner cannot jump ahead of already waiting Runners."""
+
+    async def run():
+        releases = asyncio.Queue()
+        starts = asyncio.Queue()
+        router = Mock()
+
+        async def request(runner_id, configuration, environment):
+            await starts.put(runner_id)
+            await releases.get()
+            return {}, "", configuration
+
+        router.execute.remote = AsyncMock(side_effect=request)
+        dispatcher = WorkerDispatcher(router, MemoryJournal(), 1)
+        for owner in ("large", "small", "other"):
+            dispatcher.register(owner, {})
+        prepared = steps(2)
+        await dispatcher.submit("large", prepared[0], None)
+        assert await asyncio.wait_for(starts.get(), 1) == "large"
+        submissions = []
+        for owner in ("small", "other", "large"):
+            submissions.append(
+                asyncio.create_task(dispatcher.submit(owner, prepared[1], None))
+            )
+            await asyncio.sleep(0)
+        assert len(dispatcher.waiting) == 3
+        for owner in ("small", "other", "large"):
+            await releases.put(None)
+            assert await asyncio.wait_for(starts.get(), 1) == owner
+        await releases.put(None)
+        await asyncio.gather(*submissions)
+        await asyncio.gather(*dispatcher.active.values())
+        for owner in ("large", "small", "other"):
+            await dispatcher.unregister(owner)
+
+    asyncio.run(run())
+
+
+def test_preparation_yields(monkeypatch):
+    """Activated Runners create only recipes while waiting for shared capacity."""
+    import llmperf_backend.runtime.preparation as preparation
+    from llmperf.datasets.tokenizer import TOKENIZER_PATH
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Backend must not prepare inputs")
+
+    monkeypatch.setattr(preparation, "_prepared_tokenizer", forbidden)
+    monkeypatch.setattr(preparation, "_calculation_options", forbidden)
+    monkeypatch.setattr(
+        preparation,
+        "aggregate_workers",
+        lambda benchmark, responses, *args: (
+            {"results": {}},
+            [response[0] for response in responses],
+        ),
+    )
+
+    async def run():
+        gate = asyncio.Event()
+        router = Mock()
+
+        async def request(runner_id, configuration, environment):
+            assert configuration.preparation is not None
+            assert configuration.prompt[0] == ""
+            await gate.wait()
+            return {}, "answer", configuration
+
+        router.execute.remote = AsyncMock(side_effect=request)
+        router.cancel.remote = AsyncMock()
+        dispatcher = WorkerDispatcher(router, MemoryJournal(), 2)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            runners = [
+                preparation.RunnerPreparation(str(index), executor, dispatcher)
+                for index in range(24)
+            ]
+            for runner in runners:
+                runner.start(
+                    {
+                        "repeat": 1,
+                        "model": "test",
+                        "adapter": "openai",
+                        "mean_input_tokens": 10,
+                        "timeout": 10,
+                    },
+                    {TOKENIZER_PATH: "unused"},
+                    {},
+                    4096,
+                )
+            try:
+
+                async def all_created():
+                    while any(runner.created_workers != 1 for runner in runners):
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(all_created(), 5)
+                await asyncio.sleep(0.02)
+                assert len(dispatcher.active) == 2
+                assert len(dispatcher.waiting) == 22
+                assert router.execute.remote.await_count == 2
+                gate.set()
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*(runner.result_async() for runner in runners)),
+                        5,
+                    )
+                except asyncio.TimeoutError:
+                    pytest.fail(
+                        str(
+                            {
+                                "phases": [
+                                    (runner.runner_id, runner.phase, runner.ready())
+                                    for runner in runners
+                                ],
+                                "active": list(dispatcher.active),
+                                "waiting": list(dispatcher.waiting),
+                                "errors": dispatcher.errors,
+                            }
+                        )
+                    )
+                assert all(result["ok"] for result in results)
+                assert all(
+                    result["summary"]["worker_creation"]["created"] == 1
+                    for result in results
+                )
+                assert not dispatcher.waiting
+                assert not dispatcher.active
+            finally:
+                gate.set()
+                for runner in runners:
+                    runner.cancel()
+                    await dispatcher.unregister(runner.runner_id)
 
     asyncio.run(run())

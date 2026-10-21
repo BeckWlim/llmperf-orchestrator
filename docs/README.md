@@ -11,6 +11,7 @@ have been consolidated into these guides; their original text remains in Git his
 | [Task compiler and YAML rules](tasks.md) | Instances, workflows, Runner templates, seeds, limits, failure boundaries, and compiler status |
 | [Architecture](architecture.md) | Component ownership, control plane, and reporting |
 | [Runtime and storage](runtime.md) | Request capacity, durable records, multi-turn history, and recovery |
+| [Limitations and responsibilities](limitations.md) | Family seeds, Runner creation, Worker queues, sampled slots, and cache evidence |
 | [RunnerPlan scheduling](scheduling.md) | Recurrence, timezones, misfires, and overlap policies |
 | [KV-cache measurement](cache-measurement.md) | Retention, residency, promotion, controls, and evidence interpretation |
 | [Testing](testing.md) | Test ownership and opt-in PostgreSQL/Ray checks |

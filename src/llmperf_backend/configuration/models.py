@@ -1,10 +1,22 @@
 """Validated request and configuration models used by the backend."""
 
-from datetime import datetime, time
-from typing import Any, Dict, List, Literal, Optional
+from datetime import datetime, time, timezone
+import hashlib
+from math import prod
+import re
+import secrets
+from typing import Annotated, Any, Dict, List, Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    WithJsonSchema,
+    field_validator,
+    model_validator,
+)
 from llmperf.configuration.duration import Duration
 from llmperf_backend.compiler.requests import (
     RequestPlan,
@@ -107,7 +119,9 @@ class CompiledTaskContext(TaskExecutionContext):
 class BatchTaskContext(TaskExecutionContext):
     execution_kind: Literal["batch"] = "batch"
     dataset_seed: int = Field(ge=0, le=18_446_744_073_709_551_615)
-    seed_version: Literal["batch-v1"] = "batch-v1"
+    seed_version: Literal["batch-v1", "family-suffix-v1"] = "batch-v1"
+    shared_prefix_seed: Optional[int] = Field(default=None, ge=0, le=2**64 - 1)
+    prefix_seed_version: Optional[Literal["family-prefix-v1"]] = None
 
 
 class DatasetSpec(StrictModel):
@@ -228,6 +242,7 @@ class _RequestFields(RequestPlan):
     mean_input_tokens: int = Field(default=550, gt=0)
     stddev_input_tokens: int = Field(default=150, ge=0)
     shared_prefix_tokens: int = Field(default=0, ge=0)
+    shared_prefix_seed: Optional[int] = Field(default=None, ge=0, le=2**64 - 1)
     dataset: Optional[DatasetSpec] = None
     dataset_prompt_mode: Literal["sample", "concatenate"] = "sample"
     dataset_repeat_count: int = Field(default=1, ge=1)
@@ -357,6 +372,8 @@ class BatchBenchmarkConfig(ResolvedBenchmarkConfig):
             raise ValueError("compiled batch cannot define cache_probe")
         if self.dataset_seed != self.task_context.dataset_seed:
             raise ValueError("batch dataset seed must match task context")
+        if self.shared_prefix_seed != self.task_context.shared_prefix_seed:
+            raise ValueError("batch prefix seed must match task context")
         return self
 
 
@@ -403,7 +420,8 @@ class SchedulerConfig(StrictModel):
     """Durable benchmark scheduling settings."""
 
     enabled: bool = True
-    max_concurrent_runners: int = Field(default=64, ge=1, le=1024)
+    max_concurrent_runners: int = Field(default=1024, ge=1, le=16384)
+    preparation_threads: int = Field(default=8, ge=1, le=64)
     poll_interval_seconds: float = Field(default=1.0, gt=0)
     cancel_grace_seconds: float = Field(default=5.0, gt=0)
     stale_after_seconds: int = Field(default=300, gt=0)
@@ -433,9 +451,10 @@ class SchedulerConfig(StrictModel):
 
 
 class PerformanceGuardConfig(StrictModel):
-    """Fail-closed limits for runtime fan-out and submitted workloads."""
+    """Runtime protection, static request limits, and opt-in campaign budgets."""
 
     enabled: bool = True
+    campaign_admission_enabled: bool = False
     max_runner_concurrency: int = Field(default=64, ge=1)
     max_effective_concurrency: int = Field(default=64, ge=1)
     max_campaign_runners: int = Field(default=1_000, ge=1)
@@ -447,6 +466,18 @@ class PerformanceGuardConfig(StrictModel):
     min_ray_object_store_available_ratio: float = Field(default=0.10, ge=0, lt=1)
     resume_ray_object_store_available_ratio: float = Field(default=0.20, gt=0, le=1)
     sample_interval_seconds: float = Field(default=1.0, gt=0, le=60)
+
+    @property
+    def workload_limits(self) -> Dict[str, int]:
+        """Return thresholds for always-checked estimates and request limits."""
+
+        return {
+            "planned_runners": self.max_campaign_runners,
+            "provider_requests": self.max_campaign_provider_requests,
+            "token_budget": self.max_campaign_token_budget,
+            "max_runner_concurrency": self.max_runner_concurrency,
+            "effective_concurrency": self.max_effective_concurrency,
+        }
 
     @model_validator(mode="after")
     def validate_runtime_watermarks(self) -> "PerformanceGuardConfig":
@@ -611,6 +642,10 @@ class BenchmarkRunnerSpec(RunnerExecutionSettings, RunnerGenerationSettings):
             raise ValueError(
                 "metadata.runner_round is reserved for Backend round expansion"
             )
+        if "runner_group" in value:
+            raise ValueError(
+                "metadata.runner_group is reserved for Backend matrix expansion"
+            )
         return value
 
 
@@ -717,11 +752,75 @@ class RunnerPlanCreate(RunnerPlanTiming):
     runner: BenchmarkRunnerSpec
 
 
+def dated_campaign_seed() -> int:
+    """Fresh UTC-date-based seed, resolved once and persisted with every Runner."""
+    material = f"{datetime.now(timezone.utc).isoformat()}:{secrets.token_hex(16)}"
+    return int.from_bytes(hashlib.sha256(material.encode()).digest()[:8], "big")
+
+
 class RunnerRounds(StrictModel):
     """Repeat the campaign's Runner templates behind completion barriers."""
 
     count: int = Field(ge=1, le=1000)
-    seed: int = Field(ge=0)
+    seed: Annotated[
+        int,
+        WithJsonSchema(
+            {
+                "anyOf": [
+                    {"type": "integer", "minimum": 0},
+                    {"type": "string", "const": "date"},
+                ]
+            },
+            mode="validation",
+        ),
+    ] = Field(default_factory=dated_campaign_seed, ge=0)
+    prefix_seed_scope: Literal["round", "family"] = "round"
+    phases: List[str] = Field(
+        default_factory=lambda: ["default"], min_length=1, max_length=16
+    )
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def resolve_seed(cls, raw_seed: object) -> object:
+        return dated_campaign_seed() if raw_seed == "date" else raw_seed
+
+    @field_validator("phases")
+    @classmethod
+    def validate_phases(cls, phases: List[str]) -> List[str]:
+        if len(set(phases)) != len(phases) or any(
+            re.fullmatch(r"[A-Za-z0-9_-]{1,64}", phase) is None for phase in phases
+        ):
+            raise ValueError(
+                "round phases need unique names containing 1-64 letters, digits, _ or -"
+            )
+        return phases
+
+
+class RunnerGroup(StrictModel):
+    """Compact immediate Runner templates, expanded by the Backend before admission."""
+
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    phase: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    matrix: Dict[str, List[StrictInt]] = Field(min_length=1, max_length=8)
+    runner: BenchmarkRunnerSpec
+
+    @field_validator("matrix")
+    @classmethod
+    def validate_matrix(cls, matrix: Dict[str, List[int]]) -> Dict[str, List[int]]:
+        for name, values in matrix.items():
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) is None:
+                raise ValueError(
+                    "matrix dimension names need 1-64 letters, digits, _ or -"
+                )
+            if not values or len(values) > 100 or len(set(values)) != len(values):
+                raise ValueError("matrix dimensions need 1-100 unique integer values")
+        if prod(len(values) for values in matrix.values()) > 10000:
+            raise ValueError("Runner group cannot exceed 10000 matrix coordinates")
+        return matrix
+
+    @property
+    def count(self) -> int:
+        return prod(len(values) for values in self.matrix.values())
 
 
 class BenchmarkCampaignCreate(StrictModel):
@@ -739,29 +838,74 @@ class BenchmarkCampaignStart(StrictModel):
     version: ProtocolVersion = PROTOCOL_VERSION
     campaign: BenchmarkCampaignCreate
     runners: List[BenchmarkRunnerSpec] = Field(default_factory=list, max_length=100)
+    runner_groups: List[RunnerGroup] = Field(default_factory=list, max_length=100)
     runner_plans: List[RunnerPlanCreate] = Field(default_factory=list, max_length=100)
     task_definitions: List[TaskDefinitionCreate] = Field(
         default_factory=list, max_length=20
     )
 
+    @property
+    def immediate_runner_count(self) -> int:
+        return len(self.runners) + sum(group.count for group in self.runner_groups)
+
     @model_validator(mode="after")
     def validate_workload(self) -> "BenchmarkCampaignStart":
         workload_size = (
-            len(self.runners) + len(self.runner_plans) + len(self.task_definitions)
+            len(self.runners)
+            + len(self.runner_groups)
+            + len(self.runner_plans)
+            + len(self.task_definitions)
         )
         if workload_size == 0:
             raise ValueError(
-                "campaign requires runners, runner_plans, or task_definitions"
+                "campaign requires runners, runner_groups, runner_plans, or task_definitions"
             )
         if workload_size > 100:
             raise ValueError("campaign workload cannot contain more than 100 items")
-        if self.campaign.rounds is not None:
-            if not self.runners or self.runner_plans or self.task_definitions:
+        rounds = self.campaign.rounds
+        phases = rounds.phases if rounds is not None else ["default"]
+        group_keys = [
+            (group.name, group.phase or phases[0]) for group in self.runner_groups
+        ]
+        if len(set(group_keys)) != len(group_keys):
+            raise ValueError("Runner group names must be unique within a phase")
+        for group in self.runner_groups:
+            if group.phase is not None and (
+                rounds is None or group.phase not in phases
+            ):
+                raise ValueError(
+                    "Runner group phase must name a declared campaign round phase"
+                )
+        if self.immediate_runner_count * (rounds.count if rounds else 1) > 10000:
+            raise ValueError(
+                "campaign rounds/groups cannot exceed 10000 expanded runners"
+            )
+        if rounds is not None:
+            if (
+                not self.immediate_runner_count
+                or self.runner_plans
+                or self.task_definitions
+            ):
                 raise ValueError(
                     "campaign rounds require only immediate Runner templates"
                 )
-            if len(self.runners) * self.campaign.rounds.count > 10000:
-                raise ValueError("campaign rounds cannot exceed 10000 expanded runners")
+            occupied_phases = {group.phase or phases[0] for group in self.runner_groups}
+            if self.runners:
+                occupied_phases.add(phases[0])
+            if occupied_phases != set(phases):
+                raise ValueError(
+                    "each round phase must contain at least one Runner template"
+                )
+            if rounds.prefix_seed_scope == "family" and any(
+                runner.request is not None and runner.request.cache_probe is not None
+                for runner in [
+                    *self.runners,
+                    *(group.runner for group in self.runner_groups),
+                ]
+            ):
+                raise ValueError(
+                    "family-scoped rounds use ordinary inputs, not cache_probe"
+                )
         instance_count = 0
         for definition in self.task_definitions:
             instance_count += definition.instance_count

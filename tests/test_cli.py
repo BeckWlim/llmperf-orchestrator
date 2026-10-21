@@ -70,7 +70,15 @@ class FakeClient(StubClient):
             payloads.append(self.start_runner(payload))
         return {"items": payloads}
 
-    def start_campaign(self, campaign, runners, runner_plans, task_definitions=None):
+    def start_campaign(
+        self,
+        campaign,
+        runners,
+        runner_plans,
+        task_definitions=None,
+        *,
+        runner_groups=None,
+    ):
         assert campaign["name"] == "glm-study"
         payloads = []
         for runner in runners:
@@ -108,6 +116,7 @@ class FakeClient(StubClient):
         runner_plans,
         task_definitions=None,
         *,
+        runner_groups=None,
         timeout,
         progress_callback=None,
     ):
@@ -159,6 +168,7 @@ class FakeClient(StubClient):
         runner_plans,
         task_definitions=None,
         *,
+        runner_groups=None,
         limit,
         node_limit,
         debug,
@@ -260,7 +270,13 @@ runners:
 def test_task_start_counts(tmp_path, caplog):
     class ExpandedTaskClient(FakeClient):
         def start_campaign(
-            self, campaign, runners, runner_plans, task_definitions=None
+            self,
+            campaign,
+            runners,
+            runner_plans,
+            task_definitions=None,
+            *,
+            runner_groups=None,
         ):
             response = super().start_campaign(
                 campaign, runners, runner_plans, task_definitions
@@ -1039,11 +1055,54 @@ def test_campaign_list_table(capsys):
     assert "completed" in output
     assert "succeeded" in output
     assert "cc895606-89d4-4562-811d-2e12a1e1a7de" in output
-    assert "0/0/2/0/0" in output
-    assert "RUN/PLAN/TASK/DISP" in output
-    assert "2/1/3/6" in output
+    assert "W-CREATED/PLAN" in output
+    assert "W-WAIT/Q/RUN" in output
+    assert "R-QUEUED/ACTIVE" in output
+    assert "-/-" in output
     assert "deepseek-v4-pro-kvcac" in output
     assert "must not be rendered" not in output
+
+
+def test_worker_progress_view(capsys):
+    from llmperf_cli.presentation.projections import project_runner
+    from llmperf_cli.commands.main import print_runner_summary
+
+    raw = {
+        "runner_id": "runner",
+        "workers": {
+            "created": 256,
+            "planned": 256,
+            "submitted": 12,
+            "not_submitted": 244,
+            "admission_waiting": 1,
+            "queued": 5,
+            "running": 2,
+            "succeeded": 5,
+            "creation_phases": {"submitting": 1, "secret": "hidden"},
+            "prompt": "hidden",
+        },
+        "request_slots": {
+            "scope": "global",
+            "busy": 64,
+            "free": 0,
+            "total": 64,
+            "sampled": True,
+            "snapshot_age_seconds": 1.5,
+            "endpoint": "hidden",
+        },
+    }
+    projected = project_runner(raw)
+    print_runner_summary(projected)
+    rendered = capsys.readouterr().out
+    assert "created=256" in rendered
+    assert "admission_waiting=1" in rendered
+    assert "queued=5" in rendered
+    assert "running=2" in rendered
+    assert "Global request slots: busy=64 free=0 total=64" in rendered
+    assert "hidden" not in str(projected)
+    raw["workers"]["created"] = -1
+    with pytest.raises(ClientError, match="nonnegative"):
+        project_runner(raw)
 
 
 def test_campaign_status_view(capsys):
@@ -1352,6 +1411,15 @@ def test_scheduler_projection(capsys):
         },
         "performance_guard": {
             "enabled": True,
+            "campaign_admission_enabled": False,
+            "workload_limits": {
+                "planned_runners": 1000,
+                "provider_requests": 10000,
+                "token_budget": 100000000,
+                "max_runner_concurrency": 64,
+                "effective_concurrency": 64,
+                "private": "must-not-render",
+            },
             "tripped": False,
             "host_memory": {
                 "available": True,
@@ -1375,15 +1443,23 @@ def test_scheduler_projection(capsys):
     assert projection.renderer == "scheduler_status"
     assert "Scheduler: scheduler-1  Status: running" in default_output
     assert "Request slots: busy=2 live=4" in default_output
-    assert "Runners: active=0 max=4 workers=2" in default_output
+    assert "Runners: active=0 max=4" in default_output
     assert "requests_per_actor=8" in default_output
     assert (
         "Ray: status=healthy nodes=1 object_store_available=99.65% "
         "claim_blocked=False" in default_output
     )
     assert (
-        "Guard: enabled=True tripped=False memory_utilization=44.27%" in default_output
+        "Runtime guard: enabled=True tripped=False memory_utilization=44.27%"
+        in default_output
     )
+    assert "Campaign admission: enabled=False" in default_output
+    assert (
+        "Campaign budgets: runners=1000 requests=10000 estimated_tokens=100000000"
+        in default_output
+    )
+    assert "Static concurrency limits: per_runner=64 effective=64" in default_output
+    assert "must-not-render" not in default_output
     assert "ray://must-not-render" not in default_output
     assert "node:private" not in default_output
 
@@ -1404,6 +1480,14 @@ def test_scheduler_projection(capsys):
         == 0.44273800488308934
     )
     assert json_output["ray_runtime"]["cluster_resources"] == {"CPU": 8}
+    assert json_output["performance_guard"]["campaign_admission_enabled"] is False
+    assert json_output["performance_guard"]["workload_limits"] == {
+        "planned_runners": 1000,
+        "provider_requests": 10000,
+        "token_budget": 100000000,
+        "max_runner_concurrency": 64,
+        "effective_concurrency": 64,
+    }
     assert "ray_address" not in json_output
 
 

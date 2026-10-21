@@ -169,6 +169,28 @@ def test_round_expansion():
     assert runners != expand_rounds(templates, 100, 20261015)
 
 
+def test_round_family():
+    templates = [{"benchmark": {}, "label": name} for name in ("a", "b")]
+    original = deepcopy(templates)
+    rounds = expand_rounds(templates, 3, 19, "family")
+    assert templates == original
+    assert rounds == expand_rounds(templates, 3, 19, "family")
+    assert len({item["benchmark"]["dataset_seed"] for item in rounds}) == 6
+    prefixes = [
+        {item["benchmark"]["shared_prefix_seed"] for item in rounds[index::2]}
+        for index in range(2)
+    ]
+    assert all(len(values) == 1 for values in prefixes)
+    assert prefixes[0].isdisjoint(prefixes[1])
+    assert all(
+        item["metadata"]["runner_round"]["prefix_seed_scope"] == "family"
+        for item in rounds
+    )
+    legacy = expand_rounds(templates, 3, 19)
+    assert legacy == expand_rounds(templates, 3, 19, "round")
+    assert all("shared_prefix_seed" not in item["benchmark"] for item in legacy)
+
+
 def test_round_barrier():
     runners = expand_rounds([{"benchmark": {}} for _ in range(8)], 3, 1)
     for runner in runners:

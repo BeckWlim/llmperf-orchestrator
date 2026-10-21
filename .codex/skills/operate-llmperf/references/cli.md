@@ -1,5 +1,10 @@
 # LLMPerf CLI Operations
 
+`campaign preview -f FILE` also displays `runner_groups` matrix sizes, Worker counts,
+ordered phases, cycle count and the resolved round seed. The CLI forwards groups to
+Backend compilation; it does not expand them. A `seed: date` preview is independent
+of a later start: pin its numeric seed in YAML for exact input reproduction.
+
 ## Preflight
 
 Use read-only checks first:
@@ -107,6 +112,12 @@ Runners; Scheduler owns execution.
 
 ## Waiting and logs
 
+Campaign list and Runner views expose Worker creation/submission counts and sampled
+admission waits, slot queues, and physical executions. Runner lifecycle counts are
+labelled separately. Slots are global, not Campaign quotas. Unknown counts display
+`-`; JSON uses null. See `docs/limitations.md` for telemetry age and materialization
+scope. Configuration/task counts remain in status/JSON diagnostics.
+
 `--wait` polls durable state and logs only snapshot changes. Retain the durable ID so a CLI
 disconnect can reconnect without affecting execution. Use bounded poll intervals and
 timeouts appropriate to the workload; a client timeout does not cancel the Campaign.
@@ -136,6 +147,14 @@ Ray-capacity, and performance-guard summary; `scheduler status --json` serialize
 allow-listed projection. Human-readable utilization ratios use two-decimal percentages;
 JSON retains the original 0-1 numeric ratios. Backend Ray addresses and private resource
 labels are excluded.
+
+Runtime protection defaults on; static validation and concurrency checks remain active.
+Whole-campaign Runner/request/token budgets are advisory unless
+`LLMPERF_CAMPAIGN_ADMISSION_ENABLED=true`. Status separates runtime `enabled`/`tripped`
+from `campaign_admission_enabled` and exposes `workload_limits`. `safe=false` in an
+assessment can be advisory; `blocking_risks` identifies actual rejection reasons.
+An older Backend without the new field reports campaign admission as unknown.
+Changing either guard setting requires a Backend restart, not Provider reload.
 
 ## Failure triage
 

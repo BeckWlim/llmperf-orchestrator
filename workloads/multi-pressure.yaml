@@ -1,0 +1,134 @@
+# 100 prefix families x 10 trials = 1,000 independent Runners.
+# 17,900 requests; exactly 6,710,886,400 input tokens (original basic-pressure budget).
+# No trial shuffling, serial streams, artificial revisit delays, or fairness logic.
+# Same family prefix across trials; suffix derives from family seed, trial and request.
+# Worker admission and request slots determine interleaving. DFS hits need tier evidence.
+# Requires the family-seed Backend. No inference is started by validation.
+# 21,600 seconds is a Runner execution deadline; preparation is outside that deadline.
+version: "1.0.0"
+wait: false
+campaign:
+  name: multi-pressure-family-recall
+  description: 100 stable prefix families and ten trials with mixed 32K/128K/512K/800K inputs.
+  tags:
+    purpose: competing-prefix-recall
+    offered_prefix_ratio: 0.8
+    prefix_families: 100
+    trials: 10
+    planned_runners: 1000
+    planned_requests: 17900
+    estimated_input_tokens: 6710886400
+task_definitions:
+- name: families-32k
+  instances: &family_instances
+    matrix:
+      family: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+    trials: 10
+    seed: 202610201900
+    prefix_seed_scope: family
+  workflow: &batch_workflow
+  - run:
+      name: batch
+  runner: &pressure_runner
+    label: sharegpt-32k
+    provider: dfs-beta
+    model: spark-x2.5-1.7b-L4
+    tokenizer:
+      id: hf-internal-testing/llama-tokenizer
+      revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0
+      use_fast: true
+    timeout: 21600
+    concurrent_requests: 8
+    mean_output_tokens: 16
+    stddev_output_tokens: 0
+    output_token_count: provider
+    additional_sampling_params:
+      temperature: 0
+      enable_thinking: false
+      stream_options:
+        include_usage: true
+    inputs:
+      default: &sharegpt_input
+        tokens: 32768
+        shared_prefix_tokens: 26214
+        dataset:
+          source: huggingface
+          id: anon8231489123/ShareGPT_Vicuna_unfiltered
+          filename: ShareGPT_V3_unfiltered_cleaned_split.json
+          revision: 192ab2185289094fc556ec8ce5ce1e8e587154ca
+          adapter: sharegpt-user
+        dataset_prompt_mode: concatenate
+    request:
+      repeat: 18
+- name: families-128k
+  instances:
+    <<: *family_instances
+    matrix:
+      family: [26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49]
+  workflow: *batch_workflow
+  runner: &runner_128k
+    <<: *pressure_runner
+    label: sharegpt-128k
+    inputs:
+      default:
+        <<: *sharegpt_input
+        tokens: 131072
+        shared_prefix_tokens: 104857
+- name: family-128k-short
+  instances:
+    <<: *family_instances
+    matrix:
+      family: [50]
+  workflow: *batch_workflow
+  runner:
+    <<: *runner_128k
+    request:
+      repeat: 17
+- name: families-512k
+  instances:
+    <<: *family_instances
+    matrix:
+      family: [51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74]
+  workflow: *batch_workflow
+  runner: &runner_512k
+    <<: *pressure_runner
+    label: sharegpt-512k
+    inputs:
+      default:
+        <<: *sharegpt_input
+        tokens: 524288
+        shared_prefix_tokens: 419430
+- name: family-512k-short
+  instances:
+    <<: *family_instances
+    matrix:
+      family: [75]
+  workflow: *batch_workflow
+  runner:
+    <<: *runner_512k
+    request:
+      repeat: 17
+- name: families-800k
+  instances:
+    <<: *family_instances
+    matrix:
+      family: [76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92]
+  workflow: *batch_workflow
+  runner: &runner_800k
+    <<: *pressure_runner
+    label: sharegpt-800k
+    inputs:
+      default:
+        <<: *sharegpt_input
+        tokens: 819200
+        shared_prefix_tokens: 655360
+- name: families-800k-short
+  instances:
+    <<: *family_instances
+    matrix:
+      family: [93, 94, 95, 96, 97, 98, 99, 100]
+  workflow: *batch_workflow
+  runner:
+    <<: *runner_800k
+    request:
+      repeat: 17

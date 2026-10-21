@@ -448,6 +448,8 @@ class LLMPerfClient:
         runners: List[Dict[str, Any]],
         runner_plans: List[Dict[str, Any]],
         task_definitions: Optional[List[Dict[str, Any]]] = None,
+        *,
+        runner_groups: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         return self._request(
             "POST",
@@ -458,6 +460,7 @@ class LLMPerfClient:
                 "runners": runners,
                 "runner_plans": runner_plans,
                 "task_definitions": task_definitions or [],
+                **({"runner_groups": runner_groups} if runner_groups else {}),
             },
         )
 
@@ -468,6 +471,7 @@ class LLMPerfClient:
         runner_plans: List[Dict[str, Any]],
         task_definitions: Optional[List[Dict[str, Any]]] = None,
         *,
+        runner_groups: Optional[List[Dict[str, Any]]] = None,
         timeout: float,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
@@ -477,6 +481,7 @@ class LLMPerfClient:
             "runners": runners,
             "runner_plans": runner_plans,
             "task_definitions": task_definitions or [],
+            **({"runner_groups": runner_groups} if runner_groups else {}),
         }
         if progress_callback is not None:
             return self._stream_request(
@@ -500,6 +505,7 @@ class LLMPerfClient:
         runner_plans: List[Dict[str, Any]],
         task_definitions: Optional[List[Dict[str, Any]]] = None,
         *,
+        runner_groups: Optional[List[Dict[str, Any]]] = None,
         limit: int,
         node_limit: int,
         debug: bool,
@@ -513,6 +519,7 @@ class LLMPerfClient:
                 "runners": runners,
                 "runner_plans": runner_plans,
                 "task_definitions": task_definitions or [],
+                **({"runner_groups": runner_groups} if runner_groups else {}),
             },
             query={
                 "limit": limit,

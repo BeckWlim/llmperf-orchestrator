@@ -31,7 +31,13 @@ from llmperf.clients.factory import (
 )
 
 from llmperf.clients.models import RequestConfig
-from llmperf.benchmark.execution import BatchExecutor, RequestStep
+from llmperf.benchmark.execution import (
+    BatchExecutor,
+    BenchmarkStages,
+    PreparedBatch,
+    RequestStep,
+    staged_benchmark,
+)
 from llmperf.clients.base import LLMResponse
 from llmperf.datasets.prompts import PromptDatasetSource, prepare_prompt_requests
 from llmperf.clients.launcher import RequestsLauncher
@@ -162,7 +168,8 @@ def _execute_cache_probe(
     output_token_count: str = "provider",
     request_executor: Optional[Callable[[RequestConfig], LLMResponse]] = None,
     batch_executor: Optional[BatchExecutor] = None,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    stage_batches: bool = False,
+) -> BenchmarkStages:
     """Execute a dependency-aware probe without changing the global Scheduler."""
 
     started = time.monotonic()
@@ -179,7 +186,7 @@ def _execute_cache_probe(
     requests_per_actor = actor_concurrency()
     clients = (
         []
-        if request_executor is not None or batch_executor is not None
+        if request_executor is not None or batch_executor is not None or stage_batches
         else construct_clients(
             llm_api=llm_api,
             num_clients=request_actor_count(thread_count, requests_per_actor),
@@ -256,7 +263,7 @@ def _execute_cache_probe(
                     errors.append((exc, exc.__traceback__))
 
     skipped_requests: List[CacheProbeRequest] = []
-    if batch_executor is None:
+    if batch_executor is None and not stage_batches:
         threads = [
             threading.Thread(target=execute_slot, args=(slot_index,))
             for slot_index in range(thread_count)
@@ -297,8 +304,10 @@ def _execute_cache_probe(
                 )
             )
             previous_by_family[planned.family_id] = planned.request_id
-        responses = batch_executor(
-            prepared_steps, num_concurrent_requests, test_timeout_s
+        started = time.monotonic()
+        deadline = started + test_timeout_s
+        responses = yield PreparedBatch(
+            prepared_steps, num_concurrent_requests, test_timeout_s, batch_executor
         )
         failed_families: set[str] = set()
         for completion_index, (
@@ -405,6 +414,7 @@ def _execute_cache_probe(
     return metadata, completed
 
 
+@staged_benchmark
 def get_token_throughput_latencies(
     model: str,
     mean_input_tokens: int,
@@ -435,7 +445,9 @@ def get_token_throughput_latencies(
     preparation_buffer_chunks: int = 8,
     literal_prompts: Optional[Sequence[Optional[str]]] = None,
     prepared_inputs: Optional[Sequence[Tuple[Tuple[str, int], Dict[str, Any]]]] = None,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    shared_prefix_seed: Optional[int] = None,
+    stage_batches: bool = False,
+) -> BenchmarkStages:
     """Get the token throughput and latencies for the given model.
 
     Args:
@@ -572,6 +584,7 @@ def get_token_throughput_latencies(
             shared_prefix_tokens,
             mean_output_tokens,
             source=prompt_dataset_source,
+            shared_prefix_seed=shared_prefix_seed,
         )
         prompt_stream = PreparedStream(
             preparation_plan,
@@ -601,6 +614,7 @@ def get_token_throughput_latencies(
             get_token_length=get_token_length,
             seed=prompt_seed,
             shared_prefix_tokens=shared_prefix_tokens,
+            shared_prefix_seed=shared_prefix_seed,
         )
         prompts.extend(prepared_prompts)
         prompt_evidence.extend(prepared_evidence)
@@ -663,30 +677,33 @@ def get_token_throughput_latencies(
             tokenizer,
             effective_dataset_seed,
         )
-        return _execute_cache_probe(
-            plan=plan,
-            model=model,
-            llm_api=llm_api,
-            num_concurrent_requests=num_concurrent_requests,
-            num_output_tokens_list=num_output_tokens_list,
-            additional_sampling_params=sampling_parameters,
-            test_timeout_s=test_timeout_s,
-            get_token_length=get_token_length,
-            cache_probe=probe_config,
-            dataset_seed=effective_dataset_seed,
-            tokenizer_provenance=tokenizer_provenance,
-            benchmark_metadata={
-                "mean_input_tokens": mean_input_tokens,
-                "stddev_input_tokens": stddev_input_tokens,
-                "shared_prefix_tokens": shared_prefix_tokens,
-                "prompt_dataset": dict(prompt_dataset_metadata),
-                "mean_output_tokens": mean_output_tokens,
-                "stddev_output_tokens": stddev_output_tokens,
-            },
-            prompt_evidence=prompt_evidence,
-            output_token_count=output_token_count,
-            request_executor=request_executor,
-            batch_executor=batch_executor,
+        return (
+            yield from _execute_cache_probe(
+                plan=plan,
+                model=model,
+                llm_api=llm_api,
+                num_concurrent_requests=num_concurrent_requests,
+                num_output_tokens_list=num_output_tokens_list,
+                additional_sampling_params=sampling_parameters,
+                test_timeout_s=test_timeout_s,
+                get_token_length=get_token_length,
+                cache_probe=probe_config,
+                dataset_seed=effective_dataset_seed,
+                tokenizer_provenance=tokenizer_provenance,
+                benchmark_metadata={
+                    "mean_input_tokens": mean_input_tokens,
+                    "stddev_input_tokens": stddev_input_tokens,
+                    "shared_prefix_tokens": shared_prefix_tokens,
+                    "prompt_dataset": dict(prompt_dataset_metadata),
+                    "mean_output_tokens": mean_output_tokens,
+                    "stddev_output_tokens": stddev_output_tokens,
+                },
+                prompt_evidence=prompt_evidence,
+                output_token_count=output_token_count,
+                request_executor=request_executor,
+                batch_executor=batch_executor,
+                stage_batches=stage_batches,
+            )
         )
     start_time = time.monotonic()
     pbar = tqdm(total=max_num_completed_requests)
@@ -694,7 +711,7 @@ def get_token_throughput_latencies(
     requests_per_actor = actor_concurrency()
     clients = (
         []
-        if request_executor is not None or batch_executor is not None
+        if request_executor is not None or batch_executor is not None or stage_batches
         else construct_clients(
             llm_api=llm_api,
             num_clients=request_actor_count(worker_count, requests_per_actor),
@@ -852,7 +869,7 @@ def get_token_throughput_latencies(
                     request_thread_errors.append((exc, exc.__traceback__))
             request_threads_stop.set()
 
-    if batch_executor is None:
+    if batch_executor is None and not stage_batches:
         threads = []
         for i in range(worker_count):
             thread = threading.Thread(target=launch_request, args=(i,))
@@ -880,9 +897,10 @@ def get_token_throughput_latencies(
                 )
             prepared_steps.append(RequestStep(str(prepared_index), request_config))
         start_time = time.monotonic()
-        for response_metrics, response_text, response_config in batch_executor(
-            prepared_steps, num_concurrent_requests, test_timeout_s
-        ):
+        responses = yield PreparedBatch(
+            prepared_steps, num_concurrent_requests, test_timeout_s, batch_executor
+        )
+        for response_metrics, response_text, response_config in responses:
             if input_messages is not None:
                 response_metrics[common_metrics.LOCAL_INPUT_TOKENS] = None
             completed_requests.append(response_metrics)

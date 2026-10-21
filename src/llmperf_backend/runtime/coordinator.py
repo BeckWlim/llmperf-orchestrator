@@ -103,6 +103,8 @@ class RuntimeCoordinator:
         self.order: deque[str] = deque()
         self.admitted: set[str] = set()
         self.condition = asyncio.Condition()
+        # Do not flood the DB pool with one lease-lock waiter per active Runner.
+        self.claim_lock = asyncio.Lock()
         self.task: Optional[asyncio.Task[None]] = None
         self.last_error: Optional[str] = None
         self.instances: Dict[str, Dict[str, Any]] = {}
@@ -174,7 +176,8 @@ class RuntimeCoordinator:
                 else:
                     del self.queues[campaign_id]
             try:
-                runner = await self.repository.start_selected(runner_id, owner)
+                async with self.claim_lock:
+                    runner = await self.repository.start_selected(runner_id, owner)
             except BaseException:
                 self.admitted.discard(runner_id)
                 raise

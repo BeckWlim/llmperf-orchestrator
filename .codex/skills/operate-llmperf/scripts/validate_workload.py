@@ -16,7 +16,7 @@ from llmperf_backend.configuration.models import (
     dump_model,
 )
 from llmperf.version import PROTOCOL_VERSION
-from llmperf_backend.compiler.rounds import expand_rounds
+from llmperf_backend.compiler.rounds import expand_rounds, expand_runner_group
 from llmperf_backend.compiler.safety import WorkloadSafetyError, assess_workload
 
 
@@ -33,10 +33,13 @@ def load_document(path: Path) -> Dict[str, Any]:
 def _safety_summary(assessment: Dict[str, Any]) -> str:
     metrics = assessment["metrics"]
     return (
-        f"safety=safe planned_runners={metrics['planned_runners']} "
+        f"campaign_admission={assessment['campaign_admission_enabled']} "
+        f"within_limits={assessment['safe']} "
+        f"planned_runners={metrics['planned_runners']} "
         f"provider_requests={metrics['provider_requests']} "
         f"token_budget={metrics['token_budget']} "
         f"effective_concurrency={metrics['effective_concurrency']} "
+        f"advisory_risks={len(assessment['risks'])} "
         f"warnings={len(assessment['warnings'])}"
     )
 
@@ -49,24 +52,36 @@ def validate_document(
     ray_actor_max_concurrency: int = 1,
     max_runner_concurrency: int = 32,
     max_effective_concurrency: int = 32,
+    enforce_campaign_limits: bool = False,
+    preparation_workers: int = 0,
 ) -> str:
     if ray_num_cpus < 1 or ray_actor_num_cpus <= 0:
         raise ValueError("Ray CPU and actor CPU values must be greater than zero")
-    ray_actor_capacity = int(ray_num_cpus / ray_actor_num_cpus)
+    if preparation_workers < 0:
+        raise ValueError("preparation_workers must be nonnegative")
+    ray_actor_capacity = int((ray_num_cpus - preparation_workers) / ray_actor_num_cpus)
     if ray_actor_capacity < 1:
         raise ValueError("Ray runtime cannot schedule even one configured actor")
     guard = PerformanceGuardConfig(
+        campaign_admission_enabled=enforce_campaign_limits,
         max_runner_concurrency=max_runner_concurrency,
         max_effective_concurrency=max_effective_concurrency,
     )
     if document.get("version") != PROTOCOL_VERSION:
         raise ValueError(f"YAML version must be {PROTOCOL_VERSION!r}")
     if "campaign" not in document:
-        runner = BenchmarkRunnerCreate.model_validate(document)
-        provider = runner.provider or "<backend-default>"
-        model = runner.model or "<backend-default>"
+        runner_model = BenchmarkRunnerCreate.model_validate(document)
+        provider = runner_model.provider or "<backend-default>"
+        model = runner_model.model or "<backend-default>"
         assessment = assess_workload(
-            [runner.execution_document() if runner.request is not None or runner.inputs is not None else {"benchmark": None}],
+            [
+                (
+                    runner_model.execution_document()
+                    if runner_model.request is not None
+                    or runner_model.inputs is not None
+                    else {"benchmark": None}
+                )
+            ],
             [],
             [],
             guard,
@@ -83,26 +98,57 @@ def validate_document(
         key: value for key, value in document.items() if key not in {"wait", "export"}
     }
     campaign = BenchmarkCampaignStart.model_validate(payload)
-    runner_templates = [runner.execution_document() if runner.request is not None or runner.inputs is not None else {"benchmark": None} for runner in campaign.runners]
+    runner_templates = [
+        (
+            runner.execution_document()
+            if runner.request is not None or runner.inputs is not None
+            else {"benchmark": None}
+        )
+        for runner in campaign.runners
+    ]
     rounds = campaign.campaign.rounds
+    for group in campaign.runner_groups:
+        runner_templates.extend(
+            expand_runner_group(
+                group.runner.execution_document(), group.name, group.matrix, group.phase
+            )
+        )
     expanded_runners = (
-        expand_rounds(runner_templates, rounds.count, rounds.seed)
+        expand_rounds(
+            runner_templates,
+            rounds.count,
+            rounds.seed,
+            rounds.prefix_seed_scope,
+            rounds.phases,
+        )
         if rounds is not None
         else runner_templates
     )
     plans = []
     for runner_plan in campaign.runner_plans:
-        item = dump_model(runner_plan)
-        item.pop("runner")
-        runner = runner_plan.runner.execution_document() if runner_plan.runner.request is not None or runner_plan.runner.inputs is not None else {"benchmark": None}
-        item.pop("name", None)
-        plans.append({"plan": item, "runner_template": runner})
+        plan_document = dump_model(runner_plan)
+        plan_document.pop("runner")
+        plan_runner_document = (
+            runner_plan.runner.execution_document()
+            if runner_plan.runner.request is not None
+            or runner_plan.runner.inputs is not None
+            else {"benchmark": None}
+        )
+        plan_document.pop("name", None)
+        plans.append({"plan": plan_document, "runner_template": plan_runner_document})
     tasks = []
     for definition in campaign.task_definitions:
-        item = dump_model(definition)
-        item.pop("runner")
-        runner = definition.runner.execution_document() if definition.runner.request is not None or definition.runner.inputs is not None else {"benchmark": None}
-        tasks.append({"definition": item, "runner_template": runner})
+        task_document = dump_model(definition)
+        task_document.pop("runner")
+        task_runner_document = (
+            definition.runner.execution_document()
+            if definition.runner.request is not None
+            or definition.runner.inputs is not None
+            else {"benchmark": None}
+        )
+        tasks.append(
+            {"definition": task_document, "runner_template": task_runner_document}
+        )
     assessment = assess_workload(
         expanded_runners,
         plans,
@@ -114,7 +160,8 @@ def validate_document(
     )
     return (
         "valid campaign workload: "
-        f"runners={len(campaign.runners)} "
+        f"runners={len(expanded_runners)} "
+        f"runner_groups={len(campaign.runner_groups)} "
         f"runner_plans={len(campaign.runner_plans)} "
         f"task_definitions={len(campaign.task_definitions)} "
         f"{_safety_summary(assessment)}"
@@ -145,7 +192,13 @@ def main() -> int:
         help="Maximum simultaneous requests per client actor",
     )
     parser.add_argument("--max-runner-concurrency", type=int, default=32)
+    parser.add_argument("--preparation-workers", type=int, default=0)
     parser.add_argument("--max-effective-concurrency", type=int, default=32)
+    parser.add_argument(
+        "--enforce-campaign-limits",
+        action="store_true",
+        help="Reject campaign totals above packaged budgets; advisory by default.",
+    )
     arguments = parser.parse_args()
     try:
         print(
@@ -157,6 +210,8 @@ def main() -> int:
                 ray_actor_max_concurrency=arguments.ray_actor_max_concurrency,
                 max_runner_concurrency=arguments.max_runner_concurrency,
                 max_effective_concurrency=arguments.max_effective_concurrency,
+                enforce_campaign_limits=arguments.enforce_campaign_limits,
+                preparation_workers=arguments.preparation_workers,
             )
         )
     except (ValueError, ValidationError, WorkloadSafetyError) as exc:

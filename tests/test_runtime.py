@@ -77,6 +77,12 @@ def test_shared_capacity():
         assert len(started) == 2
         assert router.status()["executing_requests"] == 2
         assert router.status()["queued_requests"] == 2
+        assert router.status()["runners"] == {
+            "0": {"queued": 0, "running": 1},
+            "1": {"queued": 0, "running": 1},
+            "2": {"queued": 1, "running": 0},
+            "3": {"queued": 1, "running": 0},
+        }
         await router.cancel("3")
         gate.set()
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -87,6 +93,74 @@ def test_shared_capacity():
         ]
         assert isinstance(results[3], RuntimeError)
         assert router.status()["executing_requests"] == 0
+        assert router.status()["runners"] == {}
+
+    asyncio.run(exercise())
+
+
+def test_runner_queue_fairness():
+    """A deep Runner backlog cannot overtake another ready Runner's turns."""
+
+    async def exercise():
+        releases = asyncio.Queue()
+        starts = asyncio.Queue()
+
+        class RemoteMethod:
+            async def remote(
+                self, request: RequestConfig, environment: Dict[str, str]
+            ) -> LLMResponse:
+                await starts.put(environment["runner"])
+                await releases.get()
+                return {}, "", request
+
+        class Actor:
+            @property
+            def execute(self) -> RemoteMethod:
+                return RemoteMethod()
+
+        router = RequestRouter([Actor()], 1, 32)
+        request = RequestConfig(model="test", prompt=("hi", 1))
+        initial = asyncio.create_task(
+            router.execute("initial", request, {"runner": "initial"})
+        )
+        assert await asyncio.wait_for(starts.get(), 1) == "initial"
+        owners = ["large"] * 6 + ["small"] * 2 + ["other"] * 2
+        pending = [
+            asyncio.create_task(router.execute(owner, request, {"runner": owner}))
+            for owner in owners
+        ]
+        try:
+
+            async def all_queued():
+                while router.status()["queued_requests"] != len(owners):
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(all_queued(), 1)
+            observed = []
+            for _ in owners:
+                await releases.put(None)
+                observed.append(await asyncio.wait_for(starts.get(), 1))
+            assert observed == [
+                "large",
+                "small",
+                "other",
+                "large",
+                "small",
+                "other",
+                "large",
+                "large",
+                "large",
+                "large",
+            ]
+            await releases.put(None)
+            await asyncio.gather(initial, *pending)
+        finally:
+            for task in [initial, *pending]:
+                if not task.done():
+                    task.cancel()
+            for _ in range(len(owners) + 1):
+                releases.put_nowait(None)
+            await asyncio.gather(initial, *pending, return_exceptions=True)
 
     asyncio.run(exercise())
 

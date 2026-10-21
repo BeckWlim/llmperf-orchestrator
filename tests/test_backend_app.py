@@ -416,10 +416,18 @@ def test_campaign_cancel(client_factory):
         assert cancelled.json()["status_counts"]["cancelled"] == 2
 
 
-def test_campaign_rounds(client_factory):
+@pytest.mark.parametrize("prefix_scope", ["round", "family"])
+def test_campaign_rounds(client_factory, prefix_scope):
     with client_factory() as client:
         submission = {
-            "campaign": {"name": "rounds", "rounds": {"count": 3, "seed": 20261014}},
+            "campaign": {
+                "name": "rounds",
+                "rounds": {
+                    "count": 3,
+                    "seed": 20261014,
+                    "prefix_seed_scope": prefix_scope,
+                },
+            },
             "runners": [{"label": "a"}, {"label": "b"}],
         }
         preview = client.post("/api/v1/campaigns/preview", json=submission)
@@ -431,6 +439,78 @@ def test_campaign_rounds(client_factory):
         assert len(runners) == 6
         assert [runner["metadata"]["round"] for runner in runners] == [1, 1, 2, 2, 3, 3]
         assert len({runner["benchmark"]["dataset_seed"] for runner in runners}) == 6
+        if prefix_scope == "family":
+            assert (
+                len({runner["benchmark"]["shared_prefix_seed"] for runner in runners})
+                == 2
+            )
+            assert all(
+                runner["metadata"]["runner_round"]["prefix_seed_scope"] == "family"
+                for runner in runners
+            )
+
+
+def test_campaign_phases(client_factory):
+    with client_factory() as client:
+        submission = {
+            "campaign": {
+                "name": "phases",
+                "rounds": {
+                    "count": 2,
+                    "seed": "date",
+                    "prefix_seed_scope": "family",
+                    "phases": ["load", "write", "read"],
+                },
+            },
+            "runner_groups": [
+                {
+                    "name": name,
+                    "phase": phase,
+                    "matrix": {"member": [1, 2]},
+                    "runner": {
+                        "inputs": {
+                            "default": {"tokens": 200, "shared_prefix_tokens": prefix}
+                        }
+                    },
+                }
+                for name, phase, prefix in [
+                    ("target", "load", 160),
+                    ("pressure", "write", 0),
+                    ("target", "read", 160),
+                ]
+            ],
+        }
+        preview = client.post("/api/v1/campaigns/preview", json=submission)
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["summary"]["immediate_runners"] == 12
+        assert len(preview.json()["runner_groups"]) == 3
+        assert isinstance(preview.json()["rounds"]["seed"], int)
+        # Pin the preview seed explicitly when exact preview/start parity is wanted.
+        submission["campaign"]["rounds"]["seed"] = preview.json()["rounds"]["seed"]
+        started = client.post("/api/v1/campaigns/start", json=submission)
+        assert started.status_code == 202, started.text
+        runners = started.json()["items"]
+        assert len(runners) == 12
+        assert {runner["metadata"]["runner_round"]["seed"] for runner in runners} == {
+            preview.json()["rounds"]["seed"]
+        }
+        assert len({runner["benchmark"]["dataset_seed"] for runner in runners}) == 12
+        assert (
+            len(
+                {
+                    runner["benchmark"]["shared_prefix_seed"]
+                    for runner in runners
+                    if runner["metadata"]["runner_group"]["name"] == "target"
+                }
+            )
+            == 2
+        )
+        persisted = client.get(f"/api/v1/runners/{runners[0]['runner_id']}")
+        assert persisted.status_code == 200
+        assert (
+            persisted.json()["metadata"]["runner_round"]
+            == runners[0]["metadata"]["runner_round"]
+        )
 
 
 def test_atomic_campaign_start(client_factory):
@@ -572,12 +652,9 @@ def test_compiled_dataset(tmp_path: Path, client_factory):
     task = {
         "name": "dataset-replay",
         "payloads": {"replay": {"seed": "replay"}},
-        "sequence": [
+        "workflow": [
             {
-                "kind": "invoke",
-                "id": "prime",
-                "role": "prime",
-                "payload": "replay",
+                "invoke": {"name": "prime", "role": "prime", "payload": "replay"},
             }
         ],
         "runner": {
@@ -611,7 +688,7 @@ def test_compiled_dataset(tmp_path: Path, client_factory):
                 "task_definitions": [task],
             },
         )
-        assert accepted.status_code == 202
+        assert accepted.status_code == 202, accepted.text
         campaign_id = accepted.json()["campaign"]["campaign_id"]
         campaign_status = client.get(f"/api/v1/campaigns/{campaign_id}")
 

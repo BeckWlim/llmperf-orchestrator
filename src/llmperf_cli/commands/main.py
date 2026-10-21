@@ -62,6 +62,7 @@ class CampaignSubmission:
     runners: List[Dict[str, Any]]
     runner_plans: List[Dict[str, Any]]
     task_definitions: List[Dict[str, Any]]
+    runner_groups: List[Dict[str, Any]]
     wait: bool
     export: Optional[str]
 
@@ -76,6 +77,7 @@ class CampaignTaskPreviewClient(Protocol):
         runner_plans: List[Dict[str, Any]],
         task_definitions: Optional[List[Dict[str, Any]]] = None,
         *,
+        runner_groups: Optional[List[Dict[str, Any]]] = None,
         limit: int,
         node_limit: int,
         debug: bool,
@@ -92,6 +94,7 @@ class CampaignArtifactValidationClient(Protocol):
         runner_plans: List[Dict[str, Any]],
         task_definitions: Optional[List[Dict[str, Any]]] = None,
         *,
+        runner_groups: Optional[List[Dict[str, Any]]] = None,
         timeout: float,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]: ...
@@ -212,15 +215,23 @@ def load_campaign_submission(file_value: str) -> CampaignSubmission:
     raw_runners = plan.get("runners", [])
     raw_runner_plans = plan.get("runner_plans", [])
     raw_task_definitions = plan.get("task_definitions", [])
+    raw_runner_groups = plan.get("runner_groups", [])
+    if not isinstance(raw_runner_groups, list):
+        raise ClientError("campaign runner_groups must be a list")
     if not isinstance(raw_runners, list):
         raise ClientError("campaign runners must be a list")
     if not isinstance(raw_runner_plans, list):
         raise ClientError("campaign runner_plans must be a list")
     if not isinstance(raw_task_definitions, list):
         raise ClientError("campaign task_definitions must be a list")
-    if not raw_runners and not raw_runner_plans and not raw_task_definitions:
+    if (
+        not raw_runners
+        and not raw_runner_plans
+        and not raw_task_definitions
+        and not raw_runner_groups
+    ):
         raise ClientError(
-            "campaign requires runners, runner_plans, or task_definitions"
+            "campaign requires runners, runner_groups, runner_plans, or task_definitions"
         )
     raw_export = plan.get("export")
     if raw_export is not None and not isinstance(raw_export, str):
@@ -236,6 +247,11 @@ def load_campaign_submission(file_value: str) -> CampaignSubmission:
             raise ClientError(f"campaign runner_plans[{index}] must be a mapping")
         prepared_runner_plans.append(dict(runner_plan))
     prepared_task_definitions: List[Dict[str, Any]] = []
+    prepared_runner_groups: List[Dict[str, Any]] = []
+    for index, runner_group in enumerate(raw_runner_groups):
+        if not isinstance(runner_group, dict):
+            raise ClientError(f"campaign runner_groups[{index}] must be a mapping")
+        prepared_runner_groups.append(dict(runner_group))
     for index, task_definition in enumerate(raw_task_definitions):
         if not isinstance(task_definition, dict):
             raise ClientError(f"campaign task_definitions[{index}] must be a mapping")
@@ -245,6 +261,7 @@ def load_campaign_submission(file_value: str) -> CampaignSubmission:
         runners=prepared_runners,
         runner_plans=prepared_runner_plans,
         task_definitions=prepared_task_definitions,
+        runner_groups=prepared_runner_groups,
         wait=bool(plan.get("wait")),
         export=raw_export,
     )
@@ -295,9 +312,26 @@ def print_scheduler_status(document: Dict[str, Any]) -> None:
     )
     print(
         f"Runners: active={_table_value(document.get('active_runners'), '0')} "
-        f"max={_table_value(document.get('max_concurrent_runners'), '0')} "
-        f"workers={_table_value(document.get('active_workers'), '0')}"
+        f"max={_table_value(document.get('max_concurrent_runners'), '0')}"
     )
+    worker_runtime = document.get("worker_runtime") or {}
+    if worker_runtime:
+        print(
+            "Workers: "
+            + "  ".join(
+                f"{field}={_table_value(worker_runtime.get(field))}"
+                for field in (
+                    "preparation_queued",
+                    "preparing",
+                    "admission_waiting",
+                    "queued",
+                    "running",
+                )
+            )
+        )
+        print(
+            f"Preparation threads: {_table_value(document.get('preparation_threads'))}"
+        )
     print(
         f"Execution: worker={_table_value(document.get('worker_kind'))} "
         f"ray_mode={_table_value(document.get('ray_mode'))} "
@@ -330,13 +364,30 @@ def print_scheduler_status(document: Dict[str, Any]) -> None:
     guard = document.get("performance_guard") or {}
     host_memory = guard.get("host_memory") or {}
     print(
-        f"Guard: enabled={_table_value(guard.get('enabled'), 'False')} "
+        f"Runtime guard: enabled={_table_value(guard.get('enabled'), 'False')} "
         f"tripped={_table_value(guard.get('tripped'), 'False')} "
         f"memory_utilization={_ratio_percentage(host_memory.get('utilization'))}"
     )
     guard_reason = guard.get("reason")
     if guard_reason:
         print(f"Guard detail: reason={_table_value(guard_reason)}")
+    print(
+        "Campaign admission: "
+        f"enabled={_table_value(guard.get('campaign_admission_enabled'), 'unknown')}"
+    )
+    workload_limits = guard.get("workload_limits") or {}
+    if workload_limits:
+        print(
+            "Campaign budgets: "
+            f"runners={_table_value(workload_limits.get('planned_runners'))} "
+            f"requests={_table_value(workload_limits.get('provider_requests'))} "
+            f"estimated_tokens={_table_value(workload_limits.get('token_budget'))}"
+        )
+        print(
+            "Static concurrency limits: "
+            f"per_runner={_table_value(workload_limits.get('max_runner_concurrency'))} "
+            f"effective={_table_value(workload_limits.get('effective_concurrency'))}"
+        )
 
 
 def print_artifact_validation(document: Dict[str, Any]) -> None:
@@ -393,6 +444,22 @@ def print_task_preview(document: Dict[str, Any]) -> None:
         f"instances={_table_value(summary.get('task_instances'), '0')} "
         f"nodes={_table_value(summary.get('task_nodes'), '0')}"
     )
+    rounds = document.get("rounds")
+    if rounds:
+        print(
+            f"Rounds: cycles={rounds['count']} seed={rounds['seed']} "
+            f"prefix_seed_scope={rounds['prefix_seed_scope']} "
+            f"phases={' -> '.join(rounds['phases'])}"
+        )
+    for group in document.get("runner_groups") or []:
+        shape = " x ".join(
+            f"{name}[{len(values)}]" for name, values in sorted(group["matrix"].items())
+        )
+        print(
+            f"Group: {group['name']} phase={group['phase']} matrix={shape} "
+            f"families={group['families']} cycles={group['cycles']} "
+            f"workers_per_runner={group['workers_per_runner']}"
+        )
     for definition in document.get("task_definitions") or []:
         print(
             f"\nTask: {_table_value(definition.get('name'))}  "
@@ -708,27 +775,35 @@ def print_campaign_table(document: Dict[str, Any]) -> None:
         ("STATUS", 9),
         ("OUTCOME", 14),
         ("CAMPAIGN ID", 36),
-        ("RUN/PLAN/TASK/DISP", 18),
-        ("Q/R/OK/F/C", 12),
-        ("CREATED", 16),
+        ("W-CREATED/PLAN", 17),
+        ("W-SUBMIT", 10),
+        ("W-WAIT/Q/RUN", 16),
+        ("W-OK/F/C/I", 18),
+        ("R-QUEUED/ACTIVE", 16),
         ("NAME", 24),
     )
     print("  ".join(title.ljust(width) for title, width in columns).rstrip())
     print("  ".join("-" * width for _, width in columns).rstrip())
     for item in items:
         counts = item.get("status_counts") or {}
-        states = "/".join(
-            _table_value(counts.get(status), "0")
-            for status in ("queued", "running", "succeeded", "failed", "cancelled")
-        )
+        workers = item.get("workers") or {}
         values = (
             item.get("status"),
             item.get("outcome"),
             item.get("campaign_id"),
-            f"{item.get('runner_count')}/{item.get('runner_plan_count')}/"
-            f"{item.get('task_instance_count')}/{item.get('dispatch_count')}",
-            states,
-            _compact_timestamp(item.get("created_at")),
+            "/".join(
+                _table_value(workers.get(field)) for field in ("created", "planned")
+            ),
+            workers.get("submitted"),
+            "/".join(
+                _table_value(workers.get(field))
+                for field in ("admission_waiting", "queued", "running")
+            ),
+            "/".join(
+                _table_value(workers.get(field))
+                for field in ("succeeded", "failed", "cancelled", "indeterminate")
+            ),
+            f"{counts.get('queued', 0)}/{counts.get('running', 0)}",
             item.get("name"),
         )
         print(
@@ -741,9 +816,66 @@ def print_campaign_table(document: Dict[str, Any]) -> None:
     offset = document.get("offset", 0)
     limit = document.get("limit", len(items))
     print(f"\nShowing {len(items)} Campaign(s) (offset={offset}, limit={limit}).")
+    print(
+        "W=Workers; WAIT=admission wait; Q=slot queue; RUN=slot held (prepare/send); I=indeterminate."
+    )
+    print(
+        "R=Runner lifecycle; planned counts cover materialized Runners; '-'=unavailable."
+    )
+    _print_slots(items[0])
+
+
+def _print_slots(document: Dict[str, Any]) -> None:
+    slots = document.get("request_slots") or {}
+    if slots:
+        print(
+            "Global request slots: "
+            f"busy={_table_value(slots.get('busy') if slots.get('sampled') else None)} "
+            f"free={_table_value(slots.get('free') if slots.get('sampled') else None)} "
+            f"total={_table_value(slots.get('total'))} "
+            f"snapshot_age_seconds={_table_value(slots.get('snapshot_age_seconds'))}"
+        )
+
+
+def _print_workers(document: Dict[str, Any]) -> None:
+    workers = document.get("workers") or {}
+    if workers:
+        print(
+            "Workers: "
+            + "  ".join(
+                f"{field}={_table_value(workers.get(field))}"
+                for field in (
+                    "created",
+                    "planned",
+                    "submitted",
+                    "not_submitted",
+                    "admission_waiting",
+                    "queued",
+                    "running",
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                    "indeterminate",
+                )
+            )
+        )
+        print(
+            "Worker creation (Runners): "
+            + "  ".join(
+                f"{phase}={count}"
+                for phase, count in (workers.get("creation_phases") or {}).items()
+            )
+        )
+    _print_slots(document)
 
 
 def _runner_request_summary(runner: Dict[str, Any]) -> str:
+    if runner.get("workers"):
+        workers = runner["workers"]
+        return (
+            f"{_table_value(workers.get('created'))}/{_table_value(workers.get('planned'))} created; "
+            f"{_table_value(workers.get('queued'))} queued; {_table_value(workers.get('running'))} running"
+        )
     requests = runner.get("requests") or {}
     started = requests.get("started")
     completed = requests.get("completed")
@@ -761,6 +893,7 @@ def print_campaign_status(document: Dict[str, Any]) -> None:
     """Render one Campaign and its lightweight Runner summaries."""
 
     campaign = document.get("campaign") or {}
+    _print_workers(campaign)
     counts = campaign.get("status_counts") or {}
     plan_counts = campaign.get("runner_plan_status_counts") or {}
     print(
@@ -863,6 +996,8 @@ def print_runner_table(document: Dict[str, Any]) -> None:
         ("STATUS", 9),
         ("RUNNER ID", 36),
         ("PROVIDER/MODEL", 24),
+        ("W-CREATED/PLAN", 17),
+        ("W-WAIT/Q/RUN", 16),
         ("OK/ERR", 7),
         ("CREATED", 16),
         ("LABEL", 16),
@@ -871,6 +1006,7 @@ def print_runner_table(document: Dict[str, Any]) -> None:
     print("  ".join("-" * width for _, width in columns).rstrip())
     for item in items:
         requests = item.get("requests") or {}
+        workers = item.get("workers") or {}
         target = (
             "/".join(
                 part
@@ -888,6 +1024,13 @@ def print_runner_table(document: Dict[str, Any]) -> None:
             item.get("status"),
             item.get("runner_id"),
             target,
+            "/".join(
+                _table_value(workers.get(field)) for field in ("created", "planned")
+            ),
+            "/".join(
+                _table_value(workers.get(field))
+                for field in ("admission_waiting", "queued", "running")
+            ),
             f"{completed}/{failed}",
             _compact_timestamp(item.get("created_at")),
             item.get("label"),
@@ -907,6 +1050,7 @@ def print_runner_table(document: Dict[str, Any]) -> None:
 def print_runner_summary(document: Dict[str, Any]) -> None:
     """Render one compact Runner outcome without dumping nested JSON."""
 
+    _print_workers(document)
     requests = document.get("requests") or {}
     worker = document.get("worker") or {}
     print(
@@ -1304,6 +1448,11 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
             submission.runners,
             submission.runner_plans,
             submission.task_definitions,
+            **(
+                {"runner_groups": submission.runner_groups}
+                if submission.runner_groups
+                else {}
+            ),
         )
     )
     campaign_id = batch["campaign"]["campaign_id"]
@@ -1372,6 +1521,11 @@ def validate_campaign_artifacts(
             submission.runners,
             submission.runner_plans,
             submission.task_definitions,
+            **(
+                {"runner_groups": submission.runner_groups}
+                if submission.runner_groups
+                else {}
+            ),
             timeout=arguments.artifact_timeout,
             progress_callback=download_renderer.update,
         )
@@ -1399,6 +1553,11 @@ def preview_campaign_tasks(
         submission.runners,
         submission.runner_plans,
         submission.task_definitions,
+        **(
+            {"runner_groups": submission.runner_groups}
+            if submission.runner_groups
+            else {}
+        ),
         limit=arguments.limit,
         node_limit=arguments.node_limit,
         debug=arguments.debug,

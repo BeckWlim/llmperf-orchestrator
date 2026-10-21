@@ -18,7 +18,8 @@ database:
 
 scheduler:
   enabled: "${LLMPERF_RUNNER_ENABLED:-true}"
-  max_concurrent_runners: "${LLMPERF_RUNNERS_MAX:-64}"
+  max_concurrent_runners: "${LLMPERF_RUNNERS_MAX:-1024}"
+  preparation_threads: "${LLMPERF_PREPARATION_THREADS:-8}"
   poll_interval_seconds: "${LLMPERF_RUNNER_POLL:-1.0}"
   cancel_grace_seconds: "${LLMPERF_RUNNER_GRACE:-5.0}"
   stale_after_seconds: "${LLMPERF_RUNNER_STALE:-300}"
@@ -39,15 +40,28 @@ scheduler:
   artifact_resolution_timeout_seconds: "${LLMPERF_ARTIFACT_TIMEOUT:-60.0}"
 
 performance_guard:
+  # Runtime protection stays on: router guard cap and host-memory claim breaker.
+  # Scheduler/Ray capacity and Ray health checks remain active independently.
   enabled: "${LLMPERF_PERFORMANCE_GUARD_ENABLED:-true}"
+  # Campaign totals are advisory by default; opt in to reject over-budget totals.
+  # Structural validation and static concurrency checks always remain enabled.
+  campaign_admission_enabled: "${LLMPERF_CAMPAIGN_ADMISSION_ENABLED:-false}"
+  # Static simultaneous request limits are always checked, independently of budgets.
   max_runner_concurrency: "${LLMPERF_MAX_RUNNER_CONCURRENCY:-64}"
   max_effective_concurrency: "${LLMPERF_MAX_EFFECTIVE_CONCURRENCY:-64}"
+  # Count all expanded Runners and requests, including trials/rounds/plan occurrences.
   max_campaign_runners: "${LLMPERF_MAX_CAMPAIGN_RUNNERS:-1000}"
   max_campaign_provider_requests: "${LLMPERF_MAX_CAMPAIGN_REQUESTS:-10000}"
+  # Sum of estimated input + output tokens; not a per-request context or RAM limit.
   max_campaign_token_budget: "${LLMPERF_MAX_CAMPAIGN_TOKENS:-100000000}"
+  # Campaign totals > limit reject only with campaign_admission_enabled=true.
+  # Values >= warning_ratio * limit produce near-limit warnings.
   warning_ratio: "${LLMPERF_PERFORMANCE_WARNING_RATIO:-0.8}"
+  # Host memory USED ratio: pause new Runner claims at >= max; resume at <= resume.
   max_host_memory_utilization: "${LLMPERF_MAX_HOST_MEMORY_UTILIZATION:-0.90}"
   resume_host_memory_utilization: "${LLMPERF_RESUME_HOST_MEMORY_UTILIZATION:-0.80}"
+  # Ray object-store FREE ratio: pause at <= min; resume at >= resume.
+  # This independent backpressure remains active when enabled=false above.
   min_ray_object_store_available_ratio: "${LLMPERF_MIN_RAY_OBJECT_STORE_AVAILABLE_RATIO:-0.10}"
   resume_ray_object_store_available_ratio: "${LLMPERF_RESUME_RAY_OBJECT_STORE_AVAILABLE_RATIO:-0.20}"
   sample_interval_seconds: "${LLMPERF_PERFORMANCE_SAMPLE_INTERVAL:-1.0}"

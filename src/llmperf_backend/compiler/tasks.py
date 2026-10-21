@@ -223,6 +223,7 @@ class TaskInstancesConfig(CompilerModel):
     matrix: Dict[str, List[int]] = Field(default_factory=dict)
     trials: int = Field(default=1, ge=1, le=1_000)
     seed: int = Field(default=11111, ge=0, le=18_446_744_073_709_551_615)
+    prefix_seed_scope: Literal["trial", "family"] = "trial"
 
     @field_validator("matrix")
     @classmethod
@@ -411,8 +412,24 @@ class InstanceContext:
     dimensions: Mapping[str, int]
     trial_index: int
     payloads: Mapping[str, TaskPayloadSpec]
+    prefix_seed_scope: Literal["trial", "family"] = "trial"
+
+    def family_prefix_seed(self) -> int:
+        coordinates = ";".join(
+            f"{key}={value}" for key, value in sorted(self.dimensions.items())
+        )
+        material = f"family-prefix-v1\0{self.seed}\0{coordinates}"
+        return int.from_bytes(hashlib.sha256(material.encode()).digest()[:8], "big")
 
     def batch_seed(self, node_id: str) -> int:
+        if self.prefix_seed_scope == "family":
+            suffix_material = (
+                f"family-suffix-v1\0{self.family_prefix_seed()}"
+                f"\0{self.trial_index}\0{node_id}"
+            )
+            return int.from_bytes(
+                hashlib.sha256(suffix_material.encode()).digest()[:8], "big"
+            )
         coordinates = ";".join(
             f"{key}={value}" for key, value in sorted(self.dimensions.items())
         )
@@ -880,8 +897,13 @@ class TaskCompiler:
                 dimensions=dimensions,
                 trial_index=0,
                 payloads=recipe.payloads,
+                prefix_seed_scope=recipe.instances.prefix_seed_scope,
             )
             compiled_nodes = graph.expand(instance_context, validation_key)
+            if recipe.instances.prefix_seed_scope == "family" and any(
+                node.execution_kind != "batch" for node in compiled_nodes
+            ):
+                raise ValueError("family prefix seeds require run-only workflows")
             planned_span_seconds = _planned_span(compiled_nodes)
             if planned_span_seconds > MAX_PLANNED_SPAN_SECONDS:
                 raise ValueError("task planned span cannot exceed 24 hours")
@@ -916,6 +938,7 @@ class TaskCompiler:
                 dimensions=dimensions,
                 trial_index=0,
                 payloads=recipe.payloads,
+                prefix_seed_scope=recipe.instances.prefix_seed_scope,
             )
             compiled_nodes = graph.expand(instance_context, estimate_key)
             _validate_worker_template(compiled_nodes, benchmark or {})
@@ -994,7 +1017,11 @@ class TaskCompiler:
         total = 0
         for index, dimensions in enumerate(_matrix_coordinates(recipe)):
             context = InstanceContext(
-                recipe.instances.seed, dimensions, 0, recipe.payloads
+                recipe.instances.seed,
+                dimensions,
+                0,
+                recipe.payloads,
+                recipe.instances.prefix_seed_scope,
             )
             histories: Dict[str, int] = {}
             for node in graph.expand(context, f"budget-{index}"):
@@ -1052,6 +1079,7 @@ class TaskCompiler:
                     dimensions=dimensions,
                     trial_index=trial_index,
                     payloads=recipe.payloads,
+                    prefix_seed_scope=recipe.instances.prefix_seed_scope,
                 )
                 compiled_nodes = self.graph.expand(instance_context, instance_key)
                 _validate_worker_template(
@@ -1210,6 +1238,21 @@ class TaskAssembler:
         benchmark["task_context"] = task_context
         if node.execution_kind == "batch":
             task_context.update(dataset_seed=node.payload_seed, seed_version="batch-v1")
+            if self.context.definition.instances.prefix_seed_scope == "family":
+                family_context = InstanceContext(
+                    self.context.definition.instances.seed,
+                    instance.dimensions,
+                    instance.trial_index,
+                    self.context.definition.payloads,
+                    "family",
+                )
+                prefix_seed = family_context.family_prefix_seed()
+                benchmark["shared_prefix_seed"] = prefix_seed
+                task_context.update(
+                    seed_version="family-suffix-v1",
+                    shared_prefix_seed=prefix_seed,
+                    prefix_seed_version="family-prefix-v1",
+                )
             batch_benchmark = BatchBenchmarkConfig.model_validate(benchmark)
             benchmark_document = batch_benchmark.model_dump(mode="json")
         else:

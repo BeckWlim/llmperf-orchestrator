@@ -1,5 +1,12 @@
 # LLMPerf Architecture
 
+Runner owns Worker creation and readiness; shared Worker scheduling owns admission
+and request slots. Defaults separate 1024 active Runners, eight aggregation threads,
+and 64 physical Worker slots. Each Ray actor invocation prepares and sends one Worker
+only after fair slot allocation. Backend creates recipes and persists results. The existing dispatcher bounds admitted
+Workers at twice request capacity; each Runner can await one submission asynchronously.
+See [limitations and responsibilities](limitations.md).
+
 See [Runtime, storage, and multi-turn execution](runtime.md) for the implemented
 database layout, shared request capacity, message history, and recovery behavior.
 
@@ -162,6 +169,10 @@ The performance guard estimates the fully expanded graph before acceptance:
 
 Unknown benchmark defaults remain visible as admission warnings. A `repeat` is finite and
 bounded; there is no runtime loop capable of escaping static accounting.
+Static validation, concurrency checks, and runtime protection remain on by default.
+Whole-submission budgets are advisory unless campaign admission is explicitly enabled.
+See the [performance guard definition](runtime.md#performance-guard) for units,
+thresholds, and the independent switches.
 
 ### 2.1 Backend ownership layers
 
@@ -333,3 +344,10 @@ The small shared request models, execution protocol, duration type, and SQLAlche
 remain separate: they serve several modules and prevent implementation-layer imports or
 metadata cycles. `compiler/requests.py` is a reusable grammar/compilation boundary used by
 configuration, admission, and runtime, rather than a private preparation helper.
+
+`compiler/rounds.py` expands generic Runner matrices and ordered cycle phases. The
+Backend resolves a date-based seed once and persists numeric seeds plus group
+coordinates, cycle and phase metadata on each Runner. The runtime coordinator applies
+the existing durable completion barrier to the flattened phase index; Scheduler
+fairness and Ray Worker preparation are unchanged. Cache-pressure roles, input sizes
+and reuse settings belong in YAML, not in runtime policy.

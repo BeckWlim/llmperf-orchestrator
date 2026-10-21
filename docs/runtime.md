@@ -25,8 +25,8 @@ flowchart TD
     Bus --> Runner
 ```
 
-A Runner owns one complete task, preparation, progression, and aggregate outcome. A Worker
-executes one prepared Provider request. It owns no conversation loop, delay, or task state.
+A Runner owns lightweight Worker creation, progression, and aggregate outcome. A Worker
+prepares input and executes one Provider request inside one Ray actor call. It owns no conversation loop, delay, or task state.
 The Scheduler assigns physical request capacity only while that request executes.
 
 `RunnerRuntime` listens asynchronously to a Runner-scoped durable mailbox. `WorkflowTaskLogic`
@@ -53,20 +53,21 @@ request capacity = actor count × ray_actor_max_concurrency
 ```
 
 The runtime performance guard can lower that capacity. Ray CPU resources determine actor
-placement, while request slots measure HTTP operations in flight. Default settings give
+placement, while request slots cover both input preparation and Provider I/O. Default settings give
 eight actors and 64 request slots. Different Runners can share an actor; credentials,
 messages, metrics, and adapter objects are isolated per request. Actors never change their
 process environment to switch Providers.
 
 `LLMPERF_RUNNERS_MAX` independently bounds active logical Runner handles. Its default is
-64 so 64 independent atomic invokes can occupy all request slots. An existing explicit
+1024, independently of eight Backend aggregation threads. An existing explicit
 value of 8 remains a limit of eight simultaneous one-request Runners. Ordinary Runners can
 omit `concurrent_requests` to leave admission to Scheduler. An explicit value sets an
 optional rolling ceiling on outstanding Workers, including queued and uncommitted results. The shared router fairly
 rotates queued requests between Runners and enforces the global capacity across Campaigns.
 
 ```bash
-llmperf-backend config set LLMPERF_RUNNERS_MAX 64
+llmperf-backend config set LLMPERF_RUNNERS_MAX 1024
+llmperf-backend config set LLMPERF_PREPARATION_THREADS 8
 llmperf-backend config set LLMPERF_RAY_CPUS 8
 llmperf-backend config set LLMPERF_RAY_ACTOR_CPUS 1
 llmperf-backend config set LLMPERF_RAY_ACTOR_MAX_CONCURRENCY 8
@@ -82,10 +83,137 @@ limits a workload.
 
 Compiled invokes complete individually. There is no static group completion barrier.
 Ready work shares actors at execution time, including requests from different instances.
-Blocked turns, joins, and delays use no actor slot. Runner preparation and aggregation use a bounded local executor; Provider calls execute
-in shared Ray actors. Tokenizers are cached by resolved path and mode, with serialized
-initial loading. Workers never initialize a tokenizer or open PostgreSQL connections.
+Blocked turns, joins, and delays use no actor slot. Backend aggregation uses a bounded
+executor. Shared Ray actors prepare and send each admitted Worker, caching tokenizers
+by resolved path and mode. Actors never open PostgreSQL connections.
 Ray execution retries and actor restarts remain disabled.
+
+## Performance guard
+
+**Static validation and runtime protection are on; campaign budget enforcement is
+off by default.** Large Runner/request/token totals alone do not reject a campaign.
+The Backend still calculates and reports all estimates.
+
+`LLMPERF_PERFORMANCE_GUARD_ENABLED=true` controls runtime memory protection and the
+router guard cap. `LLMPERF_CAMPAIGN_ADMISSION_ENABLED=false` independently makes
+whole-submission budgets advisory. Omitting either setting retains its default.
+Schema, type, range, dependency, finite-expansion, and static concurrency checks
+remain enabled independently of these switches.
+
+| Control | When it acts | Effect |
+|---|---|---|
+| Static validation and request limits | Before accepting work; also during Campaign artifact validation | Always reject invalid structure or request concurrency above configured limits |
+| Campaign admission budgets | Before accepting a Runner, Campaign, or RunnerPlan; also during Campaign artifact validation | Always estimate whole-submission totals; reject excessive totals only when `LLMPERF_CAMPAIGN_ADMISSION_ENABLED=true` |
+| Request capacity | While scheduling requests | Bound simultaneous requests through active Runner windows, shared Ray slots, and the router's guard cap |
+| Host-memory breaker | During execution | Pause new Runner claims at high memory use and resume below the recovery threshold; already running requests are not cancelled |
+| Ray health and object-store backpressure | During execution, independently of the main guard switch | Pause new Runner claims while Ray is unhealthy or its object store has too little available capacity |
+
+### Submission settings and units
+
+These are **packaged defaults**, not a claim about an existing deployment's overrides.
+The names beginning with `MAX_CAMPAIGN` apply to the complete submission, including
+standalone Runner and RunnerPlan submissions.
+
+| Backend environment setting | Default | Meaning |
+|---|---:|---|
+| `LLMPERF_CAMPAIGN_ADMISSION_ENABLED` | false | Opt in to rejecting submissions that exceed the three campaign budgets below |
+| `LLMPERF_MAX_CAMPAIGN_RUNNERS` | 1,000 | Advisory total expanded Runners, including compiled task nodes and bounded plan occurrences |
+| `LLMPERF_MAX_CAMPAIGN_REQUESTS` | 10,000 | Advisory total planned Provider requests across all Runners |
+| `LLMPERF_MAX_CAMPAIGN_TOKENS` | 100,000,000 | Advisory sum of estimated input and output tokens across all planned requests |
+| `LLMPERF_MAX_RUNNER_CONCURRENCY` | 64 | Maximum estimated simultaneous request demand within one Runner |
+| `LLMPERF_MAX_EFFECTIVE_CONCURRENCY` | 64 | Maximum estimated effective simultaneous request demand; also caps the shared request router |
+| `LLMPERF_PERFORMANCE_WARNING_RATIO` | 0.8 | Warn when an estimate reaches 80% of its limit |
+
+An estimate **strictly greater than** a static concurrency limit rejects admission.
+The three whole-submission budget limits reject only with campaign admission
+enabled. Equality is allowed. Warnings alone do not reject a workload.
+Reducing concurrency can reduce live pressure without reducing total requests or
+tokens. Splitting work across serial rounds also preserves its whole-campaign budget.
+These totals are operator-defined workload budgets, not measurements of hardware
+capacity or Provider context support.
+
+For independent single-batch instances with fixed lengths and no reused history:
+
+```text
+Runners = input lengths × families per length × trials per family
+requests = Runners × requests per Runner
+estimated tokens = sum over lengths:
+                   families × trials × requests per Runner × (input tokens + output tokens)
+```
+
+For example, four lengths, eight families, 32 trials, and 16 requests per Runner
+expand to 1,024 Runners, exceeding the default 1,000-Runner budget even if only one
+request runs at a time. This is advisory by default and rejects only after opting
+in to campaign admission. With 31 trials, 32,768 / 131,072 / 524,288 / 819,200 input
+tokens and 16 output tokens, the same shape has 992 Runners, 15,872 requests, and
+5,981,331,456 estimated tokens. It fits a deployment configured for 204,800 requests
+and 6,714,163,200 tokens, but exceeds the packaged request and token defaults.
+The estimator also accounts for request-step dependencies and reused history;
+use Backend validation for composed workloads.
+
+`token_budget` is neither a maximum prompt length nor a live-memory estimate.
+Input preparation may estimate tokens, and the Provider may use another tokenizer.
+Passing the guard does not guarantee that an 800K target remains below 1M actual
+tokens or that the Provider supports that context length.
+
+### Runtime settings and independent switches
+
+| Backend environment setting | Default | Meaning |
+|---|---:|---|
+| `LLMPERF_PERFORMANCE_GUARD_ENABLED` | true | Enable the host-memory breaker and router guard cap |
+| `LLMPERF_MAX_HOST_MEMORY_UTILIZATION` | 0.90 | Pause new Runner claims at host memory used ratio >= 90% |
+| `LLMPERF_RESUME_HOST_MEMORY_UTILIZATION` | 0.80 | Resume claims at host memory used ratio <= 80% |
+| `LLMPERF_PERFORMANCE_SAMPLE_INTERVAL` | 1.0 | Seconds between host-memory samples |
+| `LLMPERF_MIN_RAY_OBJECT_STORE_AVAILABLE_RATIO` | 0.10 | Pause new claims at Ray object-store free ratio <= 10% |
+| `LLMPERF_RESUME_RAY_OBJECT_STORE_AVAILABLE_RATIO` | 0.20 | Resume claims at Ray object-store free ratio >= 20% |
+
+Setting `LLMPERF_PERFORMANCE_GUARD_ENABLED=false` disables the router's configured
+guard cap and the host-memory claim breaker. It does **not** change campaign
+admission, static concurrency checks, structural YAML/compiler bounds, Runner
+windows, `LLMPERF_RUNNERS_MAX`, physical Ray capacity, Ray health checks, or Ray
+object-store backpressure. The object-store settings above still apply.
+
+Assessments retain `safe`, `limits`, `risks`, and `warnings`, and expose
+`campaign_admission_enabled` and `blocking_risks`. `safe=false` means an estimate
+exceeds a configured threshold; it can be advisory. Only non-empty
+`blocking_risks` reject a submission. With campaign admission off, excessive
+whole-campaign totals appear in `risks` but not in `blocking_risks`.
+
+Before this split, the single `enabled` switch also enforced campaign budgets.
+After upgrading, existing numeric budget overrides remain available but are
+advisory unless `LLMPERF_CAMPAIGN_ADMISSION_ENABLED=true` is explicitly set.
+Keep it false to accept large campaigns without raising arbitrary total budgets.
+
+### Inspecting and changing settings
+
+Use `llmperfctl scheduler status --json` for the running guard's `enabled` and
+host-memory `tripped` state, and `ray_runtime.claim_blocked` for object-store
+backpressure. Status also shows `campaign_admission_enabled` and `workload_limits`,
+and the human view labels runtime protection, campaign admission, campaign budgets,
+and static concurrency limits separately. An older Backend that omits the new
+field is shown as `Campaign admission: enabled=unknown`, never assumed disabled.
+`enabled` is the setting; `tripped=false` only means the host-memory breaker is
+not currently pausing new Runner claims.
+An idle, untripped guard can still reject invalid structure or excessive concurrency,
+and can reject campaign totals when campaign admission is explicitly enabled.
+
+`llmperfctl campaign preview -f FILE` checks structure and expansion; it does not
+prove budget acceptance. `llmperfctl campaign validate -f FILE` assesses the budget
+and validates artifacts without submitting inference. In a 422 response, compare
+each `performance_safety.risks` entry's `value` with its `limit`:
+`blocking_risks` identifies which limits actually caused rejection.
+`planned_runners_limit`, `provider_requests_limit`, and `token_budget_limit`
+refer to the three optional whole-submission budgets. Some CLI versions redact
+`token_budget` fields; the numeric `token_budget_limit` risk still shows the
+rejected estimate and cap.
+
+Persist settings in the Backend's selected environment file or use
+`llmperf-backend config set NAME VALUE` as the Backend service user.
+Process environment overrides file values; custom Backend YAML may specify
+literal values instead of the packaged environment substitutions.
+Restart the Backend to apply these changes; `llmperfctl provider reload` only
+reloads Provider profiles. Check active work before a restart. Editing workload
+YAML does not change an already accepted campaign.
 
 ## Durable records
 
@@ -151,7 +279,7 @@ admission. Timer events and committed Worker outputs share the Runner message bu
 stores and delivers data, without deciding whether to execute or cancel a request.
 
 At startup and after each event, the Runner calculates eligibility. A root's `after`
-starts when progression begins after preparation; a dependent step's `after` starts at
+starts when progression begins before input preparation; a dependent step's `after` starts at
 the latest predecessor completion. An optional `at` is another lower bound, so the later
 instant wins. Runner arms one asynchronous timer for its earliest future eligible step.
 `TimerSource.fire` waits without occupying a request slot and publishes `timer.due` when
@@ -196,55 +324,45 @@ The TaskLogic interface permits bounded dynamic step creation, but YAML currentl
 finite graphs only; persisted reservations cannot exceed the declared expansion. Automatic
 Provider retries and restart replay are not enabled.
 
-## Parallel preparation and Runner rounds
+## Actor preparation and Runner rounds
 
-Request slots belong to the shared router, not to individual Workers. Ready requests
-from different Runners can share one actor; `concurrent_requests`, when explicitly set, is the optional Runner's
-ceiling; the default is no Runner window. Preparation and dependency waits do not reserve request slots.
+Runner activation creates lightweight descriptions. The dispatcher records each
+single-send reservation and the router fairly assigns a physical slot before the
+request actor prepares that Worker's input. One Ray invocation then prepares,
+sends, normalizes, and returns; Backend persists the result. Dependencies and timers
+remain outside actors. No actor executes an entire Runner loop.
 
-For eight preparation processes plus eight request actors, configure:
+Each actor has one CPU preparation lane and can overlap Provider I/O across its
+request slots. Prefix/calibration caches are bounded and keyed by input settings,
+resolved dataset/tokenizer and family seed. Trials and request indices determine
+suffixes independently of actor placement. Calibrated counts remain estimates;
+Provider usage is authoritative. Sample, literal, atomic, named-input and cache-probe
+recipes also prepare inside their admitted actor call. See [limitations](limitations.md)
+for generation compatibility, deadlines, cancellation, cache bounds and telemetry.
+
+The existing CPU layout remains compatible:
 
 ```dotenv
 LLMPERF_RAY_CPUS=16
 LLMPERF_PREPARATION_WORKERS=8
-LLMPERF_RUNNERS_MAX=8
+LLMPERF_RUNNERS_MAX=1024
 LLMPERF_RAY_ACTOR_CPUS=1
 LLMPERF_RAY_ACTOR_MAX_CONCURRENCY=8
-LLMPERF_PREPARATION_CHUNK_SIZE=16
-LLMPERF_PREPARATION_BUFFER_CHUNKS=8
 ```
 
-Each preparation actor reserves one Ray CPU. Request actor count uses the remaining
-CPU budget, so enabling preparation does not increase request capacity accidentally.
-Preparation defaults to zero workers for existing installations. With it enabled,
-ordinary bundled-sonnet and external `concatenate` workloads calibrate corpus token estimates once per Runner,
-then generate deterministic chunks without further tokenizer calls. The preparation producer buffers bounded chunks, but the current Runner bridge materializes
-the finite request plan before dispatch. Requests and results therefore consume memory
-proportional to the Runner request target. Streaming admission is a remaining optimization;
-this refactor has not established performance equivalence for large pressure workloads. A single Runner can use the preparation
-pool; eight Runners are not required to use eight preparation actors.
-
-The local input length is a calibrated estimate, with provenance in `prompt_evidence`.
-Provider usage remains authoritative. External datasets use the existing loader and
-memory-mapped index. Calibration samples at most 128 records, capped at 4,096 characters
-each. Preparation then selects from the full corpus without tokenizing requests or
-copying the corpus into Ray messages. The resulting character/token estimate can vary
-in accuracy across languages and records. Dataset choice is entirely in `runner.inputs.<name>.dataset`;
-use `dataset_prompt_mode: concatenate` with `shared_prefix_tokens` for prefix workloads.
-External `sample` workloads, cache probes, and compiled
-exact-replay/multi-turn tasks retain their existing exact preparation path. Their
-payloads are not silently converted to estimated prompts. Worker logs remain buffered
-until completion; scheduler status displays preparation capacity separately.
+This places eight request actors. The legacy preparation-worker count retains CPU
+headroom in capacity calculation; no separate preparation actors or chunk-prefetch
+queues are launched for Backend Workers. Standalone benchmark helpers retain their
+legacy preparation APIs.
 
 ```mermaid
 flowchart LR
-    M[Durable Runner metadata] --> C[Runtime round barriers]
-    C --> W[Admitted Runners]
-    W --> P[Shared preparation actors]
-    P --> B[Bounded prepared chunks]
-    B --> Q[Fair request router]
-    Q --> A[Shared request actors]
-    A --> R[Committed results]
+    M[Durable Runner metadata] --> C[Dependencies and round barriers]
+    C --> W[Lightweight Worker recipe]
+    W --> Q[Fair slot allocation]
+    Q --> P[Actor: prepare one input]
+    P --> A[Same actor: call Provider]
+    A --> R[Backend: commit result]
     R --> C
 ```
 

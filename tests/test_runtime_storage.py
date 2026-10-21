@@ -24,6 +24,50 @@ from llmperf_backend.runtime.coordinator import RuntimeCoordinator
 pytestmark = pytest.mark.postgresql
 
 
+def test_activity_renews_lease(postgresql_url):
+    """Admitting a large ready set renews ownership without allowing resurrection."""
+
+    async def exercise():
+        database = Database(DatabaseConfig(url=postgresql_url))
+        try:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.create_schema()
+            repository = RunnerRepository(database)
+            await repository.acquire_runtime("activity")
+            runner = await repository.create_runner(
+                {"provider": "test", "model": "test", "repeat": 1}, {}, "test"
+            )
+            assert runner is not None
+            near_expiry = datetime.now(timezone.utc) + timedelta(seconds=2)
+            async with database.sessions() as session, session.begin():
+                await session.execute(
+                    update(ExecutionLeaseRecord).values(expires_at=near_expiry)
+                )
+            assert (
+                await repository.start_selected(runner["runner_id"], "activity")
+                is not None
+            )
+            async with database.sessions() as session:
+                renewed = await session.get(ExecutionLeaseRecord, 1)
+                assert renewed is not None
+                assert renewed.expires_at > near_expiry + timedelta(seconds=20)
+            async with database.sessions() as session, session.begin():
+                await session.execute(
+                    update(ExecutionLeaseRecord).values(
+                        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)
+                    )
+                )
+            with pytest.raises(RuntimeError, match="expired"):
+                await repository.heartbeat(runner["runner_id"])
+        finally:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.dispose()
+
+    asyncio.run(exercise())
+
+
 def test_worker_mailbox(postgresql_url):
     from llmperf.benchmark.execution import RequestStep
     from llmperf.clients.models import RequestConfig
@@ -50,6 +94,10 @@ def test_worker_mailbox(postgresql_url):
             )
             assert runner is not None
             runner_id = runner["runner_id"]
+            initial_progress = await repository.worker_progress(runner_ids=[runner_id])
+            assert initial_progress[runner_id]["planned"] == 2
+            assert initial_progress[runner_id]["created"] == 0
+            assert initial_progress[runner_id]["submitted"] == 0
             assert await repository.start_selected(runner_id, "test") is not None
             request = RequestConfig(model="test", prompt=("hello", 1))
             first = RequestStep("first", request)
@@ -72,6 +120,12 @@ def test_worker_mailbox(postgresql_url):
             assert await repository.reserve_worker(
                 runner_id, RequestStep("second", request), None
             )
+            current_progress = await repository.worker_progress(runner_ids=[runner_id])
+            assert current_progress[runner_id]["submitted"] == 2
+            assert current_progress[runner_id]["pending_results"] == 1
+            assert current_progress[runner_id]["succeeded"] == 1
+            assert current_progress[runner_id]["created"] is None
+            assert current_progress[runner_id]["not_submitted"] == 0
             with pytest.raises(ValueError, match="declared request expansion"):
                 await repository.reserve_worker(
                     runner_id, RequestStep("third", request), None
@@ -87,8 +141,9 @@ def test_worker_mailbox(postgresql_url):
     asyncio.run(exercise())
 
 
-def test_round_recovery(postgresql_url):
-    from llmperf_backend.compiler.rounds import expand_rounds
+@pytest.mark.parametrize("phases", [("default",), ("load", "pressure", "read")])
+def test_round_recovery(postgresql_url, phases):
+    from llmperf_backend.compiler.rounds import expand_rounds, expand_runner_group
 
     async def exercise():
         database = Database(DatabaseConfig(url=postgresql_url))
@@ -98,12 +153,21 @@ def test_round_recovery(postgresql_url):
             await database.create_schema()
             repository = RunnerRepository(database)
             await repository.acquire_runtime("round-test")
-            templates = [{"benchmark": {"provider": "test", "model": "test"}}] * 2
+            templates = [
+                runner
+                for phase in phases
+                for runner in expand_runner_group(
+                    {"benchmark": {"provider": "test", "model": "test"}},
+                    "target",
+                    {"member": [1, 2]},
+                    phase,
+                )
+            ]
             workload = await repository.create_campaign_workload(
                 "rounds",
                 None,
                 {},
-                expand_rounds(templates, 3, 20261014),
+                expand_rounds(templates, 3, 20261014, "family", phases),
                 [],
                 [],
                 "test",

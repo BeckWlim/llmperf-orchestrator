@@ -1,7 +1,7 @@
 """Strict, whitelist-only projections for every CLI response."""
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from llmperf_cli.transport.client import ClientError
 from llmperf.configuration.environment import display_environment_value
@@ -146,6 +146,7 @@ def project_runner(document: Any, detailed: bool = False) -> Dict[str, Any]:
     }
     if "plan_occurrence" in source:
         projected["plan_occurrence"] = source.get("plan_occurrence")
+    projected.update(_worker_progress(source))
     if detailed:
         projected.update(
             _pick(
@@ -194,7 +195,48 @@ _CAMPAIGN_FIELDS = (
 
 
 def _campaign(source: Mapping[str, Any]) -> Dict[str, Any]:
-    return _pick(source, _CAMPAIGN_FIELDS)
+    return {**_pick(source, _CAMPAIGN_FIELDS), **_worker_progress(source)}
+
+
+def _worker_progress(source: Mapping[str, Any]) -> Dict[str, Any]:
+    projected: Dict[str, Any] = {}
+    if "workers" in source:
+        workers = _object(source["workers"], "worker progress")
+        progress = _pick(
+            workers,
+            (
+                "planned",
+                "created",
+                "submitted",
+                "not_submitted",
+                "pending_results",
+                "succeeded",
+                "failed",
+                "cancelled",
+                "indeterminate",
+                "admission_waiting",
+                "queued",
+                "running",
+            ),
+        )
+        for field, count in progress.items():
+            if count is not None and (
+                isinstance(count, bool) or not isinstance(count, int) or count < 0
+            ):
+                raise ClientError(
+                    f"workers.{field} must be a nonnegative count or null"
+                )
+        progress["creation_phases"] = _pick(
+            _mapping(workers.get("creation_phases")),
+            ("waiting", "preparation_queued", "preparing", "submitting", "aggregating"),
+        )
+        projected["workers"] = progress
+    if "request_slots" in source:
+        projected["request_slots"] = _pick(
+            _object(source["request_slots"], "request slots"),
+            ("scope", "busy", "total", "free", "sampled", "snapshot_age_seconds"),
+        )
+    return projected
 
 
 def _campaign_list(document: Any, detailed: bool) -> Dict[str, Any]:
@@ -325,7 +367,60 @@ def _campaign_preview(document: Any, detailed: bool) -> Dict[str, Any]:
         "debug": source.get("debug"),
         "summary": workload_summary,
         "task_definitions": definitions,
+        "rounds": _preview_rounds(source.get("rounds")),
+        "runner_groups": _preview_groups(source.get("runner_groups", [])),
     }
+
+
+def _preview_rounds(document: Any) -> Optional[Dict[str, Any]]:
+    if document is None:
+        return None
+    source = _object(document, "campaign.preview.rounds")
+    if (
+        type(source.get("count")) is not int
+        or type(source.get("seed")) is not int
+        or source.get("prefix_seed_scope") not in ("round", "family")
+        or not isinstance(source.get("phases"), list)
+        or not all(isinstance(phase, str) for phase in source["phases"])
+    ):
+        raise ClientError(
+            "campaign.preview rounds must contain count, seed, scope and phases"
+        )
+    return _pick(source, ("count", "seed", "prefix_seed_scope", "phases"))
+
+
+def _preview_groups(document: Any) -> List[Dict[str, Any]]:
+    if not isinstance(document, list):
+        raise ClientError("campaign.preview runner_groups must be an array")
+    groups: List[Dict[str, Any]] = []
+    for raw_group in document:
+        source = _object(raw_group, "campaign.preview.runner_groups")
+        matrix = source.get("matrix")
+        if not isinstance(matrix, Mapping) or not all(
+            isinstance(name, str)
+            and isinstance(values, list)
+            and all(type(value) is int for value in values)
+            for name, values in matrix.items()
+        ):
+            raise ClientError(
+                "campaign.preview group matrix must contain integer arrays"
+            )
+        if not all(
+            isinstance(source.get(key), str) for key in ("name", "phase")
+        ) or not all(
+            type(source.get(key)) is int and source[key] >= 0
+            for key in ("families", "cycles", "workers_per_runner")
+        ):
+            raise ClientError(
+                "campaign.preview group must contain name, phase and counts"
+            )
+        groups.append(
+            _pick(
+                source,
+                ("name", "phase", "matrix", "families", "cycles", "workers_per_runner"),
+            )
+        )
+    return groups
 
 
 _PLAN_FIELDS = (
@@ -407,11 +502,28 @@ def _scheduler(document: Any, detailed: bool) -> Dict[str, Any]:
             "ray_actor_num_cpus",
             "ray_actor_max_concurrency",
             "preparation_workers",
+            "preparation_threads",
             "preparation_chunk_size",
             "preparation_buffer_chunks",
         ),
     )
     pool = source.get("request_pool")
+    if "worker_runtime" in source:
+        result["worker_runtime"] = _pick(
+            _mapping(source["worker_runtime"]),
+            (
+                "pool_ready",
+                "snapshot_age_seconds",
+                "slots_busy",
+                "slots_total",
+                "slots_free",
+                "admission_waiting",
+                "queued",
+                "running",
+                "preparation_queued",
+                "preparing",
+            ),
+        )
     if isinstance(pool, Mapping):
         result["request_pool"] = _pick(
             pool,
@@ -429,12 +541,25 @@ def _scheduler(document: Any, detailed: bool) -> Dict[str, Any]:
             guard,
             (
                 "enabled",
+                "campaign_admission_enabled",
                 "tripped",
                 "reason",
                 "max_host_memory_utilization",
                 "resume_host_memory_utilization",
             ),
         )
+        workload_limits = guard.get("workload_limits")
+        if isinstance(workload_limits, Mapping):
+            guard_view["workload_limits"] = _pick(
+                workload_limits,
+                (
+                    "planned_runners",
+                    "provider_requests",
+                    "token_budget",
+                    "max_runner_concurrency",
+                    "effective_concurrency",
+                ),
+            )
         host_memory = guard.get("host_memory")
         if isinstance(host_memory, Mapping):
             guard_view["host_memory"] = _pick(

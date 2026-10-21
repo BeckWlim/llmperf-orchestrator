@@ -1,4 +1,8 @@
 from pathlib import Path
+import subprocess
+import sys
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 OLD_RUNTIME_NAMES = (
@@ -37,6 +41,38 @@ def test_operation_skill():
     assert "without a progress bar" in text
     assert "tqdm bar" not in text
     assert not any(name in text for name in OLD_RUNTIME_NAMES)
+
+
+@pytest.mark.parametrize("enforce_campaign_limits", [False, True])
+def test_workload_validation(tmp_path, enforce_campaign_limits):
+    workload_path = tmp_path / "large.yaml"
+    workload_path.write_text(
+        'version: "1.0.0"\n'
+        "provider: test\n"
+        "model: test-model\n"
+        "concurrent_requests: 1\n"
+        "inputs:\n"
+        "  default:\n"
+        "    tokens: 819200\n"
+        "request:\n"
+        "  repeat: 256\n",
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable,
+        str(ROOT / ".codex/skills/operate-llmperf/scripts/validate_workload.py"),
+        str(workload_path),
+    ]
+    if enforce_campaign_limits:
+        command.append("--enforce-campaign-limits")
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if enforce_campaign_limits:
+        assert result.returncode == 1
+        assert "token_budget_limit" in result.stderr
+    else:
+        assert result.returncode == 0
+        assert "campaign_admission=False within_limits=False" in result.stdout
+        assert "advisory_risks=1" in result.stdout
 
 
 def test_reporting_skill():

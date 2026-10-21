@@ -47,6 +47,13 @@ class PromptPlan:
     characters_per_token: float = 0.0
     prefix_record_indices: Tuple[int, ...] = ()
     calibration_records: int = 0
+    shared_prefix_seed: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class CorpusCalibration:
+    characters_per_token: float
+    record_count: int
 
 
 @lru_cache(maxsize=4)
@@ -114,26 +121,34 @@ def calibrate(
     shared_prefix_tokens: int,
     output_tokens: int,
     source: Optional[PromptDatasetSource] = None,
+    shared_prefix_seed: Optional[int] = None,
+    calibration: Optional[CorpusCalibration] = None,
 ) -> PromptPlan:
+    prefix_seed = seed if shared_prefix_seed is None else shared_prefix_seed
     if source is not None and source.is_external:
         dataset = _indexed_dataset(source)
-        sample_positions = random.Random(0).sample(
-            range(len(dataset.records)), min(128, len(dataset.records))
-        )
-        sampled_characters = 0
-        sampled_tokens = 0
-        for position in sample_positions:
-            _, record_text = dataset.records[position]
-            sample_text = (record_text + dataset.separator)[:4096]
-            sampled_characters += len(sample_text)
-            sampled_tokens += len(
-                tokenizer.encode(sample_text, add_special_tokens=False)
+        if calibration is None:
+            sample_positions = random.Random(0).sample(
+                range(len(dataset.records)), min(128, len(dataset.records))
             )
-        if sampled_characters == 0 or sampled_tokens == 0:
-            raise ValueError("Prompt dataset cannot calibrate token estimates")
-        characters_per_token = sampled_characters / sampled_tokens
+            sampled_characters = 0
+            sampled_tokens = 0
+            for position in sample_positions:
+                _, record_text = dataset.records[position]
+                sample_text = (record_text + dataset.separator)[:4096]
+                sampled_characters += len(sample_text)
+                sampled_tokens += len(
+                    tokenizer.encode(sample_text, add_special_tokens=False)
+                )
+            if sampled_characters == 0 or sampled_tokens == 0:
+                raise ValueError("Prompt dataset cannot calibrate token estimates")
+            characters_per_token = sampled_characters / sampled_tokens
+            calibration_records = len(sample_positions)
+        else:
+            characters_per_token = calibration.characters_per_token
+            calibration_records = calibration.record_count
         prefix, prefix_indices = _assemble_dataset(
-            dataset, characters_per_token, shared_prefix_tokens, seed
+            dataset, characters_per_token, shared_prefix_tokens, prefix_seed
         )
         return PromptPlan(
             records=(),
@@ -146,7 +161,8 @@ def calibrate(
             dataset_source=source,
             characters_per_token=characters_per_token,
             prefix_record_indices=tuple(prefix_indices),
-            calibration_records=len(sample_positions),
+            calibration_records=calibration_records,
+            shared_prefix_seed=shared_prefix_seed,
         )
     dataset = load_prompt_dataset(PromptDatasetSource.builtin_sonnet())
     records = tuple(text + dataset.separator for _, text in dataset.records)
@@ -158,7 +174,7 @@ def calibrate(
     instruction_tokens = len(tokenizer.encode(instruction, add_special_tokens=False))
     prefix_budget = max(instruction_tokens, shared_prefix_tokens)
     prefix_body, _ = _assemble(
-        records, lengths, prefix_budget - instruction_tokens, seed
+        records, lengths, prefix_budget - instruction_tokens, prefix_seed
     )
     return PromptPlan(
         records,
@@ -168,6 +184,7 @@ def calibrate(
         seed,
         mean_tokens,
         stddev_tokens,
+        shared_prefix_seed=shared_prefix_seed,
     )
 
 
@@ -222,6 +239,12 @@ def render_chunk(plan: PromptPlan, start: int, count: int) -> List[PreparedPromp
                 prefix_record_indices=list(plan.prefix_record_indices),
                 calibration_records=plan.calibration_records,
                 characters_per_token=plan.characters_per_token,
+            )
+        if plan.shared_prefix_seed is not None:
+            evidence.update(
+                shared_prefix_seed=plan.shared_prefix_seed,
+                prefix_hash="sha256:"
+                + hashlib.sha256(plan.prefix.encode()).hexdigest(),
             )
         prepared.append(((prompt_text, target_tokens), evidence))
     return prepared

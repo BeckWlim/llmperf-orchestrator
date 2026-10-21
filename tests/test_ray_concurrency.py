@@ -15,12 +15,14 @@ from llmperf.metrics import constants as common_metrics
 from llmperf.benchmark import throughput as benchmark_module
 from llmperf.clients.factory import RAY_ACTOR_CONCURRENCY_ENV, RAY_ACTOR_CPUS_ENV
 from llmperf.datasets.prompts import PromptDatasetSource
-from llmperf.clients.models import RequestConfig
+from llmperf.clients.models import RequestConfig, WorkerInput
 from llmperf.datasets.preparation import create_preparation_actor
 from llmperf_backend.runtime.request_pool import (
     create_request_actor,
     create_request_router,
     SharedRequestExecutor,
+    RequestActor,
+    RequestActorHandle,
 )
 from llmperf_backend.runtime.worker import AtomicWorker
 import llmperf_backend.runtime.worker as worker_module
@@ -33,7 +35,8 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize(
-    "mode", ["ordinary", "grouped", "shared", "atomic", "prepared", "sharegpt"]
+    "mode",
+    ["ordinary", "grouped", "shared", "atomic", "prepared", "sharegpt", "recipe"],
 )
 def test_concurrent_http_streams(monkeypatch, mode, tmp_path):
     grouped = mode == "grouped"
@@ -123,8 +126,32 @@ def test_concurrent_http_streams(monkeypatch, mode, tmp_path):
             _temp_dir=ray_directory.name,
             runtime_env={"env_vars": runtime_environment},
         )
-        if mode in {"shared", "atomic"}:
-            actors = [create_request_actor(1, 8) for _ in range(8)]
+        if mode in {"shared", "atomic", "recipe"}:
+
+            class RecipeActor(RequestActor):
+                def __init__(self):
+                    super().__init__()
+                    import llmperf_backend.runtime.worker_input as inputs
+
+                    inputs._prepared_tokenizer = lambda *args: Tokenizer()
+
+            actors: list[RequestActorHandle] = []
+            for _ in range(8):
+                if mode == "recipe":
+                    handle = (
+                        ray.remote(RecipeActor)
+                        .options(
+                            num_cpus=1,
+                            max_concurrency=8,
+                            max_restarts=0,
+                            max_task_retries=0,
+                        )
+                        .remote()
+                    )
+                    assert isinstance(handle, RequestActorHandle)
+                    actors.append(handle)
+                else:
+                    actors.append(create_request_actor(1, 8))
             router = create_request_router(actors, 8, 128)
 
             def invoke(index):
@@ -134,12 +161,18 @@ def test_concurrent_http_streams(monkeypatch, mode, tmp_path):
                     {
                         "OPENAI_API_BASE": provider_url,
                         "OPENAI_API_KEY": f"key-{index % 2}",
+                        "LLMPERF_TOKENIZER_PATH": "mock",
                     },
                 )
                 return executor(
                     RequestConfig(
                         model="test",
-                        prompt=(f"request-{index}", 1),
+                        prompt=("", 1) if mode == "recipe" else (f"request-{index}", 1),
+                        preparation=(
+                            WorkerInput(text=f"request-{index}")
+                            if mode == "recipe"
+                            else None
+                        ),
                         llm_api="openai",
                         timeout_seconds=120,
                     )

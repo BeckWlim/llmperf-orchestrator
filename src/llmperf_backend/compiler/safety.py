@@ -17,6 +17,9 @@ from llmperf_backend.compiler.tasks import TaskCompiler
 
 UTC = timezone.utc
 LOGGER = logging.getLogger(__name__)
+CAMPAIGN_BUDGET_METRICS = frozenset(
+    {"planned_runners", "provider_requests", "token_budget"}
+)
 
 
 class WorkloadSafetyError(ValueError):
@@ -24,7 +27,7 @@ class WorkloadSafetyError(ValueError):
 
     def __init__(self, assessment: Dict[str, Any]):
         self.assessment = assessment
-        codes = ", ".join(item["code"] for item in assessment["risks"])
+        codes = ", ".join(item["code"] for item in assessment["blocking_risks"])
         super().__init__(f"workload rejected by performance guard: {codes}")
 
 
@@ -100,6 +103,8 @@ class RuntimePerformanceGuard:
                     )
         return {
             "enabled": self.config.enabled,
+            "campaign_admission_enabled": self.config.campaign_admission_enabled,
+            "workload_limits": self.config.workload_limits,
             "tripped": self._tripped if self.config.enabled else False,
             "reason": "host_memory_high" if self._tripped else None,
             "max_host_memory_utilization": (self.config.max_host_memory_utilization),
@@ -193,7 +198,7 @@ def assess_workload(
     now: Optional[datetime] = None,
     ray_actor_max_concurrency: int = 1,
 ) -> Dict[str, Any]:
-    """Estimate fan-out and reject workloads beyond configured hard limits."""
+    """Always check request limits; enforce campaign totals only when opted in."""
 
     if ray_actor_max_concurrency < 1:
         raise ValueError("ray_actor_max_concurrency must be positive")
@@ -290,19 +295,14 @@ def assess_workload(
         "effective_concurrency": effective_concurrency,
         "requested_concurrency": requested_concurrency,
     }
-    limits = {
-        "planned_runners": guard.max_campaign_runners,
-        "provider_requests": guard.max_campaign_provider_requests,
-        "token_budget": guard.max_campaign_token_budget,
-        "max_runner_concurrency": guard.max_runner_concurrency,
-        "effective_concurrency": guard.max_effective_concurrency,
-    }
+    limits = guard.workload_limits
     if ray_actor_capacity is not None:
         metrics["ray_actor_demand"] = (
             effective_concurrency + ray_actor_max_concurrency - 1
         ) // ray_actor_max_concurrency
         limits["ray_actor_demand"] = ray_actor_capacity
     risks: List[Dict[str, Any]] = []
+    blocking_risks: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
     if requested_concurrency > effective_concurrency:
         warnings.append(
@@ -317,6 +317,11 @@ def assess_workload(
         issue = {"code": f"{metric}_limit", "value": value, "limit": limit}
         if value > limit:
             risks.append(issue)
+            if (
+                metric not in CAMPAIGN_BUDGET_METRICS
+                or guard.campaign_admission_enabled
+            ):
+                blocking_risks.append(issue)
         elif value >= limit * guard.warning_ratio:
             warnings.append(issue)
     if total["unknown_benchmarks"]:
@@ -328,12 +333,14 @@ def assess_workload(
             }
         )
     assessment = {
+        "campaign_admission_enabled": guard.campaign_admission_enabled,
         "safe": not risks,
         "metrics": metrics,
         "limits": limits,
         "risks": risks,
+        "blocking_risks": blocking_risks,
         "warnings": warnings,
     }
-    if guard.enabled and risks:
+    if blocking_risks:
         raise WorkloadSafetyError(assessment)
     return assessment

@@ -187,8 +187,13 @@ def test_grouped_capacity():
     assert result["metrics"]["ray_actor_demand"] == 8
 
 
-def test_workload_rejection():
-    guard = PerformanceGuardConfig(max_campaign_provider_requests=9)
+@pytest.mark.parametrize("runtime_enabled", [False, True])
+def test_workload_rejection(runtime_enabled):
+    guard = PerformanceGuardConfig(
+        enabled=runtime_enabled,
+        campaign_admission_enabled=True,
+        max_campaign_provider_requests=9,
+    )
 
     with pytest.raises(WorkloadSafetyError) as captured:
         assess_workload(
@@ -197,7 +202,73 @@ def test_workload_rejection():
 
     assessment = captured.value.assessment
     assert assessment["safe"] is False
+    assert assessment["campaign_admission_enabled"] is True
     assert assessment["risks"][0]["code"] == "provider_requests_limit"
+
+
+def test_advisory_default():
+    benchmark = {
+        **BENCHMARK,
+        "repeat": 256,
+        "mean_input_tokens": 819200,
+        "concurrent_requests": 2,
+    }
+    guard = PerformanceGuardConfig()
+    assessment = assess_workload(
+        [{"benchmark": benchmark}] * 1024,
+        [],
+        [],
+        guard,
+        scheduler_slots=64,
+        ray_actor_capacity=8,
+        ray_actor_max_concurrency=8,
+        now=NOW,
+    )
+    assert assessment["campaign_admission_enabled"] is False
+    assert assessment["safe"] is False
+    assert assessment["blocking_risks"] == []
+    assert {risk["code"] for risk in assessment["risks"]} >= {
+        "planned_runners_limit",
+        "provider_requests_limit",
+        "token_budget_limit",
+    }
+    runtime_guard = RuntimePerformanceGuard(
+        guard, sampler=lambda: {"available": True, "utilization": 0.95}
+    )
+    assert runtime_guard.allow_claim() is False
+    status = runtime_guard.status()
+    assert status["enabled"] is True
+    assert status["campaign_admission_enabled"] is False
+    assert status["workload_limits"]["planned_runners"] == 1000
+
+
+def test_admission_boundary():
+    guard = PerformanceGuardConfig(
+        campaign_admission_enabled=True, max_campaign_provider_requests=10
+    )
+    assessment = assess_workload(
+        [{"benchmark": BENCHMARK}], [], [], guard, scheduler_slots=1, now=NOW
+    )
+    assert assessment["safe"] is True
+    assert assessment["risks"] == []
+    assert any(
+        warning["code"] == "provider_requests_limit"
+        for warning in assessment["warnings"]
+    )
+
+
+@pytest.mark.parametrize("runtime_enabled", [False, True])
+def test_static_concurrency(runtime_enabled):
+    guard = PerformanceGuardConfig(enabled=runtime_enabled, max_runner_concurrency=1)
+    with pytest.raises(WorkloadSafetyError) as captured:
+        assess_workload(
+            [{"benchmark": BENCHMARK}], [], [], guard, scheduler_slots=1, now=NOW
+        )
+    assessment = captured.value.assessment
+    assert assessment["campaign_admission_enabled"] is False
+    assert [risk["code"] for risk in assessment["blocking_risks"]] == [
+        "max_runner_concurrency_limit"
+    ]
 
 
 def test_runtime_hysteresis():

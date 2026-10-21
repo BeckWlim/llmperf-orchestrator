@@ -3,7 +3,7 @@
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import hashlib
 import json
 import math
@@ -132,7 +132,11 @@ class WorkflowTaskLogic(TaskLogic):
             for source in step.message_sources
             for message in results[source].completion().messages()
         ]
-        messages = [*history, {"role": "user", "content": step.request.prompt[0]}]
+        messages = (
+            history
+            if step.request.preparation is not None
+            else [*history, {"role": "user", "content": step.request.prompt[0]}]
+        )
         parameters = dict(step.request.sampling_params or {})
         parameters["messages"] = messages
         metadata = dict(step.request.metadata or {})
@@ -317,7 +321,25 @@ class RunnerRuntime:
                             and capacity
                             and loop.time() < deadline
                         ):
-                            prepared_step = self.logic.request(step, self.results)
+                            eligible_step = self.logic.request(step, self.results)
+                            if eligible_step.request.preparation is not None:
+                                prepared_step = RequestStep(
+                                    eligible_step.step_id,
+                                    eligible_step.request.model_copy(
+                                        update={
+                                            "deadline_at": datetime.now(timezone.utc)
+                                            + timedelta(
+                                                seconds=max(0.0, deadline - loop.time())
+                                            )
+                                        }
+                                    ),
+                                    eligible_step.dependencies,
+                                    eligible_step.delay_seconds,
+                                    eligible_step.due_at,
+                                    eligible_step.message_sources,
+                                )
+                            else:
+                                prepared_step = eligible_step
                             # One blocked submission per Runner, not an unbounded task
                             # per ready request. Continue listening while Scheduler waits.
                             self.outstanding.add(identifier)

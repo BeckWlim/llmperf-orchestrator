@@ -921,7 +921,7 @@ class RunnerRepository:
         self.runtime_owner = owner
         self.runtime_generation = generation
 
-    async def _check_runtime(self, session: AsyncSession, renew: bool = False) -> None:
+    async def _check_runtime(self, session: AsyncSession, renew: bool = True) -> None:
         # Repository-only administrative/test calls do not acquire runtime ownership.
         if self.runtime_owner is None:
             return
@@ -1004,17 +1004,30 @@ class RunnerRepository:
                     BenchmarkTaskInstanceRecord.id == context.get("instance_id", "")
                 )
             instances = list((await session.execute(instance_query)).scalars())
-            snapshots: List[Dict[str, Any]] = []
-            for instance in instances:
-                nodes = list(
+            node_rows = (
+                list(
                     (
                         await session.execute(
                             select(ExecutionNodeRecord).where(
-                                ExecutionNodeRecord.task_instance_id == instance.id
+                                ExecutionNodeRecord.task_instance_id.in_(
+                                    [instance.id for instance in instances]
+                                )
                             )
                         )
                     ).scalars()
                 )
+                if instances
+                else []
+            )
+            nodes_by_instance: Dict[str, List[ExecutionNodeRecord]] = {}
+            for node_record in node_rows:
+                if node_record.task_instance_id is not None:
+                    nodes_by_instance.setdefault(
+                        node_record.task_instance_id, []
+                    ).append(node_record)
+            snapshots: List[Dict[str, Any]] = []
+            for instance in instances:
+                nodes = nodes_by_instance.get(instance.id, [])
                 snapshots.append(
                     {
                         "instance_id": instance.id,
@@ -2288,6 +2301,72 @@ class RunnerRepository:
         async with self.database.sessions() as session:
             runner = await session.get(BenchmarkRunnerRecord, runner_id)
             return _runner_dict(runner) if runner is not None else None
+
+    async def worker_progress(
+        self, *, campaign_ids: Sequence[str] = (), runner_ids: Sequence[str] = ()
+    ) -> Dict[str, Dict[str, Any]]:
+        """Read counts only: no prompts, Worker results or full Runner configurations."""
+        if not campaign_ids and not runner_ids:
+            return {}
+        selected = or_(
+            BenchmarkRunnerRecord.campaign_id.in_(campaign_ids),
+            BenchmarkRunnerRecord.id.in_(runner_ids),
+        )
+        config = BenchmarkRunnerRecord.benchmark_config
+        statement = select(
+            BenchmarkRunnerRecord.id,
+            BenchmarkRunnerRecord.campaign_id,
+            BenchmarkRunnerRecord.status,
+            config["repeat"],
+            func.jsonb_array_length(
+                func.nullif(config["steps"], text("'null'::jsonb"))
+            ),
+            config["cache_probe"],
+            BenchmarkRunnerRecord.summary["worker_creation"]["created"],
+        ).where(selected)
+        counts_statement = (
+            select(WorkerStepRecord.runner_id, WorkerStepRecord.state, func.count())
+            .join(
+                BenchmarkRunnerRecord,
+                BenchmarkRunnerRecord.id == WorkerStepRecord.runner_id,
+            )
+            .where(selected)
+            .group_by(WorkerStepRecord.runner_id, WorkerStepRecord.state)
+        )
+        async with self.database.sessions() as session:
+            rows = (await session.execute(statement)).all()
+            count_rows = (await session.execute(counts_statement)).all()
+        progress: Dict[str, Dict[str, Any]] = {}
+        for runner_id, campaign_id, status, repeat, step_count, probe, created in rows:
+            planned = (
+                int(probe["trials"]) * (1 + int(probe.get("repeats_after_prime", 1)))
+                if probe
+                else int(repeat or 1) * int(step_count or 1)
+            )
+            progress[runner_id] = {
+                "campaign_id": campaign_id,
+                "planned": planned,
+                "created": (
+                    int(created)
+                    if created is not None
+                    else (0 if status == QUEUED else None)
+                ),
+                "phase": "waiting" if status == QUEUED else status,
+                "submitted": 0,
+                "pending_results": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "indeterminate": 0,
+            }
+        for runner_id, state, count in count_rows:
+            progress[runner_id]["submitted"] += int(count)
+            progress[runner_id][
+                "pending_results" if state == "submitted" else state
+            ] += int(count)
+        for item in progress.values():
+            item["not_submitted"] = max(0, item["planned"] - item["submitted"])
+        return progress
 
     async def list_runners(
         self,

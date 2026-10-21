@@ -8,14 +8,21 @@ configurable concurrency, and per-request results stored in PostgreSQL.
 - **Durable workloads:** submit individual Runners, scheduled rounds, or Campaigns;
   track their state independently of the CLI session.
 - **Flexible concurrency:** a shared Ray actor pool serves independent requests across
-  Runners; eight actors support 64 request slots by default.
+  Runners; eight actors support 64 request slots by default. Up to 1024 active Runners
+  share eight preparation threads, released while their Workers execute.
+- **Family prefix reuse:** stable prefixes across trials with suffixes derived from
+  family seed, trial, and request. See [responsibilities and limitations](docs/limitations.md).
+- **Matrix phases:** repeat named Runner matrices behind global completion barriers;
+  retain family prefixes across bounded cycles with a recorded date-based or explicit seed.
+  Define experiment roles in [workload YAML](docs/usage.md#3-run-a-multi-round-campaign).
 - **Composable experiments:** combine sequences, parallel branches, repeats, delay
   matrices, and deterministic payload replay. Task `run` steps execute multi-request
   Runners, letting families advance through independent batch sequences.
 - **Multi-turn conversations:** pass committed message history between ordered invokes.
 - **Performance evidence:** measure latency, throughput, errors, and available cache
   counters; export JSON and prepare HTML reports.
-- **Controlled execution:** admission limits and runtime resource guards bound load;
+- **Controlled execution:** static validation and runtime guards bound concurrent load;
+  whole-campaign budgets are advisory by default, with explicit admission opt-in.
   Provider credentials stay in Backend configuration.
 - **Provider configuration isolation:** define `api_key` or `api_key_env` in
   `providers.yaml`, including empty keys. Invalid Provider configuration leaves the
@@ -133,6 +140,7 @@ to prepare an HTML report.
 - [Documentation index](docs/README.md) · [Setup and operations](docs/usage.md)
 - [Core workload examples](docs/examples.md) · [Task compiler and YAML rules](docs/tasks.md)
 - [Architecture and source layout](docs/architecture.md) · [Runtime and storage](docs/runtime.md)
+- [Performance guard: defaults, budgets, and runtime controls](docs/runtime.md#performance-guard)
 - [systemd deployment](deploy/systemd/README.md) · [Testing](docs/testing.md)
 
 Existing installations: the Backend checks required tables and columns. For older
