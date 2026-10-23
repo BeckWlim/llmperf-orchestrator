@@ -137,12 +137,20 @@ class RuntimeCoordinator:
                 self.instances[instance["instance_id"]] = instance
             else:
                 self.instances.pop(instance["instance_id"], None)
-        for instance in self.instances.values():
+        # A Runner notification changes only the returned instance. Rechecking
+        # every cached graph here makes each completion scale with all campaigns.
+        # Periodic full snapshots still revisit every instance and repair missed events.
+        for instance in snapshot["instances"]:
+            if instance["state"] not in {"planned", "active"}:
+                continue
             nodes = [NodeSnapshot(**node) for node in instance["nodes"]]
             for node_id, due_at in ready_nodes(
                 nodes, instance["created_at"], now
             ).items():
-                if len(runners) + len(self.admitted) >= self.ready_capacity:
+                if (
+                    len(runners) + sum(map(len, self.queues.values()))
+                    >= self.ready_capacity
+                ):
                     break
                 runner = await self.repository.activate_node(node_id, due_at)
                 if runner is not None:
@@ -152,7 +160,7 @@ class RuntimeCoordinator:
                             node["state"] = "emitted"
         async with self.condition:
             for runner in runners:
-                if len(self.admitted) >= self.ready_capacity:
+                if sum(map(len, self.queues.values())) >= self.ready_capacity:
                     break
                 candidate_runner_id = runner["runner_id"]
                 if candidate_runner_id in self.admitted:
@@ -165,25 +173,37 @@ class RuntimeCoordinator:
                 self.admitted.add(candidate_runner_id)
             self.condition.notify_all()
 
+    async def wait_ready(self) -> None:
+        async with self.condition:
+            await self.condition.wait_for(lambda: bool(self.order))
+
     async def next_runner(self, owner: str) -> Dict[str, Any]:
         while True:
-            async with self.condition:
-                await self.condition.wait_for(lambda: bool(self.order))
-                campaign_id = self.order.popleft()
-                runner_id = self.queues[campaign_id].popleft()
-                if self.queues[campaign_id]:
-                    self.order.append(campaign_id)
-                else:
-                    del self.queues[campaign_id]
-            try:
-                async with self.claim_lock:
-                    runner = await self.repository.start_selected(runner_id, owner)
-            except BaseException:
-                self.admitted.discard(runner_id)
-                raise
+            await self.wait_ready()
+            runner = await self.claim_ready_runner(owner)
             if runner is not None:
                 return runner
+
+    async def claim_ready_runner(self, owner: str) -> Optional[Dict[str, Any]]:
+        """Never hold Runner admission waiting for new work after a stale claim."""
+        async with self.condition:
+            if not self.order:
+                return None
+            campaign_id = self.order.popleft()
+            runner_id = self.queues[campaign_id].popleft()
+            if self.queues[campaign_id]:
+                self.order.append(campaign_id)
+            else:
+                del self.queues[campaign_id]
+        try:
+            async with self.claim_lock:
+                runner = await self.repository.start_selected(runner_id, owner)
+        except BaseException:
             self.admitted.discard(runner_id)
+            raise
+        if runner is None:
+            self.admitted.discard(runner_id)
+        return runner
 
     def release_runner(self, runner_id: str) -> None:
         self.admitted.discard(runner_id)

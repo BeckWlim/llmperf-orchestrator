@@ -60,7 +60,7 @@ def batch_template():
                 "accuracy": "compatible",
             },
             "repeat": 256,
-            "concurrent_requests": 8,
+            "concurrent_workers": 8,
             "mean_input_tokens": 32768,
             "stddev_input_tokens": 0,
             "shared_prefix_tokens": 26214,
@@ -93,7 +93,7 @@ def test_batch_compilation():
                 node.runner_template["benchmark"]
             )
             assert benchmark.repeat == 256
-            assert benchmark.concurrent_requests == 8
+            assert benchmark.concurrent_workers == 8
             assert benchmark.shared_prefix_tokens == 26214
             assert benchmark.dataset_seed == benchmark.task_context.dataset_seed
             assert benchmark.task_context.execution_kind == "batch"

@@ -16,6 +16,9 @@ async def attach_progress(
     identifiers = [
         record["campaign_id" if campaigns else "runner_id"] for record in records
     ]
+    if campaigns:
+        await _attach_campaign_progress(records, repository, scheduler, identifiers)
+        return
     durable = await repository.worker_progress(
         campaign_ids=identifiers if campaigns else (),
         runner_ids=() if campaigns else identifiers,
@@ -76,6 +79,65 @@ async def attach_progress(
         }
         record["workers"] = progress_view
         # Slot capacity is global, never a private quota belonging to this Campaign.
+        record["request_slots"] = {
+            "scope": "global",
+            "busy": snapshot["slots_busy"],
+            "total": snapshot["slots_total"],
+            "free": snapshot["slots_free"],
+            "sampled": bool(sampled),
+            "snapshot_age_seconds": snapshot["snapshot_age_seconds"],
+        }
+
+
+async def _attach_campaign_progress(
+    records: Sequence[Dict[str, Any]],
+    repository: RunnerRepository,
+    scheduler: Scheduler,
+    identifiers: Sequence[str],
+) -> None:
+    durable = await repository.campaign_worker_progress(identifiers)
+    snapshot = scheduler.worker_status()
+    live = snapshot["runners"]
+    # Only resident Runners need individual rows to merge live creation telemetry.
+    resident = await repository.worker_progress(runner_ids=list(live))
+    sampled = snapshot["pool_ready"] and (
+        snapshot["snapshot_age_seconds"]
+        <= scheduler.config.ray_health_interval_seconds
+        + scheduler.config.ray_health_timeout_seconds
+    )
+    live_fields = ("admission_waiting", "queued", "running")
+    for item in durable.values():
+        item.update({field: 0 if sampled else None for field in live_fields})
+    for runner_id, runner_live in live.items():
+        stored = resident.get(runner_id)
+        if stored is None or stored["campaign_id"] not in durable:
+            continue
+        item = durable[stored["campaign_id"]]
+        if "created" in runner_live:
+            if stored["created"] is None:
+                item["unknown_created"] -= 1
+            item["created"] += runner_live["created"] - (stored["created"] or 0)
+            phases = item["creation_phases"]
+            phases[stored["phase"]] = phases.get(stored["phase"], 0) - 1
+            phases[runner_live["phase"]] = phases.get(runner_live["phase"], 0) + 1
+        if sampled:
+            for field in live_fields:
+                item[field] += runner_live.get(field, 0)
+    for record in records:
+        item = durable[record["campaign_id"]]
+        if item.pop("unknown_created") > 0:
+            item["created"] = None
+        item["creation_phases"] = {
+            phase: item["creation_phases"].get(phase, 0)
+            for phase in (
+                "waiting",
+                "preparation_queued",
+                "preparing",
+                "submitting",
+                "aggregating",
+            )
+        }
+        record["workers"] = item
         record["request_slots"] = {
             "scope": "global",
             "busy": snapshot["slots_busy"],

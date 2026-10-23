@@ -284,7 +284,7 @@ def test_provider_reload(client_factory, tmp_path):
 
         invalid_runner = client.post(
             "/api/v1/runners",
-            json={"request": {}, "provider": "test", "model": "glm5.2"},
+            json={"worker": {}, "provider": "test", "model": "glm5.2"},
         )
         assert invalid_runner.status_code == 422
         assert "configured models: glm-5.2" in invalid_runner.text
@@ -527,7 +527,7 @@ def test_atomic_campaign_start(client_factory):
                 "campaign": {"name": "invalid-study"},
                 "runners": [
                     {
-                        "request": {"unknown_field": True},
+                        "worker": {"unknown_field": True},
                         "provider": "test",
                         "model": "test-model",
                     }
@@ -658,7 +658,7 @@ def test_compiled_dataset(tmp_path: Path, client_factory):
             }
         ],
         "runner": {
-            "request": {},
+            "worker": {},
             "provider": "test",
             "model": "test-model",
             "stddev_output_tokens": 0,
@@ -743,7 +743,7 @@ def test_runner_tokenizer(tmp_path: Path, client_factory):
         created = client.post(
             "/api/v1/runners",
             json={
-                "request": {},
+                "worker": {},
                 "provider": "test",
                 "model": "test-model",
                 "tokenizer": {
@@ -777,7 +777,7 @@ def test_runner_dataset(tmp_path: Path, client_factory):
         created = client.post(
             "/api/v1/runners",
             json={
-                "request": {},
+                "worker": {},
                 "provider": "test",
                 "model": "test-model",
                 "inputs": {
@@ -837,3 +837,33 @@ def test_runner_plan(client_factory):
         assert resumed.json()["status"] == "active"
         cancelled = client.post(f"/api/v1/runner-plans/{plan_id}/cancel")
         assert cancelled.json()["status"] == "cancelled"
+
+
+def test_default_task_tokenizer(tmp_path, client_factory):
+    tokenizer_directory = tmp_path / "general-tokenizer"
+    tokenizer_directory.mkdir()
+    tokenizer_cache = FakeTokenizerCache(tokenizer_directory, revision="a" * 40)
+    task = {
+        "name": "general-estimate",
+        "workflow": [{"run": {"name": "request"}}],
+        "runner": {
+            "provider": "test",
+            "model": "test-model",
+            "stddev_output_tokens": 0,
+            "inputs": {"default": {"tokens": 100}},
+        },
+    }
+    with client_factory(tokenizer_cache=tokenizer_cache) as client:
+        accepted = client.post(
+            "/api/v1/campaigns/start",
+            json={
+                "campaign": {"name": "general-estimate"},
+                "task_definitions": [task],
+            },
+        )
+        assert accepted.status_code == 202, accepted.text
+        resolved = accepted.json()["task_definitions"][0]["runner"]["benchmark"]
+        assert resolved["input_token_count"] == "estimate"
+        assert resolved["tokenizer"]["id"] == "hf-internal-testing/llama-tokenizer"
+        assert resolved["tokenizer"]["selection"] == "global_default"
+        assert resolved["tokenizer"]["accuracy"] == "approximate"

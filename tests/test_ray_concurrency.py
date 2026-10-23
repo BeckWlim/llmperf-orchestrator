@@ -197,7 +197,7 @@ def test_concurrent_http_streams(monkeypatch, mode, tmp_path):
                                     "adapter": "openai",
                                     "timeout": 120,
                                     "repeat": 1,
-                                    "concurrent_requests": 1,
+                                    "concurrent_workers": 1,
                                     "mean_input_tokens": 1,
                                     "stddev_input_tokens": 0,
                                     "mean_output_tokens": 1,

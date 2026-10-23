@@ -17,6 +17,7 @@ increase counts only after checking Scheduler capacity and the fully expanded re
 |---|---|---:|
 | [Independent batches](../examples/example-batch-parallel.yaml) | Matrix × trials; one independent batch per instance | 16 |
 | [Family recall](../examples/example-family-recall.yaml) | Three stable prefix families × two trials with family-derived suffixes | 24 |
+| [Seed pool](../examples/example-seed-pool.yaml) | Two sequential groups × four Runners; one deterministic prefix draw per Runner | 32 |
 | [Sequential batches](../examples/example-batch-sequence.yaml) | Two independent families, each with two serial batches | 16 |
 | [Campaign rounds](../examples/example-rounds.yaml) | Two Runner templates repeated twice with a barrier between rounds | 8 |
 | [RunnerPlan](../examples/example-runner-plan.yaml) | Two time-based occurrences one second apart | 2 |

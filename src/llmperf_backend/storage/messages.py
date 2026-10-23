@@ -37,7 +37,7 @@ class MessageRecord(Base):
         String(36), primary_key=True, default=lambda: str(uuid4())
     )
     runner_id: Mapped[str] = mapped_column(
-        ForeignKey("benchmark_runners.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("runners.id", ondelete="CASCADE"), nullable=False
     )
     message_type: Mapped[str] = mapped_column(String(32), nullable=False)
     source: Mapped[Optional[str]] = mapped_column(String(128))
@@ -84,7 +84,7 @@ class ConversationMessageRecord(MessageRecord):
         ForeignKey("runner_messages.id", ondelete="CASCADE"), primary_key=True
     )
     instance_id: Mapped[str] = mapped_column(
-        ForeignKey("benchmark_task_instances.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("task_instances.id", ondelete="CASCADE"), nullable=False
     )
     conversation: Mapped[str] = mapped_column(String(64), nullable=False)
     position: Mapped[int] = mapped_column(Integer, nullable=False)

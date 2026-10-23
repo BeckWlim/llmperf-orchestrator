@@ -24,7 +24,7 @@ task_definitions:
       revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0
       use_fast: true
     timeout: 60
-    concurrent_requests: 2
+    concurrent_workers: 2
     mean_output_tokens: 8
     stddev_output_tokens: 0
     output_token_count: provider
@@ -34,5 +34,5 @@ task_definitions:
       default:
         shared_prefix_tokens: 96
         tokens: 128
-    request:
+    worker:
       repeat: 4

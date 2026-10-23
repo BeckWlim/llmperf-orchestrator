@@ -18,7 +18,7 @@ runners:
       text: Give one risk of caching.
     summary:
       text: Summarize both answers in one sentence.
-  request:
+  worker:
     steps:
     - name: benefits
       input: benefits

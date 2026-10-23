@@ -13,6 +13,7 @@ from uuid import NAMESPACE_URL, uuid5
 from llmperf.benchmark.execution import RequestStep
 from llmperf.clients.base import LLMResponse
 from llmperf.metrics import constants
+from llmperf_backend.runtime.admission import RunnerAdmission
 from llmperf_backend.runtime.messages import (
     RunnerMessage,
     RunnerMessageBus,
@@ -110,6 +111,12 @@ class WorkflowTaskLogic(TaskLogic):
     def eligibility(
         self, step: RequestStep, now: datetime, results: Mapping[str, WorkerResult]
     ) -> Eligibility:
+        if not step.dependencies:
+            due_at = max(
+                self.created_at + timedelta(seconds=step.delay_seconds),
+                step.due_at or self.created_at,
+            )
+            return DateTrigger(due_at).evaluate(now, {})
         completions = {
             identifier: Completion(result.succeeded, result.completed_at)
             for identifier, result in results.items()
@@ -171,16 +178,27 @@ class RunnerRuntime:
         bus: RunnerMessageBus,
         timeout_seconds: float,
         max_outstanding_workers: Optional[int] = None,
+        cooldown_seconds: Optional[float] = None,
+        admission: Optional[RunnerAdmission] = None,
     ):
         if max_outstanding_workers is not None and max_outstanding_workers < 1:
             raise ValueError("max_outstanding_workers must be positive when specified")
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("Runner timeout must be finite and positive")
+        if cooldown_seconds is not None and (
+            not math.isfinite(cooldown_seconds) or cooldown_seconds < 0
+        ):
+            raise ValueError("Worker cooldown must be finite and nonnegative")
+        if cooldown_seconds is not None and max_outstanding_workers not in (None, 1):
+            raise ValueError("Worker cooldown requires a serial Runner")
         self.runner_id = runner_id
         self.logic = logic
         self.scheduler = scheduler
         self.bus = bus
-        self.window = max_outstanding_workers
+        self.window = 1 if cooldown_seconds is not None else max_outstanding_workers
+        self.cooldown_seconds = cooldown_seconds
+        self.next_worker_at: Optional[datetime] = None
+        self.admission = admission
         self.timeout_seconds = timeout_seconds
         self.results: Dict[str, WorkerResult] = {}
         self.cancelled_steps: Dict[str, WorkerCancellation] = {}
@@ -211,6 +229,11 @@ class RunnerRuntime:
         )
         self.cancelled_steps[step.step_id] = cancellation
 
+    async def _submit(self, step: RequestStep) -> None:
+        if self.admission is not None:
+            await self.admission.acquire(self.runner_id)
+        await self.scheduler.submit(self.runner_id, step, self.window)
+
     async def run(self) -> List[LLMResponse]:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.timeout_seconds
@@ -240,6 +263,13 @@ class RunnerRuntime:
                             if identifier not in known_steps:
                                 raise ValueError(
                                     "Worker completion does not belong to task"
+                                )
+                            if (
+                                identifier not in self.results
+                                and self.cooldown_seconds is not None
+                            ):
+                                self.next_worker_at = message.created_at + timedelta(
+                                    seconds=self.cooldown_seconds
                                 )
                             self.results.setdefault(
                                 identifier,
@@ -291,6 +321,15 @@ class RunnerRuntime:
                 now = datetime.now(timezone.utc)
                 next_due: Optional[datetime] = None
                 for identifier, step in tuple(pending.items()):
+                    if self.cooldown_seconds is not None:
+                        if self.outstanding or submission_task is not None:
+                            break
+                        if (
+                            self.next_worker_at is not None
+                            and now < self.next_worker_at
+                        ):
+                            next_due = self.next_worker_at
+                            break
                     failed_dependencies = [
                         parent
                         for parent in step.dependencies
@@ -344,15 +383,20 @@ class RunnerRuntime:
                             # per ready request. Continue listening while Scheduler waits.
                             self.outstanding.add(identifier)
                             submission_task = asyncio.create_task(
-                                self.scheduler.submit(
-                                    self.runner_id, prepared_step, self.window
-                                )
+                                self._submit(prepared_step)
                             )
                             del pending[identifier]
                     elif eligibility.due_at is not None:
                         next_due = min(
                             next_due or eligibility.due_at, eligibility.due_at
                         )
+                if (
+                    next_due is not None
+                    and not self.outstanding
+                    and submission_task is None
+                    and self.admission is not None
+                ):
+                    self.admission.release(self.runner_id)
                 if next_due is None and timer_task is not None:
                     timer_task.cancel()
                     await asyncio.gather(timer_task, return_exceptions=True)

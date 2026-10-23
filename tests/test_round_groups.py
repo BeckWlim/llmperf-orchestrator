@@ -1,7 +1,6 @@
 """Matrix phases retain family identity while imposing durable completion barriers."""
 
 from copy import deepcopy
-from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -139,15 +138,14 @@ def test_group_validation(case):
         BenchmarkCampaignStart.model_validate(document)
 
 
-@pytest.mark.parametrize(
-    "profile,total",
-    [("memory-recall", 8192), ("dfs-recall", 7168), ("tiered-recall", 8960)],
-)
-def test_recall_workloads(profile, total):
-    document = yaml.safe_load(
-        (Path(__file__).parents[1] / "workloads" / f"{profile}.yaml").read_text()
-    )
-    document.pop("wait")
+@pytest.mark.parametrize("cycles", [1, 7, 24])
+def test_large_matrix(cycles):
+    # Grammar coverage must not depend on retired operational workload files.
+    document = submission()
+    document["campaign"]["rounds"]["count"] = cycles
+    for group in document["runner_groups"]:
+        group["matrix"] = {"row": list(range(8)), "column": list(range(16))}
+    total = cycles * 3 * 128
     runners = expanded(document)
     assert len(runners) == total
     target_seeds = {

@@ -90,7 +90,7 @@ ready Workers to slots; each Worker sends one request and returns.
 
 ```text
 YAML authoring syntax
-  instances(matrix, trials, seed) / workflow / invoke / run / repeat / parallel / sequence
+  instances(matrix, trials, seed) / workflow / invoke / run / repeat / parallel / sequence / for_each
                     │
                     ▼
              Workload Compiler
@@ -110,9 +110,9 @@ part of the release surface.
 
 ### 1.1 Versioned format inventory
 
-| Surface | Version marker | 1.0.0 contract |
+| Surface | Version marker | Current version |
 |---|---|---|
-| Python distribution and CLI | package `version` | `1.0.0` |
+| Python distribution and CLI | package `version` | `1.0.1` |
 | Backend configuration YAML | root `version` | string `"1.0.0"` |
 | Runner and Campaign YAML/JSON | root `version` | string `"1.0.0"` |
 | HTTP control plane | route prefix | `/api/v1` |
@@ -123,6 +123,10 @@ part of the release surface.
 | Normalized report evidence | `analysis_version` | string `"1.0.0"` |
 | Render plan and review | `render_plan_version` / `render_review_version` | string `"1.0.0"` |
 | Hugging Face cache-link manifest | `schema` suffix | `llmperf-huggingface-cache-links/1.0.0` |
+
+Release 1.0.1 introduces incompatible storage layouts and canonical Worker output fields.
+Existing installations require an explicit schema cutover. Document-format markers remain
+at 1.0.0 and are versioned independently from the package release.
 
 `llmperf.version` is the runtime authority for release, protocol, and compiled-task format
 identifiers. External YAML is strict: the version is mandatory, unknown fields are rejected,
@@ -224,6 +228,14 @@ and batch `run` nodes. `repeat`, `parallel`, and `sequence` define dependencies 
 It derives deterministic seeds and assigns runtime identities only after logical compilation.
 The runtime coordinator owns readiness; Scheduler owns execution.
 
+`parallel.count/node` expands a branch template into ordinary parallel members.
+`run.prefix_seed` resolves a literal, matrix reference, or deterministic list pick
+once per expanded Runner. The resolved integer is persisted directly as the prefix
+seed, independently from the suffix seed. These authoring conveniences introduce
+no new runtime group or round state; existing dependencies enforce group constraints.
+Pick pools may be explicit lists or compact `{seed, count}` specifications expanded
+deterministically by the compiler.
+
 [Task compiler and YAML rules](tasks.md) contains the supported definition contract,
 instance/workflow/Runner mapping, primitive semantics, seed rules, limits, and implementation
 boundaries. [Dataset configuration](usage.md#workload-examples-and-task-definitions) describes
@@ -252,7 +264,7 @@ Eight shared Ray actors with eight requests per actor provide 64 request slots b
 handles have an independent bound. Runner-owned preparation uses cached tokenizers and a
 local executor; its async listener submits atomic Workers through Scheduler backpressure.
 Every request uses the shared pool with isolated adapter state and credentials. An explicit
-`concurrent_requests` applies an optional ceiling; by default Scheduler owns admission.
+`concurrent_workers` applies an optional ceiling; by default Scheduler owns admission.
 
 Each compiled invoke completes independently. The runtime combines ready work across
 Runners at the actor pool without a static group barrier. Multi-turn invokes use an

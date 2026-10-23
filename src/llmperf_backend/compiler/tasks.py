@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import cached_property
 import hashlib
 import math
 from itertools import product
@@ -78,6 +79,64 @@ TaskValue = Annotated[
 ]
 
 
+SeedInteger = Annotated[int, Field(strict=True, ge=0, le=2**64 - 1)]
+
+
+class GeneratedSeedPool(CompilerModel):
+    """Compact authoring of a deterministic, unique unsigned integer pool."""
+
+    seed: SeedInteger
+    count: int = Field(strict=True, ge=1, le=10_000)
+
+    @cached_property
+    def values(self) -> Tuple[int, ...]:
+        values: List[int] = []
+        used: set[int] = set()
+        for index in range(self.count):
+            material = f"prefix-pool-v1\0{self.seed}\0{index}"
+            candidate = int.from_bytes(
+                hashlib.sha256(material.encode()).digest()[:8], "big"
+            )
+            # Resolve a truncated-digest collision without changing earlier entries.
+            while candidate in used:
+                candidate = (candidate + 1) % (2**64)
+            used.add(candidate)
+            values.append(candidate)
+        return tuple(values)
+
+
+class RandomPick(CompilerModel):
+    """One deterministic draw with replacement from an explicit or generated pool."""
+
+    pick: Union[
+        Annotated[List[SeedInteger], Field(min_length=1, max_length=10_000)],
+        GeneratedSeedPool,
+    ]
+
+    @field_validator("pick")
+    @classmethod
+    def validate_pool(
+        cls, values: Union[List[int], GeneratedSeedPool]
+    ) -> Union[List[int], GeneratedSeedPool]:
+        if isinstance(values, list) and len(set(values)) != len(values):
+            raise ValueError("pick values must be unique")
+        return values
+
+    @cached_property
+    def values(self) -> Tuple[int, ...]:
+        return (
+            self.pick.values
+            if isinstance(self.pick, GeneratedSeedPool)
+            else tuple(self.pick)
+        )
+
+
+PrefixSeed = Annotated[
+    Union[SeedInteger, DimensionReference, RandomPick],
+    BeforeValidator(_parse_task_value),
+]
+
+
 class TaskDuration(DurationValue[Union[float, DimensionReference]]):
     @field_validator("value", mode="before")
     @classmethod
@@ -142,6 +201,7 @@ class RunConfig(DependentNodeConfig):
     name: str = Field(min_length=1, max_length=64)
     role: Optional[str] = Field(default=None, min_length=1, max_length=64)
     after: TaskDuration = Field(default_factory=lambda: TaskDuration(value=0))
+    prefix_seed: Optional[PrefixSeed] = None
 
     @model_validator(mode="after")
     def validate_messages(self) -> RunConfig:
@@ -167,7 +227,20 @@ class ParallelConfig(CompilerModel):
     name: str = Field(min_length=1, max_length=64)
     after: TaskDuration = Field(default_factory=lambda: TaskDuration(value=0))
 
-    branches: List[TaskNodeSpec] = Field(min_length=1, max_length=100)
+    branches: Optional[List[TaskNodeSpec]] = Field(
+        default=None, min_length=1, max_length=100
+    )
+    count: Optional[TaskValue] = None
+    node: Optional[TaskNodeSpec] = None
+
+    @model_validator(mode="after")
+    def validate_expansion(self) -> ParallelConfig:
+        if self.branches is not None:
+            if self.count is not None or self.node is not None:
+                raise ValueError("parallel accepts branches or count/node, not both")
+        elif self.count is None or self.node is None:
+            raise ValueError("parallel requires branches or both count and node")
+        return self
 
 
 class SequenceConfig(CompilerModel):
@@ -179,8 +252,31 @@ class SequenceConfig(CompilerModel):
     steps: List[TaskNodeSpec] = Field(min_length=1, max_length=100)
 
 
+class ForEachConfig(CompilerModel):
+    """Enumerate fixed values in bounded, static serial lanes."""
+
+    name: str = Field(min_length=1, max_length=64)
+    variable: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$", max_length=64)
+    values: Union[
+        Annotated[List[SeedInteger], Field(min_length=1, max_length=10_000)],
+        GeneratedSeedPool,
+    ]
+    parallelism: int = Field(default=1, strict=True, ge=1, le=10_000)
+    after: TaskDuration = Field(default_factory=lambda: TaskDuration(value=0))
+    node: TaskNodeSpec
+
+    @field_validator("values")
+    @classmethod
+    def validate_values(
+        cls, values: Union[List[int], GeneratedSeedPool]
+    ) -> Union[List[int], GeneratedSeedPool]:
+        if isinstance(values, list) and len(set(values)) != len(values):
+            raise ValueError("for_each values must be unique")
+        return values
+
+
 NodeConfig = Union[
-    InvokeConfig, RunConfig, RepeatConfig, ParallelConfig, SequenceConfig
+    InvokeConfig, RunConfig, RepeatConfig, ParallelConfig, SequenceConfig, ForEachConfig
 ]
 
 
@@ -192,12 +288,13 @@ class TaskNodeSpec(CompilerModel):
     repeat: Optional[RepeatConfig] = None
     parallel: Optional[ParallelConfig] = None
     sequence: Optional[SequenceConfig] = None
+    for_each: Optional[ForEachConfig] = None
 
     @model_validator(mode="after")
     def validate_primitive(self) -> TaskNodeSpec:
         configured_primitives = [
             name
-            for name in ("invoke", "run", "repeat", "parallel", "sequence")
+            for name in ("invoke", "run", "repeat", "parallel", "sequence", "for_each")
             if getattr(self, name) is not None
         ]
         if len(configured_primitives) != 1:
@@ -205,7 +302,14 @@ class TaskNodeSpec(CompilerModel):
         return self
 
     def selected(self) -> Tuple[str, NodeConfig]:
-        for primitive_name in ("invoke", "run", "repeat", "parallel", "sequence"):
+        for primitive_name in (
+            "invoke",
+            "run",
+            "repeat",
+            "parallel",
+            "sequence",
+            "for_each",
+        ):
             primitive_config = getattr(self, primitive_name)
             if primitive_config is not None:
                 return primitive_name, primitive_config
@@ -215,6 +319,7 @@ class TaskNodeSpec(CompilerModel):
 RepeatConfig.model_rebuild()
 ParallelConfig.model_rebuild()
 SequenceConfig.model_rebuild()
+ForEachConfig.model_rebuild()
 
 
 class TaskInstancesConfig(CompilerModel):
@@ -327,6 +432,7 @@ class CompiledNodeRow:
     prompt_text: Optional[str] = None
     execution_kind: Literal["atomic", "batch"] = "atomic"
     message_sources: Tuple[str, ...] = ()
+    prefix_seed: Optional[int] = None
 
 
 class CompilationTable:
@@ -414,6 +520,24 @@ class InstanceContext:
     payloads: Mapping[str, TaskPayloadSpec]
     prefix_seed_scope: Literal["trial", "family"] = "trial"
 
+    def resolve_prefix_seed(self, value: PrefixSeed, node_id: str) -> int:
+        if isinstance(value, RandomPick):
+            coordinates = ";".join(
+                f"{key}={item}" for key, item in sorted(self.dimensions.items())
+            )
+            material = (
+                f"prefix-pick-v1\0{self.seed}\0{coordinates}"
+                f"\0{self.trial_index}\0{node_id}"
+            )
+            selection = int.from_bytes(
+                hashlib.sha256(material.encode()).digest(), "big"
+            )
+            return value.values[selection % len(value.values)]
+        resolved_seed = TaskExpression.from_value(value).resolve(self.dimensions)
+        if not 0 <= resolved_seed <= 2**64 - 1:
+            raise ValueError("prefix_seed must be an unsigned 64-bit integer")
+        return resolved_seed
+
     def family_prefix_seed(self) -> int:
         coordinates = ";".join(
             f"{key}={value}" for key, value in sorted(self.dimensions.items())
@@ -475,6 +599,7 @@ class GraphBuilder:
         payload_id: Optional[str],
         message_sources: Tuple[str, ...] = (),
         execution_kind: Literal["atomic", "batch"] = "atomic",
+        prefix_seed: Optional[int] = None,
     ) -> str:
         if not node_id or len(node_id) > 120:
             raise ValueError("expanded task node IDs must contain 1-120 chars")
@@ -507,6 +632,7 @@ class GraphBuilder:
                 else None
             ),
             execution_kind=execution_kind,
+            prefix_seed=prefix_seed,
         )
         self._nodes.append(compiled_row)
         self._node_ids.add(node_id)
@@ -599,6 +725,7 @@ class RunNode(BaseNode):
     role: str
     after: TaskDuration
     depends_on: Tuple[RequestDependency, ...] = ()
+    prefix_seed: Optional[PrefixSeed] = None
 
     @classmethod
     def from_config(cls, config: CompilerModel, depth: int) -> RunNode:
@@ -610,6 +737,7 @@ class RunNode(BaseNode):
             config.role or config.name,
             config.after,
             tuple(config.depends_on),
+            config.prefix_seed,
         )
 
     def expand(
@@ -637,6 +765,13 @@ class RunNode(BaseNode):
             role=self.role,
             payload_id=None,
             execution_kind="batch",
+            prefix_seed=(
+                builder.instance.resolve_prefix_seed(
+                    self.prefix_seed, _qualified_name(path, self.name)
+                )
+                if self.prefix_seed is not None
+                else None
+            ),
         )
         return (node_id,)
 
@@ -693,6 +828,8 @@ class RepeatNode(BaseNode):
 class ParallelNode(BaseNode):
     after: TaskDuration
     branches: Tuple[BaseNode, ...]
+    count: Optional[TaskExpression] = None
+    node: Optional[BaseNode] = None
 
     @classmethod
     def from_config(cls, config: CompilerModel, depth: int) -> ParallelNode:
@@ -703,9 +840,34 @@ class ParallelNode(BaseNode):
             name=config.name,
             after=config.after,
             branches=tuple(
-                _node_from_spec(branch, depth + 1) for branch in config.branches
+                _node_from_spec(branch, depth + 1) for branch in config.branches or ()
+            ),
+            count=(
+                TaskExpression.from_value(config.count)
+                if config.count is not None
+                else None
+            ),
+            node=(
+                _node_from_spec(config.node, depth + 1)
+                if config.node is not None
+                else None
             ),
         )
+
+    def expanded_branches(
+        self, dimensions: Mapping[str, int], path: Tuple[str, ...]
+    ) -> Iterable[Tuple[BaseNode, Tuple[str, ...]]]:
+        if self.count is None or self.node is None:
+            for branch in self.branches:
+                yield branch, path
+            return
+        branch_count = self.count.resolve(dimensions)
+        if not 1 <= branch_count <= MAX_NODES_PER_INSTANCE:
+            raise ValueError(
+                f"expanded parallel count must be between 1 and {MAX_NODES_PER_INSTANCE}"
+            )
+        for branch_index in range(1, branch_count + 1):
+            yield self.node, (*path, str(branch_index))
 
     def expand(
         self,
@@ -718,11 +880,13 @@ class ParallelNode(BaseNode):
         branch_delay_seconds = inherited_delay_seconds + own_delay_seconds
         parallel_path = (*path, self.name)
         outgoing_frontier: List[str] = []
-        for branch in self.branches:
+        for branch, branch_path in self.expanded_branches(
+            builder.instance.dimensions, parallel_path
+        ):
             branch_frontier = branch.expand(
                 builder,
                 incoming_frontier,
-                parallel_path,
+                branch_path,
                 branch_delay_seconds,
             )
             outgoing_frontier.extend(branch_frontier)
@@ -768,12 +932,125 @@ class SequenceNode(BaseNode):
         return outgoing_frontier
 
 
+def _bind_loop_value(document: object, variable: str, value: int) -> object:
+    """Substitute only typed scalar references, never arbitrary text or names."""
+    if isinstance(document, dict):
+        if document == {"dimension": variable}:
+            return value
+        nested_loop = document.get("for_each")
+        if isinstance(nested_loop, dict) and nested_loop.get("variable") == variable:
+            raise ValueError(
+                f"for_each variable shadows an enclosing variable: {variable}"
+            )
+        return {
+            key: _bind_loop_value(child, variable, value)
+            for key, child in document.items()
+        }
+    if isinstance(document, list):
+        return [_bind_loop_value(child, variable, value) for child in document]
+    return document
+
+
+def _validate_loop_names(document: object, dimension_names: set[str]) -> None:
+    if isinstance(document, dict):
+        loop_config = document.get("for_each")
+        if (
+            isinstance(loop_config, dict)
+            and loop_config.get("variable") in dimension_names
+        ):
+            raise ValueError("for_each variable must not shadow a matrix dimension")
+        for child in document.values():
+            _validate_loop_names(child, dimension_names)
+    elif isinstance(document, list):
+        for child in document:
+            _validate_loop_names(child, dimension_names)
+
+
+@dataclass(frozen=True)
+class ForEachNode(BaseNode):
+    variable: str
+    values: Tuple[int, ...]
+    parallelism: int
+    after: TaskDuration
+    template: TaskNodeSpec
+    depth: int
+
+    @classmethod
+    def from_config(cls, config: CompilerModel, depth: int) -> ForEachNode:
+        if not isinstance(config, ForEachConfig):
+            raise TypeError("for_each node requires ForEachConfig")
+        _validate_depth(depth)
+        # Validate nested syntax/depth without eagerly expanding the value product.
+        _node_from_spec(config.node, depth + 1)
+        return cls(
+            name=config.name,
+            variable=config.variable,
+            values=(
+                config.values.values
+                if isinstance(config.values, GeneratedSeedPool)
+                else tuple(config.values)
+            ),
+            parallelism=config.parallelism,
+            after=config.after,
+            template=config.node,
+            depth=depth,
+        )
+
+    def expanded_lanes(self) -> Iterable[SequenceNode]:
+        lane_count = min(self.parallelism, len(self.values))
+        lane_size, extra_members = divmod(len(self.values), lane_count)
+        template_document = self.template.model_dump(mode="json", exclude_none=True)
+        offset = 0
+        for lane_index in range(lane_count):
+            member_count = lane_size + int(lane_index < extra_members)
+            members: List[BaseNode] = []
+            for member_index, value in enumerate(
+                self.values[offset : offset + member_count]
+            ):
+                bound_document = _bind_loop_value(
+                    template_document, self.variable, value
+                )
+                bound_spec = TaskNodeSpec.model_validate(bound_document)
+                members.append(
+                    SequenceNode(
+                        name=f"member_{member_index + 1:02d}",
+                        after=TaskDuration(value=0),
+                        steps=(_node_from_spec(bound_spec, self.depth + 1),),
+                    )
+                )
+            offset += member_count
+            yield SequenceNode(
+                name=f"lane_{lane_index + 1:02d}",
+                after=TaskDuration(value=0),
+                steps=tuple(members),
+            )
+
+    def expand(
+        self,
+        builder: GraphBuilder,
+        incoming_frontier: Tuple[str, ...],
+        path: Tuple[str, ...],
+        inherited_delay_seconds: float,
+    ) -> Tuple[str, ...]:
+        loop_path = (*path, self.name)
+        lane_delay_seconds = inherited_delay_seconds + self.after.resolve(
+            builder.instance.dimensions
+        )
+        outgoing_frontier: List[str] = []
+        for lane in self.expanded_lanes():
+            outgoing_frontier.extend(
+                lane.expand(builder, incoming_frontier, loop_path, lane_delay_seconds)
+            )
+        return tuple(outgoing_frontier)
+
+
 NODE_TYPES = {
     "invoke": InvokeNode,
     "run": RunNode,
     "repeat": RepeatNode,
     "parallel": ParallelNode,
     "sequence": SequenceNode,
+    "for_each": ForEachNode,
 }
 
 
@@ -800,6 +1077,13 @@ class TaskGraph:
 
     @classmethod
     def from_recipe(cls, recipe: TaskRecipe) -> TaskGraph:
+        _validate_loop_names(
+            [
+                spec.model_dump(mode="json", exclude_none=True)
+                for spec in recipe.workflow
+            ],
+            set(recipe.instances.matrix),
+        )
         return cls(roots=tuple(_node_from_spec(spec) for spec in recipe.workflow))
 
     def expand(
@@ -810,15 +1094,21 @@ class TaskGraph:
         for root in self.roots:
             frontier = root.expand(builder, frontier, (), 0)
         compiled_rows = builder.rows()
+        requires_history = any(row.message_sources for row in compiled_rows)
         ancestors: Dict[str, set[str]] = {}
         prior_nodes: Dict[str, CompiledNodeRow] = {}
         for row in compiled_rows:
-            predecessors = set(row.dependencies)
             for dependency in row.dependencies:
-                if dependency not in ancestors:
+                if dependency not in prior_nodes:
                     raise ValueError("depends_on must reference an earlier node")
-                predecessors.update(ancestors[dependency])
-            ancestors[row.node_id] = predecessors
+            # Batch groups only need direct dependency validation. Their dense joins
+            # must not materialize transitive closure unless message reuse needs it.
+            predecessors: set[str] = set()
+            if requires_history:
+                predecessors.update(row.dependencies)
+                for dependency in row.dependencies:
+                    predecessors.update(ancestors[dependency])
+                ancestors[row.node_id] = predecessors
             for message_source in row.message_sources:
                 if message_source not in predecessors:
                     raise ValueError(
@@ -948,8 +1238,10 @@ class TaskCompiler:
             batch_limit = planned_worker_count(benchmark or {})
             batch_concurrency = min(
                 batch_limit,
-                int((benchmark or {}).get("concurrent_requests") or batch_limit),
+                int((benchmark or {}).get("concurrent_workers") or batch_limit),
             )
+            if (benchmark or {}).get("every") is not None:
+                batch_concurrency = min(batch_concurrency, 1)
             request_count += (
                 sum(
                     batch_limit if node.execution_kind == "batch" else 1
@@ -1015,6 +1307,7 @@ class TaskCompiler:
         recipe = TaskRecipe.model_validate(definition)
         graph = TaskGraph.from_recipe(recipe)
         total = 0
+        batch_token_budget: Optional[int] = None
         for index, dimensions in enumerate(_matrix_coordinates(recipe)):
             context = InstanceContext(
                 recipe.instances.seed,
@@ -1026,16 +1319,15 @@ class TaskCompiler:
             histories: Dict[str, int] = {}
             for node in graph.expand(context, f"budget-{index}"):
                 if node.execution_kind == "batch":
-                    total += (
-                        planned_token_budget(
+                    if batch_token_budget is None:
+                        batch_token_budget = planned_token_budget(
                             benchmark
                             or {
                                 "mean_input_tokens": input_tokens,
                                 "mean_output_tokens": output_tokens,
                             }
                         )
-                        * recipe.instances.trials
-                    )
+                    total += batch_token_budget * recipe.instances.trials
                     continue
                 # Literal payloads need not match the configured generated-prompt size.
                 user_tokens = (
@@ -1106,10 +1398,15 @@ def _weighted_peak(
     if isinstance(node, (InvokeNode, RunNode)):
         return weights.get(_qualified_name(path, node.name), 0)
     nested_path = (*path, node.name)
+    if isinstance(node, ForEachNode):
+        return sum(
+            _weighted_peak(lane, dimensions, weights, nested_path)
+            for lane in node.expanded_lanes()
+        )
     if isinstance(node, ParallelNode):
         return sum(
-            _weighted_peak(child, dimensions, weights, nested_path)
-            for child in node.branches
+            _weighted_peak(child, dimensions, weights, child_path)
+            for child, child_path in node.expanded_branches(dimensions, nested_path)
         )
     if isinstance(node, SequenceNode):
         return max(
@@ -1238,7 +1535,19 @@ class TaskAssembler:
         benchmark["task_context"] = task_context
         if node.execution_kind == "batch":
             task_context.update(dataset_seed=node.payload_seed, seed_version="batch-v1")
-            if self.context.definition.instances.prefix_seed_scope == "family":
+            if node.prefix_seed is not None:
+                benchmark["shared_prefix_seed"] = node.prefix_seed
+                task_context.update(
+                    seed_version=(
+                        "family-suffix-v1"
+                        if self.context.definition.instances.prefix_seed_scope
+                        == "family"
+                        else "batch-v1"
+                    ),
+                    shared_prefix_seed=node.prefix_seed,
+                    prefix_seed_version="explicit-prefix-v1",
+                )
+            elif self.context.definition.instances.prefix_seed_scope == "family":
                 family_context = InstanceContext(
                     self.context.definition.instances.seed,
                     instance.dimensions,
@@ -1266,7 +1575,7 @@ class TaskAssembler:
                 raise ValueError(
                     "invoke requires a single Worker template; use run for request steps or repetition"
                 )
-            benchmark.update(repeat=1, concurrent_requests=1)
+            benchmark.update(repeat=1, concurrent_workers=1)
             atomic_benchmark = CompiledBenchmarkConfig.model_validate(benchmark)
             benchmark_document = atomic_benchmark.model_dump(mode="json")
         prefix = (

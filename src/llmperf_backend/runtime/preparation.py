@@ -24,6 +24,7 @@ from llmperf.clients.factory import actor_concurrency
 from llmperf.datasets.preparation import PreparationHandle
 from llmperf.datasets.tokenizer import TOKENIZER_FAST, TOKENIZER_PATH
 from llmperf_backend.runtime.dispatch import WorkerDispatcher
+from llmperf_backend.runtime.admission import RunnerAdmission
 from llmperf_backend.runtime.request_pool import RouterHandle
 from llmperf_backend.runtime.runner import RunnerRuntime, WorkflowTaskLogic
 from llmperf_backend.runtime.worker import (
@@ -98,7 +99,9 @@ def prepare_named_inputs(
                 "big",
             )
             if family_prefix_seed is not None
-            else None
+            and (benchmark.get("task_context") or {}).get("prefix_seed_version")
+            != "explicit-prefix-v1"
+            else family_prefix_seed
         )
         prompts, evidence = prepare_prompt_requests(
             source=source,
@@ -173,7 +176,7 @@ def _calculation_options(
         test_timeout_s=duration_seconds(benchmark["timeout"]),
         max_num_completed_requests=planned_worker_count(benchmark),
         num_concurrent_requests=(
-            benchmark.get("concurrent_requests") or planned_worker_count(benchmark)
+            benchmark.get("concurrent_workers") or planned_worker_count(benchmark)
         ),
         mean_input_tokens=benchmark["mean_input_tokens"],
         stddev_input_tokens=benchmark["stddev_input_tokens"],
@@ -291,10 +294,11 @@ def aggregate_workers(
             "task_context",
             "task_contexts",
             "output_token_count",
+            "input_token_count",
         )
     }
     summary.update(
-        num_concurrent_requests=benchmark.get("concurrent_requests"),
+        num_concurrent_requests=benchmark.get("concurrent_workers"),
         timed_out=timed_out,
         results=metrics_summary(metrics, started_at, finished_at),
         prompt_dataset={
@@ -339,11 +343,16 @@ def aggregate_workers(
 
 class RunnerPreparation:
     def __init__(
-        self, runner_id: str, executor: Executor, dispatcher: WorkerDispatcher
+        self,
+        runner_id: str,
+        executor: Executor,
+        dispatcher: WorkerDispatcher,
+        admission: Optional[RunnerAdmission] = None,
     ):
         self.runner_id = runner_id
         self.executor = executor
         self.dispatcher = dispatcher
+        self.admission = admission
         self.preparation_actors: Sequence[PreparationHandle] = ()
         self.local_task: Optional[asyncio.Future[Dict[str, Any]]] = None
         self._dispatch_future: Optional[asyncio.Task[List[LLMResponse]]] = None
@@ -352,7 +361,14 @@ class RunnerPreparation:
         self.created_workers = 0
 
     def progress(self) -> Dict[str, Any]:
-        return {"phase": self.phase, "created": self.created_workers}
+        phase = (
+            "waiting"
+            if self.phase == "submitting"
+            and self.admission is not None
+            and self.runner_id not in self.admission.active
+            else self.phase
+        )
+        return {"phase": phase, "created": self.created_workers}
 
     def start(
         self,
@@ -365,7 +381,11 @@ class RunnerPreparation:
         if self.local_task is not None:
             raise RuntimeError("Runner preparation already started")
         loop = asyncio.get_running_loop()
-        bus = self.dispatcher.register(self.runner_id, runtime_environment(environment))
+        bus = self.dispatcher.register(
+            self.runner_id,
+            runtime_environment(environment),
+            runtime_limits=execution_runtime.get("runtime_limits"),
+        )
 
         async def execute_workers() -> Dict[str, Any]:
             from llmperf_backend.runtime.worker_input import worker_steps
@@ -386,7 +406,13 @@ class RunnerPreparation:
                     self.dispatcher,
                     bus,
                     duration_seconds(benchmark["timeout"]),
-                    max_outstanding_workers=benchmark.get("concurrent_requests"),
+                    max_outstanding_workers=benchmark.get("concurrent_workers"),
+                    admission=self.admission,
+                    cooldown_seconds=(
+                        duration_seconds(benchmark["every"])
+                        if benchmark.get("every") is not None
+                        else None
+                    ),
                 )
                 started_at = time.monotonic()
                 self._dispatch_future = asyncio.create_task(runtime.run())

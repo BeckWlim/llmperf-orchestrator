@@ -181,17 +181,17 @@ def test_worker_environment():
 
 def test_worker_actor_count():
     benchmark = dump_model(BenchmarkConfig(provider="test", model="test"))
-    benchmark["concurrent_requests"] = 8
+    benchmark["concurrent_workers"] = 8
     benchmark["repeat"] = 3
     assert benchmark_actor_count(benchmark) == 3
     benchmark["cache_probe"] = {"trials": 2}
     assert benchmark_actor_count(benchmark) == 2
     assert benchmark_actor_count(benchmark, 8) == 1
     benchmark["cache_probe"] = None
-    benchmark["concurrent_requests"] = 64
+    benchmark["concurrent_workers"] = 64
     benchmark["repeat"] = 640
     assert benchmark_actor_count(benchmark, 8) == 8
-    benchmark["concurrent_requests"] = 65
+    benchmark["concurrent_workers"] = 65
     assert benchmark_actor_count(benchmark, 8) == 9
 
 
@@ -369,8 +369,7 @@ def test_list_projection():
         finished_at=created_at,
         scheduler_id="scheduler-1",
         exit_code=1,
-        stdout="large stdout",
-        stderr="large stderr",
+        log_key="ab/" + "ab" * 32 + ".json",
         user_metadata={},
         request_count=0,
         cancel_requested=False,

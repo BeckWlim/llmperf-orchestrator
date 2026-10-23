@@ -53,10 +53,13 @@ Runners persisted upfront. Group matrices allow up to eight dimensions, each wit
 1–100 unique integers. `metadata.runner_group` is Backend-owned. See `docs/usage.md`
 and `docs/limitations.md` for authoring and long-test measurement boundaries.
 
-Optional `LLMPERF_PREPARATION_WORKERS` enables bounded chunk generation for ordinary
-bundled-sonnet and external `concatenate` workloads. Tokenization calibrates corpus estimates once per Runner before
-timed sending; chunk generation during sending does not tokenize. Local input counts are
-estimates and server usage remains authoritative. See `docs/runtime.md` for CPU budgeting.
+Runner `input_token_count: estimate` is the default. The general tokenizer is
+`hf-internal-testing/llama-tokenizer` unless explicitly overridden. Each request actor
+calibrates a bounded corpus sample and caches the ratio by dataset/tokenizer identity
+across Runners. Rendering subsequent inputs does not tokenize whole prompts. Set
+`input_token_count: tokenizer` for per-input tokenization; explicit `cache_probe`
+experiments retain tokenizer processing. Local estimates are labeled and server usage
+remains authoritative. See `docs/runtime.md` for CPU budgeting.
 
 ## Runner and Worker template
 
@@ -65,7 +68,7 @@ and exact `model` IDs.
 
 ```yaml
 timeout: 60
-concurrent_requests: 1
+concurrent_workers: 1
 provider: aliyun
 model: deepseek-v4-pro
 tokenizer:
@@ -88,7 +91,7 @@ inputs:
       adapter: sharegpt-user
     dataset_prompt_mode: concatenate
     dataset_seed: 11111
-request:
+worker:
   repeat: 20
 ```
 
@@ -126,8 +129,9 @@ retokenizes outputs after timed execution using the selected tokenizer; it is us
 endpoints without usage, but local and server counts can differ. These fields also apply
 to task/plan Runner templates. Actors never tokenize individual responses.
 
-For cross-Runner replay tasks, use fixed token lengths and an explicit tokenizer resolved
-to an immutable revision. Dataset-backed tasks are accepted only after the Backend resolves
+For cross-Runner replay tasks, use fixed token targets and a tokenizer resolved
+to an immutable revision. The default general tokenizer is accepted with approximate
+provenance; specify a model-compatible tokenizer when needed. Dataset-backed tasks are accepted only after the Backend resolves
 the dataset revision to a Hugging Face commit hash. All registered Provider adapters may
 execute compiled tasks; cache conclusions still require comparable Provider counter
 evidence. Each invoke sends one request and retains an independent completion boundary. Runtime
@@ -144,11 +148,11 @@ authoring are rejected.
 Runner owns Provider/model/tokenizer, generation settings, and named `inputs`. Each input
 contains text or dataset settings and a new-input token target (`tokens: 128` or
 `tokens: {mean: 128, stddev: 16}`). Reused history is additional context, not part of that
-target. `request` owns only execution logic and message composition: `input`, `repeat`,
+target. `worker` owns only execution logic and message composition: `input`, `repeat`,
 `steps`, dependencies, and timing. Steps select a Runner input by name. Omitted input
 references select `default`. Omitting `repeat` and `steps` creates one Worker.
 `repeat` copies the complete step graph; it is planned work, not retries.
-`timeout` and optional `concurrent_requests` also belong to Runner.
+`timeout` and optional `concurrent_workers` also belong to Runner.
 The old `benchmark`, `max_submissions`, `request_steps`, and `history_from` authoring
 fields are rejected. Internal resolved execution records still use `benchmark`.
 
@@ -158,11 +162,32 @@ in `docs/examples.md`. Use `instances.trials` with one `run` for independent bat
 queued siblings, so independent failure boundaries require separate instances.
 
 Use `run: {name: batch}` for a whole multi-request Runner. It inherits the definition's
-`runner.request` template and Runner execution settings. Put it
+`runner.worker` template and Runner execution settings. Put it
 inside `repeat` for serial batches and use independent `instances.matrix` families for
 independent progression. Batch-only definitions omit `payloads`; `invoke` still requires
-an explicit payload and always sends one request. `run` supports `role` and `after`,
-but not conversation or payload fields. Both node kinds advance on committed success.
+an explicit payload and always sends one request. `run` supports `role`, `after`, and
+`prefix_seed`, but not conversation or payload fields. Both node kinds advance on committed success.
+
+`parallel: {name: members, count: 512, node: {run: {name: batch,
+prefix_seed: {pick: [101, 102, 103]}}}}` expands a repeated branch template. Use either
+`branches` or `count/node`. Count accepts an integer or matrix reference, from 1 to
+10,000, subject to the existing total node limit. Wrapping it in `repeat` makes
+sequential groups using existing success dependencies; it adds no runtime round type.
+Failed nodes terminate their instance. Independent trials have no cross-trial barrier.
+
+`run.prefix_seed` accepts an unsigned 64-bit integer, a matrix reference, or a pick
+from 1–10,000 unique unsigned integers. Selection is deterministic with replacement,
+and `prefix_seed: {pick: {seed: 2026102100, count: 1024}}` generates a long pool
+without listing its members. The parent seed and count define the pool independently
+from `instances.seed`, which controls draws and suffixes. Pool values follow the
+versioned `prefix-pool-v1` algorithm documented in `docs/tasks.md`.
+Selection occurs
+once per expanded Runner, using task seed, coordinates, trial, and node path. The
+selected value reaches prefix generation unchanged, including named inputs. It
+overrides family prefix derivation; default suffix seeds still vary by trial and
+Runner path, and requests add their index. Equal prefix seeds need unchanged input
+configuration to reproduce text. `campaign preview --debug` exposes resolved
+`prefix_seed` and separate `dataset_seed`. See `examples/example-seed-pool.yaml`.
 
 Batch dataset seeds use `batch-v1`: task seed, sorted matrix coordinates, trial index,
 and expanded node path (including repeat indices). Task seeds accept unsigned 64-bit
@@ -171,7 +196,7 @@ integers. Legacy invoke payload seeds remain unchanged. See
 compile to 800 nodes and 204,800 target requests, with peak concurrency 64 when each batch
 allows eight requests. Counts inside a Runner must be included in safety estimates.
 
-`runner.concurrent_requests`, when specified, bounds outstanding Workers within a Runner.
+`runner.concurrent_workers`, when specified, bounds outstanding Workers within a Runner.
 Omitting it leaves admission to Scheduler without a Runner window. Backend
 `scheduler.ray_actor_max_concurrency` bounds each shared actor (default eight). Eight actors
 provide 64 slots; `LLMPERF_RUNNERS_MAX=64` allows 64 atomic Runners to fill them. Dependencies
@@ -184,7 +209,7 @@ in that order, and appends the current input. Duplicates and structured content 
 `depends_on: [first]` waits without message reuse. Failed or cancelled predecessors cause
 Runner-owned cancellation of unsubmitted descendants; independent branches can continue.
 No named conversation object is needed. Outer `run` dependencies only wait; define message
-reuse within its `request.steps`. Payloads may contain literal `text` in addition to `seed`.
+reuse within its `worker.steps`. Payloads may contain literal `text` in addition to `seed`.
 See `examples/example-multiturn.yaml`, `examples/example-message-merge.yaml`, and `docs/runtime.md`.
 
 ```yaml
@@ -247,6 +272,16 @@ requests  = sum(batch request targets) + number of expanded invoke nodes
 
 `workflow` is an implicit top-level sequence. Every list entry is a one-key primitive
 mapping, so the YAML hierarchy mirrors the compiler node hierarchy.
+
+For fixed cohorts, use `for_each: {name, variable, values, parallelism, node}`.
+`values` is a unique unsigned-integer list or `{seed, count}` generated pool;
+`$variable` binds typed scalar references only inside `node`. `parallelism` defaults
+to one and bounds simultaneous child subgraphs through balanced static serial lanes.
+The next workflow node joins all lane tails. Use one-request children to make lane
+count equal the request cap. Reuse the same cohort beneath `repeat.every` for paired
+recalls with fresh suffixes. This is compile-time expansion; it adds no runtime loop.
+Loop names cannot shadow matrix dimensions or enclosing loop variables. See
+`docs/tasks.md` for bounds, generated paths, and the full example.
 
 ```yaml
 - invoke:

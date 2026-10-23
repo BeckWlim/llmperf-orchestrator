@@ -10,15 +10,15 @@ runners:
   provider: default
   model: meta-llama/Llama-2-7b-chat-hf
   timeout: 30
-  concurrent_requests: 2
+  concurrent_workers: 2
   mean_output_tokens: 8
   stddev_output_tokens: 0
   inputs:
     default:
       shared_prefix_tokens: 200
       tokens: 256
-  request:
+  worker:
     repeat: 2
 - label: family-b
-  request:
+  worker:
     repeat: 2

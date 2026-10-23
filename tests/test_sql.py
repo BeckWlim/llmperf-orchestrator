@@ -32,7 +32,7 @@ def _benchmark(model):
         },
         "timeout": 10,
         "repeat": 1,
-        "concurrent_requests": 1,
+        "concurrent_workers": 1,
         "mean_input_tokens": 40,
         "stddev_input_tokens": 0,
         "mean_output_tokens": 10,
@@ -45,7 +45,7 @@ def test_task_lock_scope():
     statement = RunnerRepository._task_dispatch_rows_statement("task-instance")
     compiled_sql = str(statement.compile(dialect=postgresql.dialect()))
 
-    assert "LEFT OUTER JOIN benchmark_runners" in compiled_sql
+    assert "LEFT OUTER JOIN runners" in compiled_sql
     assert compiled_sql.endswith("FOR UPDATE OF execution_nodes")
 
 
@@ -71,7 +71,7 @@ def test_postgres_lifecycle(postgresql_url):
                     "adapter": "openai",
                     "timeout": 10,
                     "repeat": 1,
-                    "concurrent_requests": 1,
+                    "concurrent_workers": 1,
                     "mean_input_tokens": 40,
                     "stddev_input_tokens": 0,
                     "mean_output_tokens": 10,

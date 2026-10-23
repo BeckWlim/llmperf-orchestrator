@@ -15,6 +15,7 @@ from llmperf_backend.runtime.messages import RunnerMessage, RunnerMessageBus
 from llmperf_backend.runtime.runner import RunnerRuntime, WorkflowTaskLogic
 from llmperf_backend.runtime.runner import WorkerResult
 from llmperf_backend.runtime.dispatch import WorkerDispatcher
+from llmperf_backend.runtime.admission import RunnerAdmission
 from llmperf_backend.configuration.models import BenchmarkConfig
 from llmperf_backend.runtime.triggers import TimerSource
 from llmperf_backend.runtime.triggers import Completion, DependencyTrigger, Eligibility
@@ -407,7 +408,7 @@ def test_default_configuration():
             ],
         }
     )
-    assert configuration.concurrent_requests is None
+    assert configuration.concurrent_workers is None
     assert configuration.steps is not None
     assert configuration.steps[1].message_sources == ("first",)
 
@@ -615,5 +616,188 @@ def test_preparation_yields(monkeypatch):
                 for runner in runners:
                     runner.cancel()
                     await dispatcher.unregister(runner.runner_id)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_worker_cooldown(fail_first):
+    async def run():
+        store = MemoryMessages()
+        bus = RunnerMessageBus("runner", store)
+        scheduler = FakeScheduler(bus, 8)
+        starts: list[datetime] = []
+        original_submit = scheduler.submit
+
+        async def record_submit(runner_id, step, window):
+            starts.append(datetime.now(timezone.utc))
+            await original_submit(runner_id, step, window)
+
+        scheduler.submit = record_submit
+        if fail_first:
+            scheduler.fail.add("0")
+        prepared = steps(3)
+        assert all(not step.dependencies for step in prepared)
+        runtime = RunnerRuntime(
+            "runner",
+            WorkflowTaskLogic(prepared, datetime.now(timezone.utc)),
+            scheduler,
+            bus,
+            2,
+            cooldown_seconds=0.02,
+        )
+        assert len(await asyncio.wait_for(runtime.run(), 3)) == 3
+        completions = [
+            message.created_at
+            for message in store.messages.values()
+            if message.topic == "worker.completed"
+        ]
+        assert scheduler.peak == 1
+        assert all(
+            (starts[index + 1] - completions[index]).total_seconds() >= 0.02
+            for index in range(2)
+        )
+        assert len(scheduler.submitted) == 3  # Failed requests are not retried.
+        assert not runtime.cancelled_steps
+
+    asyncio.run(run())
+
+
+def test_cooldown_timeout():
+    async def run():
+        bus = RunnerMessageBus("runner", MemoryMessages())
+        scheduler = FakeScheduler(bus, 8)
+        runtime = RunnerRuntime(
+            "runner",
+            WorkflowTaskLogic(steps(3), datetime.now(timezone.utc)),
+            scheduler,
+            bus,
+            0.05,
+            cooldown_seconds=3600,
+        )
+        assert len(await asyncio.wait_for(runtime.run(), 1)) == 1
+        assert runtime.timed_out
+        assert scheduler.active == 0
+        assert len(scheduler.submitted) == 1
+
+    asyncio.run(run())
+
+
+def test_rolling_admission():
+    async def run():
+        admission = RunnerAdmission(1)
+        starts: list[str] = []
+        runtimes = []
+
+        async def execute(owner):
+            await admission.acquire(owner)
+            bus = RunnerMessageBus(owner, MemoryMessages())
+            scheduler = FakeScheduler(bus, 1)
+            original_submit = scheduler.submit
+
+            async def submit(runner_id, step, window):
+                assert admission.active == {owner}
+                starts.append(owner)
+                await original_submit(runner_id, step, window)
+
+            scheduler.submit = submit
+            runtime = RunnerRuntime(
+                owner,
+                WorkflowTaskLogic(steps(2), datetime.now(timezone.utc)),
+                scheduler,
+                bus,
+                2,
+                cooldown_seconds=0.05,
+                admission=admission,
+            )
+            runtimes.append(runtime)
+            try:
+                return await runtime.run()
+            finally:
+                admission.release(owner)
+
+        results = await asyncio.wait_for(
+            asyncio.gather(execute("a"), execute("b"), execute("c")), 3
+        )
+        assert starts[:3] == ["a", "b", "c"]
+        assert all(len(result) == 2 for result in results)
+        assert all(not runtime.timed_out for runtime in runtimes)
+        assert not admission.active
+
+    asyncio.run(run())
+
+
+def test_runtime_admission():
+    async def run():
+        releases = {owner: asyncio.Event() for owner in ("a1", "a2", "b")}
+        started: asyncio.Queue[str] = asyncio.Queue()
+        router = Mock()
+
+        async def request(runner_id, configuration, environment):
+            await started.put(runner_id)
+            await releases[runner_id].wait()
+            return {}, "", configuration
+
+        router.execute.remote = AsyncMock(side_effect=request)
+        router.cancel.remote = AsyncMock()
+        dispatcher = WorkerDispatcher(router, MemoryJournal(), 2)
+        for owner in ("a1", "a2"):
+            dispatcher.register(owner, {}, runtime_limits={"a": 1})
+        dispatcher.register("b", {})
+        initial = steps(1)[0]
+        await dispatcher.submit("a1", initial, None)
+        assert await asyncio.wait_for(started.get(), 1) == "a1"
+        waiting = asyncio.create_task(dispatcher.submit("a2", initial, None))
+        await asyncio.sleep(0)
+        await asyncio.wait_for(dispatcher.submit("b", initial, None), 1)
+        assert await asyncio.wait_for(started.get(), 1) == "b"
+        assert not waiting.done()
+        releases["a1"].set()
+        assert await asyncio.wait_for(started.get(), 1) == "a2"
+        await waiting
+        releases["a2"].set()
+        releases["b"].set()
+        await asyncio.gather(*dispatcher.active.values())
+        for owner in releases:
+            await dispatcher.unregister(owner)
+        assert not dispatcher.runtime_gates
+
+    asyncio.run(run())
+
+
+def test_cancelled_runtime_permit():
+    async def run():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        router = Mock()
+
+        async def request(runner_id, configuration, environment):
+            started.set()
+            await release.wait()
+            return {}, "", configuration
+
+        router.execute.remote = AsyncMock(side_effect=request)
+        router.cancel.remote = AsyncMock()
+        dispatcher = WorkerDispatcher(router, MemoryJournal(), 2)
+        for owner in ("first", "waiting", "next"):
+            dispatcher.register(owner, {}, runtime_limits={"a": 1})
+        initial = steps(1)[0]
+        await dispatcher.submit("first", initial, None)
+        await asyncio.wait_for(started.wait(), 1)
+        waiting = asyncio.create_task(dispatcher.submit("waiting", initial, None))
+        await asyncio.sleep(0)
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+        cancelling = asyncio.create_task(dispatcher.cancel("first"))
+        next_submission = asyncio.create_task(dispatcher.submit("next", initial, None))
+        await asyncio.sleep(0.01)
+        assert not next_submission.done()
+        assert not cancelling.done()  # Physical execution still owns its permit.
+        release.set()
+        await asyncio.wait_for(cancelling, 1)
+        await asyncio.wait_for(next_submission, 1)
+        await asyncio.gather(*dispatcher.active.values())
+        for owner in ("first", "waiting", "next"):
+            await dispatcher.unregister(owner)
 
     asyncio.run(run())

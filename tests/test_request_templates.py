@@ -20,15 +20,45 @@ from llmperf_backend.runtime.runner import WorkerResult, WorkflowTaskLogic
 
 def test_template_defaults():
     runner = BenchmarkRunnerSpec.model_validate(
-        {"request": {}, "provider": "test", "model": "test"}
+        {"worker": {}, "provider": "test", "model": "test"}
     )
     execution = runner.execution_benchmark()
     assert planned_worker_count(execution) == 1
-    assert runner.concurrent_requests is None
+    assert runner.concurrent_workers is None
     assert "max_submissions" not in execution
-    assert runner.request is not None
-    assert "timeout" not in runner.request.model_dump()
-    assert "concurrent_requests" not in runner.request.model_dump()
+    assert runner.worker is not None
+    assert "timeout" not in runner.worker.model_dump()
+    assert "concurrent_workers" not in runner.worker.model_dump()
+
+
+def test_worker_authoring():
+    runner = BenchmarkRunnerSpec.model_validate(
+        {
+            "concurrent_workers": 1,
+            "worker": {"repeat": 3, "every": "0.1"},
+        }
+    )
+    assert runner.worker is not None
+    assert runner.worker.every is not None
+    assert runner.worker.every.seconds == 0.1
+    assert all(not step.dependencies for step in runner.worker.expand())
+    legacy = BenchmarkRunnerSpec.model_validate(
+        {
+            "concurrent_requests": 1,
+            "request": {"repeat": 3, "every": 0.1},
+        }
+    )
+    assert legacy.model_dump() == runner.model_dump()
+    assert "request" not in runner.model_dump()
+    assert "concurrent_requests" not in runner.model_dump()
+    for document in (
+        {"concurrent_workers": 2, "worker": {"every": 1}},
+        {"worker": {"every": -1}},
+        {"worker": {"every": 1, "steps": [{"name": "a"}]}},
+        {"worker": {"every": 1, "cache_probe": {"mode": "exact_repeat"}}},
+    ):
+        with pytest.raises(ValueError):
+            BenchmarkRunnerSpec.model_validate(document)
 
 
 def test_omitted_request_defaults():
@@ -41,7 +71,7 @@ def test_omitted_request_defaults():
         "mean_output_tokens": 16,
     }
     omitted = BenchmarkRunnerSpec().execution_benchmark(defaults)
-    explicit = BenchmarkRunnerSpec.model_validate({"request": {}}).execution_benchmark(
+    explicit = BenchmarkRunnerSpec.model_validate({"worker": {}}).execution_benchmark(
         defaults
     )
     assert omitted == explicit
@@ -60,7 +90,7 @@ def test_omitted_request_defaults():
         "max_submissions",
         "request_steps",
         "timeout",
-        "concurrent_requests",
+        "concurrent_workers",
         "provider",
         "model",
         "tokenizer",
@@ -74,7 +104,7 @@ def test_omitted_request_defaults():
 def test_removed_template_fields(removed):
     with pytest.raises(ValueError, match="Extra inputs"):
         BenchmarkRunnerSpec.model_validate(
-            {"request": {removed: 1}, "provider": "test", "model": "test"}
+            {"worker": {removed: 1}, "provider": "test", "model": "test"}
         )
     with pytest.raises(ValueError, match="Extra inputs"):
         BenchmarkRunnerSpec.model_validate(
@@ -85,7 +115,7 @@ def test_removed_template_fields(removed):
 def test_template_expansion():
     runner = BenchmarkRunnerSpec.model_validate(
         {
-            "request": {
+            "worker": {
                 "repeat": 3,
                 "steps": [
                     {"name": "first", "input": "first"},
@@ -142,7 +172,7 @@ def test_template_expansion():
 def test_definition_accounting():
     runner = BenchmarkRunnerSpec.model_validate(
         {
-            "request": {
+            "worker": {
                 "repeat": 3,
                 "steps": [
                     {"name": "a"},
@@ -345,7 +375,7 @@ def test_named_input_preparation(monkeypatch):
                 "followup": {"tokens": {"mean": 16, "stddev": 2}},
                 "literal": {"text": "summarize"},
             },
-            "request": {
+            "worker": {
                 "repeat": 2,
                 "steps": [
                     {"name": "a", "input": "opening"},
@@ -370,11 +400,11 @@ def test_named_input_preparation(monkeypatch):
     assert calls[0]["seed"] != calls[1]["seed"]
     assert preparation.prepare_named_inputs(execution, {}, Tokenizer()) == prepared
     assert (
-        "tokens" not in runner.request.model_dump()
-        if runner.request is not None
+        "tokens" not in runner.worker.model_dump()
+        if runner.worker is not None
         else False
     )
     with pytest.raises(ValueError, match="unknown Runner input"):
         BenchmarkRunnerSpec.model_validate(
-            {"inputs": {"known": {"tokens": 10}}, "request": {"input": "missing"}}
+            {"inputs": {"known": {"tokens": 10}}, "worker": {"input": "missing"}}
         )

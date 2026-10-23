@@ -15,7 +15,7 @@ from llmperf_backend.compiler.safety import (
 NOW = datetime(2026, 8, 14, tzinfo=timezone.utc)
 BENCHMARK = {
     "repeat": 10,
-    "concurrent_requests": 2,
+    "concurrent_workers": 2,
     "mean_input_tokens": 100,
     "mean_output_tokens": 20,
 }
@@ -211,7 +211,7 @@ def test_advisory_default():
         **BENCHMARK,
         "repeat": 256,
         "mean_input_tokens": 819200,
-        "concurrent_requests": 2,
+        "concurrent_workers": 2,
     }
     guard = PerformanceGuardConfig()
     assessment = assess_workload(
@@ -320,7 +320,7 @@ def test_ray_capacity():
     [(1, 64, 8, 8), (8, 8, 8, 8), (8, 1, 8, 1), (2, 9, 4, 3)],
 )
 def test_concurrent_actor_capacity(runners, concurrency, capacity, expected_demand):
-    benchmark = dict(BENCHMARK, concurrent_requests=concurrency, repeat=100)
+    benchmark = dict(BENCHMARK, concurrent_workers=concurrency, repeat=100)
     result = assess_workload(
         [{"benchmark": benchmark}] * runners,
         [],
@@ -335,7 +335,7 @@ def test_concurrent_actor_capacity(runners, concurrency, capacity, expected_dema
 
 
 def test_shared_actor_rounding():
-    benchmark = dict(BENCHMARK, concurrent_requests=9, repeat=100)
+    benchmark = dict(BENCHMARK, concurrent_workers=9, repeat=100)
     result = assess_workload(
         [{"benchmark": benchmark}] * 2,
         [],

@@ -2,11 +2,19 @@
 -- Existing schemas require a fresh database; this is not a migration.
 BEGIN;
 
+CREATE TABLE runtimes (
+    id VARCHAR(36) PRIMARY KEY,
+    parent_id VARCHAR(36) REFERENCES runtimes(id),
+    configuration JSONB NOT NULL,
+    created_by VARCHAR(64) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
 
-CREATE TABLE benchmark_campaigns (
+CREATE TABLE campaigns (
 	id VARCHAR(36) NOT NULL,
 	name VARCHAR(200) NOT NULL,
 	description TEXT,
+	runtime_id VARCHAR(36) REFERENCES runtimes(id),
 	tags JSONB NOT NULL,
 	created_by VARCHAR(64) NOT NULL,
 	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -15,7 +23,7 @@ CREATE TABLE benchmark_campaigns (
 
 ;
 
-CREATE INDEX ix_benchmark_campaigns_created_at ON benchmark_campaigns (created_at);
+CREATE INDEX ix_campaigns_created_at ON campaigns (created_at);
 
 
 CREATE TABLE execution_leases (
@@ -60,7 +68,8 @@ CREATE TABLE users (
 ;
 
 
-CREATE TABLE benchmark_runner_plans (
+CREATE TABLE runner_plans (
+	runtime_id VARCHAR(36) REFERENCES runtimes(id),
 	id VARCHAR(36) NOT NULL,
 	campaign_id VARCHAR(36) NOT NULL,
 	name VARCHAR(200) NOT NULL,
@@ -87,17 +96,17 @@ CREATE TABLE benchmark_runner_plans (
 	CONSTRAINT ck_runner_plan_boundary CHECK (ends_at IS NOT NULL OR max_occurrences IS NOT NULL),
 	CONSTRAINT ck_runner_plan_time_range CHECK (ends_at IS NULL OR ends_at > starts_at),
 	CONSTRAINT ck_runner_plan_overlap_policy CHECK (overlap_policy IN ('queue', 'skip')),
-	FOREIGN KEY(campaign_id) REFERENCES benchmark_campaigns (id) ON DELETE CASCADE
+	FOREIGN KEY(campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
 )
 
 ;
 
-CREATE INDEX ix_runner_plan_campaign ON benchmark_runner_plans (campaign_id, created_at);
+CREATE INDEX ix_runner_plan_campaign ON runner_plans (campaign_id, created_at);
 
-CREATE INDEX ix_runner_plan_due ON benchmark_runner_plans (next_fire_at) WHERE status = 'active';
+CREATE INDEX ix_runner_plan_due ON runner_plans (next_fire_at) WHERE status = 'active';
 
 
-CREATE TABLE benchmark_task_definitions (
+CREATE TABLE task_definitions (
 	id VARCHAR(36) NOT NULL,
 	campaign_id VARCHAR(36) NOT NULL,
 	name VARCHAR(200) NOT NULL,
@@ -107,12 +116,12 @@ CREATE TABLE benchmark_task_definitions (
 	created_by VARCHAR(64) NOT NULL,
 	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
 	PRIMARY KEY (id),
-	FOREIGN KEY(campaign_id) REFERENCES benchmark_campaigns (id) ON DELETE CASCADE
+	FOREIGN KEY(campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
 )
 
 ;
 
-CREATE INDEX ix_task_definition_campaign ON benchmark_task_definitions (campaign_id, created_at);
+CREATE INDEX ix_task_definition_campaign ON task_definitions (campaign_id, created_at);
 
 
 CREATE TABLE trusted_client_keys (
@@ -132,7 +141,8 @@ CREATE TABLE trusted_client_keys (
 CREATE INDEX ix_trusted_client_keys_username ON trusted_client_keys (username);
 
 
-CREATE TABLE benchmark_runners (
+CREATE TABLE runners (
+	runtime_id VARCHAR(36) REFERENCES runtimes(id),
 	id VARCHAR(36) NOT NULL,
 	campaign_id VARCHAR(36),
 	runner_plan_id VARCHAR(36),
@@ -154,30 +164,31 @@ CREATE TABLE benchmark_runners (
 	summary JSONB,
 	request_count INTEGER NOT NULL,
 	error_message TEXT,
-	stdout TEXT,
-	stderr TEXT,
+	log_key VARCHAR(80),
+	planned_workers INTEGER NOT NULL,
 	PRIMARY KEY (id),
 	CONSTRAINT uq_runner_plan_occurrence UNIQUE (runner_plan_id, plan_occurrence),
-	FOREIGN KEY(campaign_id) REFERENCES benchmark_campaigns (id) ON DELETE SET NULL,
-	FOREIGN KEY(runner_plan_id) REFERENCES benchmark_runner_plans (id) ON DELETE SET NULL
+	FOREIGN KEY(campaign_id) REFERENCES campaigns (id) ON DELETE SET NULL,
+	FOREIGN KEY(runner_plan_id) REFERENCES runner_plans (id) ON DELETE SET NULL
 )
 
 ;
 
-CREATE INDEX ix_benchmark_runners_campaign_id ON benchmark_runners (campaign_id);
+CREATE INDEX ix_runners_campaign_id ON runners (campaign_id);
+CREATE INDEX ix_runners_campaign_status ON runners (campaign_id, status);
 
-CREATE INDEX ix_benchmark_runners_created_at ON benchmark_runners (created_at);
+CREATE INDEX ix_runners_created_at ON runners (created_at);
 
-CREATE INDEX ix_runner_plan_time ON benchmark_runners (runner_plan_id, scheduled_for);
+CREATE INDEX ix_runner_plan_time ON runners (runner_plan_id, scheduled_for);
 
-CREATE INDEX ix_runners_queue_created_at ON benchmark_runners (created_at) WHERE status = 'queued';
+CREATE INDEX ix_runners_queue_created_at ON runners (created_at) WHERE status = 'queued';
 
-CREATE INDEX ix_runners_running_campaign ON benchmark_runners (campaign_id) WHERE status = 'running';
+CREATE INDEX ix_runners_running_campaign ON runners (campaign_id) WHERE status = 'running';
 
-CREATE INDEX ix_runners_status_created_at ON benchmark_runners (status, created_at);
+CREATE INDEX ix_runners_status_created_at ON runners (status, created_at);
 
 
-CREATE TABLE benchmark_task_instances (
+CREATE TABLE task_instances (
 	id VARCHAR(36) NOT NULL,
 	definition_id VARCHAR(36) NOT NULL,
 	campaign_id VARCHAR(36) NOT NULL,
@@ -193,44 +204,44 @@ CREATE TABLE benchmark_task_instances (
 	PRIMARY KEY (id),
 	CONSTRAINT uq_task_instance_key UNIQUE (definition_id, instance_key),
 	CONSTRAINT ck_task_instance_state CHECK (state IN ('planned', 'active', 'completed', 'failed', 'cancelled')),
-	FOREIGN KEY(definition_id) REFERENCES benchmark_task_definitions (id) ON DELETE CASCADE,
-	FOREIGN KEY(campaign_id) REFERENCES benchmark_campaigns (id) ON DELETE CASCADE
+	FOREIGN KEY(definition_id) REFERENCES task_definitions (id) ON DELETE CASCADE,
+	FOREIGN KEY(campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE
 )
 
 ;
 
-CREATE INDEX ix_task_instance_campaign ON benchmark_task_instances (campaign_id, format_version, state);
+CREATE INDEX ix_task_instance_campaign ON task_instances (campaign_id, format_version, state);
 
 
-CREATE TABLE benchmark_request_results (
+CREATE TABLE worker_results (
 	runner_id VARCHAR(36) NOT NULL,
 	sequence INTEGER NOT NULL,
 	metrics JSONB NOT NULL,
 	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
 	PRIMARY KEY (runner_id, sequence),
 	CONSTRAINT ck_request_result_sequence CHECK (sequence >= 0),
-	FOREIGN KEY(runner_id) REFERENCES benchmark_runners (id) ON DELETE CASCADE
+	FOREIGN KEY(runner_id) REFERENCES runners (id) ON DELETE CASCADE
 )
 
 ;
 
 
-CREATE TABLE benchmark_runner_events (
+CREATE TABLE runner_events (
 	id SERIAL NOT NULL,
 	runner_id VARCHAR(36) NOT NULL,
 	status VARCHAR(20) NOT NULL,
 	message TEXT,
 	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
 	PRIMARY KEY (id),
-	FOREIGN KEY(runner_id) REFERENCES benchmark_runners (id) ON DELETE CASCADE
+	FOREIGN KEY(runner_id) REFERENCES runners (id) ON DELETE CASCADE
 )
 
 ;
 
-CREATE INDEX ix_benchmark_runner_events_runner_id ON benchmark_runner_events (runner_id);
+CREATE INDEX ix_runner_events_runner_id ON runner_events (runner_id);
 
 
-CREATE TABLE benchmark_runner_plan_events (
+CREATE TABLE runner_plan_events (
 	id SERIAL NOT NULL,
 	runner_plan_id VARCHAR(36) NOT NULL,
 	event_type VARCHAR(30) NOT NULL,
@@ -241,13 +252,13 @@ CREATE TABLE benchmark_runner_plan_events (
 	details JSONB NOT NULL,
 	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
 	PRIMARY KEY (id),
-	FOREIGN KEY(runner_plan_id) REFERENCES benchmark_runner_plans (id) ON DELETE CASCADE,
-	FOREIGN KEY(runner_id) REFERENCES benchmark_runners (id) ON DELETE SET NULL
+	FOREIGN KEY(runner_plan_id) REFERENCES runner_plans (id) ON DELETE CASCADE,
+	FOREIGN KEY(runner_id) REFERENCES runners (id) ON DELETE SET NULL
 )
 
 ;
 
-CREATE INDEX ix_runner_plan_event_time ON benchmark_runner_plan_events (runner_plan_id, created_at);
+CREATE INDEX ix_runner_plan_event_time ON runner_plan_events (runner_plan_id, created_at);
 
 
 CREATE TABLE execution_nodes (
@@ -269,9 +280,9 @@ CREATE TABLE execution_nodes (
 	CONSTRAINT uq_runner_dispatch_task_node UNIQUE (task_instance_id, node_id),
 	CONSTRAINT ck_runner_dispatch_state CHECK (state IN ('blocked', 'pending', 'emitted', 'cancelled')),
 	CONSTRAINT ck_runner_dispatch_owner CHECK ((runner_plan_id IS NOT NULL AND task_instance_id IS NULL AND dispatch_key IS NOT NULL AND node_id IS NULL) OR (runner_plan_id IS NULL AND task_instance_id IS NOT NULL AND dispatch_key IS NULL AND node_id IS NOT NULL)),
-	FOREIGN KEY(campaign_id) REFERENCES benchmark_campaigns (id) ON DELETE CASCADE,
-	FOREIGN KEY(runner_plan_id) REFERENCES benchmark_runner_plans (id) ON DELETE CASCADE,
-	FOREIGN KEY(task_instance_id) REFERENCES benchmark_task_instances (id) ON DELETE CASCADE
+	FOREIGN KEY(campaign_id) REFERENCES campaigns (id) ON DELETE CASCADE,
+	FOREIGN KEY(runner_plan_id) REFERENCES runner_plans (id) ON DELETE CASCADE,
+	FOREIGN KEY(task_instance_id) REFERENCES task_instances (id) ON DELETE CASCADE
 )
 
 ;
@@ -297,7 +308,7 @@ CREATE TABLE runner_messages (
 	payload JSONB NOT NULL,
 	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
 	PRIMARY KEY (id),
-	FOREIGN KEY(runner_id) REFERENCES benchmark_runners (id) ON DELETE CASCADE
+	FOREIGN KEY(runner_id) REFERENCES runners (id) ON DELETE CASCADE
 )
 
 ;
@@ -305,7 +316,7 @@ CREATE TABLE runner_messages (
 CREATE INDEX ix_runner_message_destination ON runner_messages (runner_id, destination, created_at);
 
 
-CREATE TABLE task_attempts (
+CREATE TABLE runner_attempts (
 	id VARCHAR(36) NOT NULL,
 	runner_id VARCHAR(36) NOT NULL,
 	generation INTEGER NOT NULL,
@@ -315,29 +326,28 @@ CREATE TABLE task_attempts (
 	PRIMARY KEY (id),
 	CONSTRAINT ck_attempt_state CHECK (state IN ('executing', 'succeeded', 'failed', 'cancelled', 'indeterminate')),
 	UNIQUE (runner_id),
-	FOREIGN KEY(runner_id) REFERENCES benchmark_runners (id) ON DELETE CASCADE
+	FOREIGN KEY(runner_id) REFERENCES runners (id) ON DELETE CASCADE
 )
 
 ;
 
 
-CREATE TABLE worker_steps (
+CREATE TABLE workers (
 	runner_id VARCHAR(36) NOT NULL,
 	step_id VARCHAR(128) NOT NULL,
 	generation INTEGER NOT NULL,
 	state VARCHAR(20) NOT NULL,
 	submitted_at TIMESTAMP WITH TIME ZONE NOT NULL,
 	completed_at TIMESTAMP WITH TIME ZONE,
-	request JSONB NOT NULL,
-	result JSONB,
+	completion_hash VARCHAR(64),
 	PRIMARY KEY (runner_id, step_id),
 	CONSTRAINT ck_worker_step_state CHECK (state IN ('submitted', 'succeeded', 'failed', 'cancelled', 'indeterminate')),
-	FOREIGN KEY(runner_id) REFERENCES benchmark_runners (id) ON DELETE CASCADE
+	FOREIGN KEY(runner_id) REFERENCES runners (id) ON DELETE CASCADE
 )
 
 ;
 
-CREATE INDEX ix_worker_runner_state ON worker_steps (runner_id, state);
+CREATE INDEX ix_worker_runner_state ON workers (runner_id, state);
 
 
 CREATE TABLE conversation_messages (
@@ -351,7 +361,7 @@ CREATE TABLE conversation_messages (
 	CONSTRAINT uq_conversation_position UNIQUE (instance_id, conversation, position),
 	CONSTRAINT ck_message_position_role CHECK (position >= 0 AND role IN ('user', 'assistant')),
 	FOREIGN KEY(id) REFERENCES runner_messages (id) ON DELETE CASCADE,
-	FOREIGN KEY(instance_id) REFERENCES benchmark_task_instances (id) ON DELETE CASCADE
+	FOREIGN KEY(instance_id) REFERENCES task_instances (id) ON DELETE CASCADE
 )
 
 ;

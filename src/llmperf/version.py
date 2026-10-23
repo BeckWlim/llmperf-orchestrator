@@ -1,9 +1,9 @@
-"""Canonical release and protocol identifiers for LLMPerf 1.0.0."""
+"""Release identifier and independently versioned document formats."""
 
 from typing import Literal
 
 ProtocolVersion = Literal["1.0.0"]
 
-RELEASE_VERSION: ProtocolVersion = "1.0.0"
-PROTOCOL_VERSION: ProtocolVersion = RELEASE_VERSION
+RELEASE_VERSION = "1.0.1"
+PROTOCOL_VERSION: ProtocolVersion = "1.0.0"
 TASK_FORMAT_VERSION: ProtocolVersion = PROTOCOL_VERSION

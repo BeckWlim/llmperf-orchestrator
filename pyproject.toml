@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "LLMPerf"
-version = "1.0.0"
+version = "1.0.1"
 description = "A framework for load testing LLM APIs"
 authors = [{name="Avnish Narayan", email="avnish@anyscale.com"}]
 license = {text= "Apache-2.0"}

@@ -46,6 +46,7 @@ from llmperf.clients.factory import RAY_ACTOR_CPUS_ENV, RAY_ACTOR_CONCURRENCY_EN
 from llmperf_backend.runtime.coordinator import RuntimeCoordinator, RuntimeRepository
 from llmperf_backend.runtime.dispatch import DispatchRepository, WorkerDispatcher
 from llmperf_backend.runtime.preparation import RunnerPreparation
+from llmperf_backend.runtime.admission import RunnerAdmission
 from llmperf_backend.runtime.request_pool import (
     PoolStatus,
     create_request_actor,
@@ -125,7 +126,9 @@ class Scheduler:
         )
         self.scheduler_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4().hex[:8]}"
         self._runner_tasks: List[asyncio.Task] = []
-        self._busy_runners = set()
+        self._runner_admission = RunnerAdmission(config.max_concurrent_runners)
+        self._busy_runners = self._runner_admission.active
+        self._execution_tasks: set[asyncio.Task[None]] = set()
         self._stop: Optional[asyncio.Event] = None
         self._ray_module: Any = None
         self._ray_context: Any = None
@@ -167,10 +170,7 @@ class Scheduler:
             await self.repository.requeue_stale(self.config.stale_after_seconds)
             await self.coordinator.start()
             self._runner_tasks = [
-                asyncio.create_task(
-                    self._worker(index), name=f"llmperf-scheduler-{index}"
-                )
-                for index in range(self.config.max_concurrent_runners)
+                asyncio.create_task(self._worker(0), name="llmperf-runner-admission")
             ]
         except Exception:
             await self.coordinator.stop()
@@ -180,7 +180,7 @@ class Scheduler:
         LOGGER.info(
             "Scheduler %s started with %d Runner handles",
             self.scheduler_id,
-            len(self._runner_tasks),
+            self.config.max_concurrent_runners,
         )
 
     async def stop(self) -> None:
@@ -191,6 +191,10 @@ class Scheduler:
             task.cancel()
         if self._runner_tasks:
             await asyncio.gather(*self._runner_tasks, return_exceptions=True)
+        for execution_task in tuple(self._execution_tasks):
+            execution_task.cancel()
+        await asyncio.gather(*self._execution_tasks, return_exceptions=True)
+        self._execution_tasks.clear()
         if self._ray_monitor_task is not None:
             self._ray_monitor_task.cancel()
             await asyncio.gather(self._ray_monitor_task, return_exceptions=True)
@@ -220,6 +224,7 @@ class Scheduler:
             "live_slots": self._pool_status.get("request_capacity", 0),
             "busy_slots": self._pool_status.get("executing_requests", 0),
             "active_runners": active_runners,
+            "waiting_runners": len(set(self._active_workers) - self._busy_runners),
             "request_pool": dict(self._pool_status),
             "runtime_error": self.coordinator.last_error,
             "worker_kind": "atomic_requests",
@@ -503,10 +508,14 @@ class Scheduler:
                     pass
                 continue
             try:
-                runner = await self.coordinator.next_runner(scheduler_slot_id)
+                await self.coordinator.wait_ready()
+                await self._runner_admission.acquire(scheduler_slot_id)
+                runner = await self.coordinator.claim_ready_runner(scheduler_slot_id)
             except asyncio.CancelledError:
+                self._runner_admission.release(scheduler_slot_id)
                 raise
             except Exception:
+                self._runner_admission.release(scheduler_slot_id)
                 LOGGER.exception("Unable to claim a benchmark Runner")
                 try:
                     await asyncio.wait_for(
@@ -516,6 +525,7 @@ class Scheduler:
                     pass
                 continue
             if runner is None:
+                self._runner_admission.release(scheduler_slot_id)
                 try:
                     await asyncio.wait_for(
                         self._stop.wait(), self.config.poll_interval_seconds
@@ -528,17 +538,27 @@ class Scheduler:
                 scheduler_slot_id,
                 runner["runner_id"],
             )
-            self._busy_runners.add(index)
-            try:
-                await self._execute(runner)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                LOGGER.exception(
-                    "Execution could not persist its terminal state; recovery will mark it indeterminate"
-                )
-            finally:
-                self._busy_runners.discard(index)
+            runner_id = runner["runner_id"]
+            # Transfer the already acquired permit without briefly releasing it.
+            self._busy_runners.remove(scheduler_slot_id)
+            self._busy_runners.add(runner_id)
+            execution_task = asyncio.create_task(
+                self._supervise(runner), name=f"llmperf-runner-{runner_id}"
+            )
+            self._execution_tasks.add(execution_task)
+            execution_task.add_done_callback(self._execution_tasks.discard)
+
+    async def _supervise(self, runner: Dict[str, Any]) -> None:
+        try:
+            await self._execute(runner)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception(
+                "Execution could not persist its terminal state; recovery will mark it indeterminate"
+            )
+        finally:
+            self._runner_admission.release(runner["runner_id"])
 
     async def worker_environment(
         self, runner: Dict[str, Any], base_environment: Dict[str, str]
@@ -674,11 +694,23 @@ class Scheduler:
                 return
             if self._ray_module is None or self._worker_remote is None:
                 raise RuntimeError("Ray Worker runtime is not initialized")
+            if self._dispatcher is None and (
+                bool(runner.get("runtime_limits"))
+                or runner["benchmark"].get("every") is not None
+            ):
+                raise RuntimeError(
+                    "Worker limits and cooldown require shared Worker dispatch"
+                )
             actor_count = benchmark_actor_count(
                 runner["benchmark"], self.config.ray_actor_max_concurrency
             )
             worker = (
-                RunnerPreparation(runner_id, self._atomic_executor, self._dispatcher)
+                RunnerPreparation(
+                    runner_id,
+                    self._atomic_executor,
+                    self._dispatcher,
+                    self._runner_admission,
+                )
                 if self._dispatcher is not None
                 else (
                     AtomicWorker(
@@ -725,6 +757,8 @@ class Scheduler:
                 "resource_scheduling": "shared_request_pool",
                 "runner_id": runner_id,
                 "campaign_id": runner.get("campaign_id"),
+                "runtime_id": runner.get("runtime_id"),
+                "runtime_limits": runner.get("runtime_limits", {}),
                 "preparation_chunk_size": self.config.preparation_chunk_size,
                 "preparation_buffer_chunks": self.config.preparation_buffer_chunks,
             }

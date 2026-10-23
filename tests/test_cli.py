@@ -61,7 +61,7 @@ class FakeClient(StubClient):
             "status": "queued",
         }
 
-    def start_campaign_runners(self, campaign_id, runners):
+    def start_campaign_runners(self, campaign_id, runners, *, runtime=None):
         assert campaign_id == "campaign-1"
         payloads = []
         for runner in runners:
@@ -78,6 +78,7 @@ class FakeClient(StubClient):
         task_definitions=None,
         *,
         runner_groups=None,
+        runtime=None,
     ):
         assert campaign["name"] == "glm-study"
         payloads = []
@@ -117,6 +118,7 @@ class FakeClient(StubClient):
         task_definitions=None,
         *,
         runner_groups=None,
+        runtime=None,
         timeout,
         progress_callback=None,
     ):
@@ -169,6 +171,7 @@ class FakeClient(StubClient):
         task_definitions=None,
         *,
         runner_groups=None,
+        runtime=None,
         limit,
         node_limit,
         debug,
@@ -218,6 +221,7 @@ class FakeClient(StubClient):
                                     "role": "prime",
                                     "payload_id": "prompt",
                                     "payload_seed": 123,
+                                    "prefix_seed": 17,
                                 },
                                 {
                                     "node_id": "probe",
@@ -277,6 +281,7 @@ def test_task_start_counts(tmp_path, caplog):
             task_definitions=None,
             *,
             runner_groups=None,
+            runtime=None,
         ):
             response = super().start_campaign(
                 campaign, runners, runner_plans, task_definitions
@@ -465,6 +470,7 @@ task_definitions:
     assert "* [prime]" in output
     assert "[prime] --> [probe]" in output
     assert "debug: payload_seed=123" in output
+    assert "debug: prefix_seed=17" in output
     assert "... 1 more instance(s)" in output
 
 
@@ -1098,7 +1104,7 @@ def test_worker_progress_view(capsys):
     assert "admission_waiting=1" in rendered
     assert "queued=5" in rendered
     assert "running=2" in rendered
-    assert "Global request slots: busy=64 free=0 total=64" in rendered
+    assert "Global Worker slots: busy=64 free=0 total=64" in rendered
     assert "hidden" not in str(projected)
     raw["workers"]["created"] = -1
     with pytest.raises(ClientError, match="nonnegative"):
@@ -1394,6 +1400,7 @@ def test_scheduler_projection(capsys):
         "scheduler_id": "scheduler-1",
         "status": "running",
         "max_concurrent_runners": 4,
+        "waiting_runners": 3,
         "live_slots": 4,
         "busy_slots": 2,
         "worker_kind": "ray_task",
@@ -1442,8 +1449,8 @@ def test_scheduler_projection(capsys):
 
     assert projection.renderer == "scheduler_status"
     assert "Scheduler: scheduler-1  Status: running" in default_output
-    assert "Request slots: busy=2 live=4" in default_output
-    assert "Runners: active=0 max=4" in default_output
+    assert "Worker slots: busy=2 live=4" in default_output
+    assert "Runners: active=0 max=4 waiting=3" in default_output
     assert "requests_per_actor=8" in default_output
     assert (
         "Ray: status=healthy nodes=1 object_store_available=99.65% "
@@ -1545,6 +1552,7 @@ def test_adapter_redaction():
         runner_arguments,
         {
             "runner_id": "runner-1",
+            "runtime_id": None,
             "status": "failed",
             "benchmark": {"provider": "aliyun", "model": "model-1"},
             "summary": {"private": "raw summary"},
@@ -1961,6 +1969,7 @@ def test_wait_summary(caplog):
     assert reports == [
         {
             "runner_id": "runner-1",
+            "runtime_id": None,
             "status": "failed",
             "label": "smoke",
             "provider": "aliyun",

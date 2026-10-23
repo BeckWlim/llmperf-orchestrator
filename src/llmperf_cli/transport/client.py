@@ -434,12 +434,19 @@ class LLMPerfClient:
         return self._request("POST", "/api/v1/runners", payload)
 
     def start_campaign_runners(
-        self, campaign_id: str, runners: List[Dict[str, Any]]
+        self,
+        campaign_id: str,
+        runners: List[Dict[str, Any]],
+        *,
+        runtime: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         return self._request(
             "POST",
             f"/api/v1/campaigns/{campaign_id}/runners",
-            {"runners": runners},
+            {
+                "runners": runners,
+                **({"runtime": runtime} if runtime is not None else {}),
+            },
         )
 
     def start_campaign(
@@ -450,6 +457,7 @@ class LLMPerfClient:
         task_definitions: Optional[List[Dict[str, Any]]] = None,
         *,
         runner_groups: Optional[List[Dict[str, Any]]] = None,
+        runtime: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         return self._request(
             "POST",
@@ -460,6 +468,7 @@ class LLMPerfClient:
                 "runners": runners,
                 "runner_plans": runner_plans,
                 "task_definitions": task_definitions or [],
+                **({"runtime": runtime} if runtime is not None else {}),
                 **({"runner_groups": runner_groups} if runner_groups else {}),
             },
         )
@@ -472,6 +481,7 @@ class LLMPerfClient:
         task_definitions: Optional[List[Dict[str, Any]]] = None,
         *,
         runner_groups: Optional[List[Dict[str, Any]]] = None,
+        runtime: Optional[Dict[str, Any]] = None,
         timeout: float,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
@@ -481,6 +491,7 @@ class LLMPerfClient:
             "runners": runners,
             "runner_plans": runner_plans,
             "task_definitions": task_definitions or [],
+            **({"runtime": runtime} if runtime is not None else {}),
             **({"runner_groups": runner_groups} if runner_groups else {}),
         }
         if progress_callback is not None:
@@ -506,6 +517,7 @@ class LLMPerfClient:
         task_definitions: Optional[List[Dict[str, Any]]] = None,
         *,
         runner_groups: Optional[List[Dict[str, Any]]] = None,
+        runtime: Optional[Dict[str, Any]] = None,
         limit: int,
         node_limit: int,
         debug: bool,
@@ -519,6 +531,7 @@ class LLMPerfClient:
                 "runners": runners,
                 "runner_plans": runner_plans,
                 "task_definitions": task_definitions or [],
+                **({"runtime": runtime} if runtime is not None else {}),
                 **({"runner_groups": runner_groups} if runner_groups else {}),
             },
             query={

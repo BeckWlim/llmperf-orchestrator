@@ -49,13 +49,13 @@ Runtime guards stop new admission. Commit results and generic Worker messages be
 successors. Recover interrupted execution as indeterminate without automatic Provider replay.
 
 Runner owns Provider/model/tokenizer, generation settings, and named `inputs` with per-input
-new-token budgets. `runner.request` defines execution logic and message composition, with
+new-token budgets. `runner.worker` defines execution logic and message composition, with
 one Worker by default. Steps reference named inputs; `repeat` and `steps` declare finite
 work. `depends_on` waits for success; `reuse_messages: true` on a
 dependency also copies its structured messages. Multiple sources concatenate in declared
 order without deduplication. Runner owns cancellation when a predecessor fails; the bus
 stores and delivers events, and Workers never wait for other Workers. Runner `timeout`
-and optional `concurrent_requests` stay outside `request`. There is no submission-budget
+and optional `concurrent_workers` stay outside `request`. There is no submission-budget
 authoring field or automatic retry count.
 
 Keep helper functions in the module that owns their behavior. Named-input preparation

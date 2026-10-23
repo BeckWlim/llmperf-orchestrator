@@ -19,7 +19,7 @@ runners:
       text: Remember the word ORCHID. Reply with a brief acknowledgement.
     followup:
       text: What word did I ask you to remember?
-  request:
+  worker:
     steps:
     - name: opening
       input: opening

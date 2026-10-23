@@ -217,7 +217,7 @@ def test_round_validation():
     document = {
         "version": "1.0.0",
         "campaign": {"name": "rounds", "rounds": {"count": 100, "seed": 20261014}},
-        "runners": [{"request": {}, "provider": "test", "model": "test"}] * 8,
+        "runners": [{"worker": {}, "provider": "test", "model": "test"}] * 8,
     }
     model = BenchmarkCampaignStart.model_validate(document)
     assert model.campaign.rounds is not None

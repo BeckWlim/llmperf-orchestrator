@@ -58,7 +58,7 @@ task_definitions:
       revision: main
       use_fast: true
     timeout: 60
-    concurrent_requests: 1
+    concurrent_workers: 1
     mean_output_tokens: 8
     stddev_output_tokens: 0
     additional_sampling_params:
@@ -68,4 +68,4 @@ task_definitions:
     inputs:
       default:
         tokens: 2048
-    request: {}
+    worker: {}

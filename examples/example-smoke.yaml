@@ -5,7 +5,7 @@ metadata:
 provider: aliyun
 model: deepseek-v4-pro
 timeout: 30
-concurrent_requests: 1
+concurrent_workers: 1
 mean_output_tokens: 16
 stddev_output_tokens: 0
 additional_sampling_params:
@@ -13,4 +13,4 @@ additional_sampling_params:
 inputs:
   default:
     tokens: 64
-request: {}
+worker: {}

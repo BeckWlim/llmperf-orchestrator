@@ -62,7 +62,7 @@ def benchmark_actor_count(
     """Return the exact maximum number of request actors created by a Runner."""
 
     concurrent = int(
-        benchmark.get("concurrent_requests") or planned_worker_count(benchmark)
+        benchmark.get("concurrent_workers") or planned_worker_count(benchmark)
     )
     cache_probe = benchmark.get("cache_probe")
     if cache_probe:

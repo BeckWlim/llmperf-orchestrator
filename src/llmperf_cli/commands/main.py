@@ -58,6 +58,7 @@ SubmissionResult = TypeVar("SubmissionResult")
 class CampaignSubmission:
     """Validated top-level Campaign components loaded from one YAML file."""
 
+    runtime: Dict[str, Any]
     campaign: Dict[str, Any]
     runners: List[Dict[str, Any]]
     runner_plans: List[Dict[str, Any]]
@@ -78,6 +79,7 @@ class CampaignTaskPreviewClient(Protocol):
         task_definitions: Optional[List[Dict[str, Any]]] = None,
         *,
         runner_groups: Optional[List[Dict[str, Any]]] = None,
+        runtime: Optional[Dict[str, Any]] = None,
         limit: int,
         node_limit: int,
         debug: bool,
@@ -95,6 +97,7 @@ class CampaignArtifactValidationClient(Protocol):
         task_definitions: Optional[List[Dict[str, Any]]] = None,
         *,
         runner_groups: Optional[List[Dict[str, Any]]] = None,
+        runtime: Optional[Dict[str, Any]] = None,
         timeout: float,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]: ...
@@ -142,7 +145,7 @@ Concepts:
   RunnerPlan A bounded geographic-time rule that produces Runners.
   Planner    The backend component that materializes due RunnerPlans.
   Campaign   A named workload containing Runners and/or RunnerPlans.
-  Scheduler  Admits ready Workers to shared request slots.
+  Scheduler  Admits ready Workers to shared Worker slots.
   Worker     One prepared Provider request, submitted by its Runner.
 
 Typical workflow:
@@ -212,6 +215,9 @@ def load_campaign_submission(file_value: str) -> CampaignSubmission:
     campaign_spec = plan.get("campaign")
     if not isinstance(campaign_spec, dict) or not campaign_spec.get("name"):
         raise ClientError("campaign file must define campaign.name")
+    raw_runtime = plan.get("runtime", {})
+    if not isinstance(raw_runtime, dict):
+        raise ClientError("runtime must be a mapping")
     raw_runners = plan.get("runners", [])
     raw_runner_plans = plan.get("runner_plans", [])
     raw_task_definitions = plan.get("task_definitions", [])
@@ -257,6 +263,7 @@ def load_campaign_submission(file_value: str) -> CampaignSubmission:
             raise ClientError(f"campaign task_definitions[{index}] must be a mapping")
         prepared_task_definitions.append(dict(task_definition))
     return CampaignSubmission(
+        runtime=dict(raw_runtime),
         campaign=dict(campaign_spec),
         runners=prepared_runners,
         runner_plans=prepared_runner_plans,
@@ -306,13 +313,14 @@ def print_scheduler_status(document: Dict[str, Any]) -> None:
         f"Status: {_table_value(document.get('status'))}"
     )
     print(
-        "Request slots: "
+        "Worker slots: "
         f"busy={_table_value(document.get('busy_slots'), '0')} "
         f"live={_table_value(document.get('live_slots'), '0')}"
     )
     print(
         f"Runners: active={_table_value(document.get('active_runners'), '0')} "
-        f"max={_table_value(document.get('max_concurrent_runners'), '0')}"
+        f"max={_table_value(document.get('max_concurrent_runners'), '0')} "
+        f"waiting={_table_value(document.get('waiting_runners'), '0')}"
     )
     worker_runtime = document.get("worker_runtime") or {}
     if worker_runtime:
@@ -503,9 +511,13 @@ def print_task_preview(document: Dict[str, Any]) -> None:
                     print(
                         f"      debug: dataset_seed={_table_value(node.get('dataset_seed'))}"
                     )
+                if "prefix_seed" in node:
+                    print(
+                        f"      debug: prefix_seed={_table_value(node.get('prefix_seed'))}"
+                    )
                 if node.get("execution_kind") == "batch":
                     print(
-                        f"      batch: requests={_table_value(node.get('planned_workers'))} concurrency={_table_value(node.get('concurrent_requests'))}"
+                        f"      batch: requests={_table_value(node.get('planned_workers'))} concurrency={_table_value(node.get('concurrent_workers'))}"
                     )
                 if int(node.get("group_size") or 1) > 1:
                     print(
@@ -829,7 +841,7 @@ def _print_slots(document: Dict[str, Any]) -> None:
     slots = document.get("request_slots") or {}
     if slots:
         print(
-            "Global request slots: "
+            "Global Worker slots: "
             f"busy={_table_value(slots.get('busy') if slots.get('sampled') else None)} "
             f"free={_table_value(slots.get('free') if slots.get('sampled') else None)} "
             f"total={_table_value(slots.get('total'))} "
@@ -1448,11 +1460,8 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
             submission.runners,
             submission.runner_plans,
             submission.task_definitions,
-            **(
-                {"runner_groups": submission.runner_groups}
-                if submission.runner_groups
-                else {}
-            ),
+            runtime=submission.runtime,
+            runner_groups=submission.runner_groups,
         )
     )
     campaign_id = batch["campaign"]["campaign_id"]
@@ -1462,6 +1471,7 @@ def start_campaign(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
     created_definitions = batch.get("task_definitions", [])
     result: Dict[str, Any] = {
         "campaign_id": campaign_id,
+        "runtime_id": batch.get("runtime_id"),
         "summary": batch.get("summary"),
         "runners": created,
         "runner_plans": created_plans,
@@ -1521,11 +1531,8 @@ def validate_campaign_artifacts(
             submission.runners,
             submission.runner_plans,
             submission.task_definitions,
-            **(
-                {"runner_groups": submission.runner_groups}
-                if submission.runner_groups
-                else {}
-            ),
+            runtime=submission.runtime,
+            runner_groups=submission.runner_groups,
             timeout=arguments.artifact_timeout,
             progress_callback=download_renderer.update,
         )
@@ -1553,11 +1560,8 @@ def preview_campaign_tasks(
         submission.runners,
         submission.runner_plans,
         submission.task_definitions,
-        **(
-            {"runner_groups": submission.runner_groups}
-            if submission.runner_groups
-            else {}
-        ),
+        runtime=submission.runtime,
+        runner_groups=submission.runner_groups,
         limit=arguments.limit,
         node_limit=arguments.node_limit,
         debug=arguments.debug,

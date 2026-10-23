@@ -65,6 +65,7 @@ class RequestPlan(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     repeat: int = Field(default=1, ge=1, le=MAX_REQUEST_STEPS)
+    every: Optional[Duration] = None
     input: str = Field(default="default", min_length=1, max_length=100)
     steps: Optional[list[RequestStepSpec]] = Field(
         default=None, min_length=1, max_length=10_000
@@ -76,6 +77,8 @@ class RequestPlan(BaseModel):
 
     @model_validator(mode="after")
     def validate_graph(self) -> "RequestPlan":
+        if self.every is not None and self.steps is not None:
+            raise ValueError("worker.every cannot combine with explicit steps")
         if self.worker_count > MAX_REQUEST_STEPS:
             raise ValueError("request expansion exceeds 100000 Workers")
         seen: set[str] = set()
@@ -121,7 +124,7 @@ def request_plan(benchmark: Mapping[str, Any]) -> RequestPlan:
     return RequestPlan.model_validate(
         {
             name: benchmark[name]
-            for name in ("repeat", "steps", "input")
+            for name in ("repeat", "every", "steps", "input")
             if name in benchmark
         }
     )

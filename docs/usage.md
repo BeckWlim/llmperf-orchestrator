@@ -234,10 +234,10 @@ runner_groups:
     runner: &target
       provider: your-provider
       model: your-model
-      concurrent_requests: 8
+      concurrent_workers: 8
       inputs:
         default: {tokens: 4096, shared_prefix_tokens: 3276}
-      request: {repeat: 1}
+      worker: {repeat: 1}
   - name: pressure
     phase: pressure
     matrix:
@@ -258,7 +258,8 @@ carry no built-in cache behavior. `seed: date` is frozen per API request; use an
 for reproducible preview/submission. `campaign preview` shows the resolved seed,
 phase order, matrix sizes and cycle count without preparing or submitting requests.
 The expanded limit is 10,000 Runners. See [limitations](limitations.md#matrix-phases-and-long-running-experiments)
-for recovery/failure semantics and the optional larger `workloads/*-recall.yaml` profiles.
+for recovery/failure semantics. The operational [background and L4 campaigns](../workloads/README.md)
+use independent task graphs with one request per Runner.
 
 For independent family sequences, use the bounded
 [`example-batch-sequence.yaml`](../examples/example-batch-sequence.yaml). Each `run` step
@@ -360,7 +361,7 @@ addition to the prompt hash.
 
 ## Request concurrency and token counts
 
-`runner.concurrent_requests` bounds requests within an ordinary Runner. The shared Ray
+`runner.concurrent_workers` bounds requests within an ordinary Runner. The shared Ray
 pool defaults to eight actors with eight requests each, providing 64 slots across Runners.
 The active Runner bound is independent; its default is 64 for atomic workloads. Waiting
 turns and delays use no request slots. See [runtime configuration](runtime.md#capacity).
@@ -369,7 +370,22 @@ The Backend checks required tables and columns without an application schema-ver
 marker. Older protocol/Dispatch layouts require explicit migration or a fresh database.
 Stop the old Backend before switching database configuration and preserve a backup.
 
-Tokenization runs during prompt preparation, before timed request execution. By default,
+Runner input preparation defaults to `input_token_count: estimate`. The general
+`hf-internal-testing/llama-tokenizer` is used unless a tokenizer is explicitly
+configured. Each request actor calibrates a bounded corpus sample once and reuses
+the characters-per-token ratio across requests and prefix seeds. Generated text,
+sampled records and literal inputs use that estimate without full prompt tokenization.
+Calibration is cached by dataset and tokenizer identity (four entries per actor);
+eviction or actor restart requires recalibration. Prefix identity stays stable while
+suffix seeds vary. Evidence labels these counts `calibrated_estimate`; provider
+usage remains authoritative, and 64K is a generation target rather than an exact count.
+
+Set `input_token_count: tokenizer` on a Runner template to tokenize individual
+inputs during preparation. Explicit token-mutation `cache_probe` experiments also
+use tokenizer processing. Compiled tasks accept the general tokenizer, with its
+approximate provenance retained, but still require immutable artifact revisions.
+
+By default,
 `benchmark.output_token_count: provider` uses server-reported output usage and performs no
 local output tokenization. Missing usage leaves output count, total count, token throughput,
 and TPOT unavailable (`null`); request rates and measured latencies remain available.

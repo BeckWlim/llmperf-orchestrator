@@ -5,7 +5,7 @@ Use `instances` to create independent copies of a workflow, `workflow` to descri
 operations, and `runner` to configure the Runner created by each execution node.
 The compiler supports both single-request `invoke` nodes and multi-request `run` nodes.
 
-This is the current implementation contract as of October 16, 2026. For setup and commands,
+This is the current implementation contract as of October 21, 2026. For setup and commands,
 see [Usage](usage.md); for runnable workloads, see [Examples](examples.md); for request
 capacity, storage, and recovery, see [Runtime](runtime.md).
 
@@ -35,7 +35,7 @@ task_definitions:
   runner:
     label: family
     timeout: 60
-    concurrent_requests: 2
+    concurrent_workers: 2
     model: spark-x2.5-4b-L4
     mean_output_tokens: 8
     stddev_output_tokens: 0
@@ -44,7 +44,7 @@ task_definitions:
       default:
         shared_prefix_tokens: 96
         tokens: 128
-    request:
+    worker:
       repeat: 4
 ```
 
@@ -58,7 +58,7 @@ it is removed before API validation.
 | `instances` | One expansion object containing `matrix`, `trials`, and `seed` |
 | `payloads` | Named atomic payload definitions; may be omitted for batch-only workflows |
 | `workflow` | Nonempty list of operations executed by every instance |
-| `runner` | Shared Runner template: label, metadata, execution settings, and `request` Worker template |
+| `runner` | Shared Runner template: label, metadata, execution settings, and `worker` template |
 
 Unknown fields are rejected. The former flat `sequence`/`kind` syntax and the input names
 `seed_namespace`, `after_seconds`, `every_seconds`, `timeout_seconds`, and
@@ -67,8 +67,95 @@ Unknown fields are rejected. The former flat `sequence`/`kind` syntax and the in
 
 ## Runner data and request logic
 
+### Seed pools and repeated groups
+
+Use `parallel.count` and `parallel.node` to repeat a branch template without listing
+every branch. This is compiler expansion with the same join semantics as explicit
+`parallel.branches`. Specify either form, never both. Count accepts an integer or
+`$dimension` reference, from 1 to 10,000; the expanded graph still has a 10,000-node
+limit per instance. Nested nodes may be runs, invokes, sequences, or repeats.
+
+```yaml
+instances:
+  seed: 20261021
+workflow:
+  - repeat:
+      name: rounds
+      count: 16
+      node:
+        parallel:
+          name: members
+          count: 512
+          node:
+            run:
+              name: batch
+              prefix_seed:
+                pick:
+                  seed: 2026102100
+                  count: 1024
+```
+
+This expands to 8,192 batch Runners with a 1,024-seed pool. Increase the pool
+independently of Runner count for more prefix variety. Each
+Runner selects once and retains its chosen prefix for every request in its batch.
+There is no new runtime round object: `rounds` and `members` are ordinary node names.
+Each group waits for the previous group's successful completion within its instance.
+A failed node terminates that instance, following existing task failure semantics.
+Separate instances progress independently. Use `instances.trials` around one parallel
+group for independent groups without a cross-group barrier.
+
+`run.prefix_seed` accepts an unsigned 64-bit integer, a `$dimension` reference, or
+`{pick: [integer, ...]}` or `{pick: {seed: 2026102100, count: 1024}}`.
+The pick pool contains 1–10,000 unique unsigned 64-bit integers. The compact form
+generates the pool from its parent `seed`; it is equivalent to supplying those
+generated values as an explicit list. It does not add a runtime operation.
+Selection is deterministic **with replacement**: duplicate selections are
+allowed within and across groups. Pool size does not imply full coverage or equal
+visit counts. To enumerate a pool exactly inside a shared wave, use `for_each`.
+A matrix with `prefix_seed: $family` instead creates independent instances.
+
+The `prefix-pool-v1` generator hashes `prefix-pool-v1`, parent seed, and zero-based
+entry index, separated by NUL characters, with SHA-256. Each value is the first
+eight digest bytes interpreted as an unsigned big-endian integer. In the unlikely
+event of a collision, increment modulo 2^64 until the value is unused. The same
+parent seed and count reproduce the same list; increasing count preserves earlier
+entries. Changing the parent seed creates a different pool. Changing
+`instances.seed` changes selection and suffixes without changing pool membership.
+Increasing pool size can change selections because the selection modulus changes.
+The recipe retains the compact definition; resolved seeds appear in debug preview
+and persisted Runners as usual. YAML anchors can share a pool specification.
+
+The `prefix-pick-v1` algorithm hashes the task seed, sorted matrix coordinates,
+trial index, and expanded node path with SHA-256; the digest modulo pool length
+selects a list position. Reordering the list changes the mapping. UUIDs, wall time,
+actor placement, and execution order do not participate. The selected integer goes
+directly to prefix generation, without mixing in round, Runner, or input names.
+`run.prefix_seed` overrides `instances.prefix_seed_scope` for that run's prefix;
+the existing batch/family suffix derivation remains separate and unchanged.
+By default suffix seeds include task seed, matrix coordinates, trial index, and
+expanded Runner path; each request adds its index. Selecting the same prefix in a
+later trial or round therefore does not reset suffix generation. Tiny or repetitive
+corpora can still produce identical text by chance; this is not a uniqueness filter.
+Omitting it preserves existing behavior. Atomic `invoke` payload semantics are unchanged.
+
+Keep dataset revision, adapter, tokenizer, prefix length, and generation path fixed
+to reproduce prefix text. Literal inputs and zero-length prefixes do not gain reuse
+from a seed. Equal prefix hashes prove local reuse, not memory or DFS cache hits.
+
+Preview with `campaign preview -f FILE --debug` to inspect `prefix_seed` and the
+separate `dataset_seed` on expanded runs. The selected seed persists in the Runner's
+`shared_prefix_seed` and task context with `prefix_seed_version: explicit-prefix-v1`.
+Validation and token/concurrency estimates count all expanded Runners and requests.
+Group joins retain ordinary dependencies: R groups of N single-run branches require
+(R−1)×N² dependency edges. Independent groups avoid that global join cost when no
+barrier is needed. Counts bound work, not elapsed duration or cache retention.
+
+See [the small runnable seed-pool example](../examples/example-seed-pool.yaml).
+
+### Input and request configuration
+
 A Runner owns a complete execution: the Provider, model, tokenizer, output and sampling
-settings, named inputs, timeout, progress, and aggregate outcome. `request` controls how
+settings, named inputs, timeout, progress, and aggregate outcome. `worker` controls how
 Workers are created and combined. A Worker executes one fully resolved Provider request;
 it inherits its Runner's execution settings and selects one named input.
 
@@ -85,7 +172,7 @@ runner:
   timeout:
     value: 2
     unit: m
-  concurrent_requests: 8
+  concurrent_workers: 8
   inputs:
     opening:
       tokens: 1024
@@ -93,7 +180,7 @@ runner:
       tokens:
         mean: 64
         stddev: 8
-  request:
+  worker:
     repeat: 2
     steps:
     - name: first
@@ -121,13 +208,13 @@ Worker count. In `sample` mode, six requests with a value of `2` select three re
 use each twice, and shuffle the resulting sequence. The default `1` selects each record
 once. `concatenate` mode requires `1`, so the field can be omitted in that mode.
 
-`request.input` selects a named input and defaults to `default`. A step's `input` overrides
+`worker.input` selects a named input and defaults to `default`. A step's `input` overrides
 that selection. If every step selects its own input, no `default` entry is needed. Omitted
 Runner inputs use Backend input defaults. Unknown input references fail validation.
 Provider/model/tokenizer, sampling, output settings, and input data are not fields of
-`request` or its steps.
+`worker` or its steps.
 
-Omitting `request` is equivalent to `request: {}`: one Worker using the `default` input,
+Omitting `worker` is equivalent to `worker: {}`: one Worker using the `default` input,
 with no dependencies or delay. Backend data and execution defaults still apply.
 Omitting `repeat` and `steps` plans one Worker. `repeat: 256` plans 256 independent Workers
 using the selected input. With `steps`, `repeat` copies the entire graph: the example above
@@ -165,7 +252,7 @@ aggregate result. TaskInstance failure separately cancels pending sibling Runner
 Worker results commit as `worker.completed` messages. The same Runner listener consumes
 these outputs and `timer.due` events, then decides progression. Neither Workers nor the
 message bus directly launch successors. Waiting consumes no request slot. An omitted
-`concurrent_requests` leaves admission to Scheduler; an explicit value bounds outstanding
+`concurrent_workers` leaves admission to Scheduler; an explicit value bounds outstanding
 Workers. `timeout` covers execution after preparation, queueing, and inter-step waits.
 
 The old authoring keys `benchmark`, `max_submissions`, `request_steps`, `history_from`, and
@@ -217,16 +304,63 @@ nodes but do not themselves create Runners.
 
 | Primitive | Required fields | Optional fields | Execution |
 |---|---|---|---|
-| `run` | `name` | `role`, `after`, `depends_on` | One batch Runner using the template's request count and concurrency |
+| `run` | `name` | `role`, `after`, `depends_on`, `prefix_seed` | One batch Runner using the template's request count and concurrency |
 | `invoke` | `name`, `payload` | `role`, `after`, `depends_on` | One Runner with exactly one request and concurrency one |
 | `repeat` | `name`, `count`, `node` | `every` | Serial expansion of the nested node |
-| `parallel` | `name`, `branches` | `after` | Branches share incoming dependencies; the next step joins all branches |
+| `parallel` | `name`, either `branches` or `count` plus `node` | `after` | Branches share incoming dependencies; the next step joins all branches |
 | `sequence` | `name`, `steps` | `after` | Nested ordered operations |
+| `for_each` | `name`, `variable`, `values`, `node` | `parallelism` (default 1), `after` | Enumerate values once in bounded serial lanes, then join all lanes |
 
 Names contribute to logical node paths; `role` is analysis metadata and defaults to the
 execution node's name. Roles do not influence scheduling. `run` accepts neither `payload`
 or message-reusing dependencies. `invoke` must reference a declared payload. Task Runner templates
 cannot contain `cache_probe`.
+
+### Fixed cohorts with bounded parallelism
+
+Use `for_each` to enumerate a fixed list or generated seed pool, rather than sample
+it with replacement. Reusing this definition in later waves reuses the exact cohort:
+
+```yaml
+workflow:
+  - for_each: &cohort
+      name: cohort
+      variable: prefix
+      values: {seed: 202610211102, count: 256}
+      parallelism: 32
+      node:
+        run: {name: request, prefix_seed: $prefix}
+  - repeat:
+      name: recalls
+      count: 3
+      every: {value: 40, unit: m}
+      node:
+        for_each: *cohort
+```
+
+`values` accepts 1–10,000 unique unsigned 64-bit integers or the same `{seed, count}`
+generator used by `pick`. `parallelism` is an integer from 1 to 10,000; fewer values
+produce fewer lanes. Values keep their list order and are split into contiguous,
+balanced lanes; earlier lanes receive any extra members. For example, five values
+with parallelism two produce serial lanes of three and two members.
+
+Each lane waits for the incoming dependencies and optional `after` delay. Members
+inside it execute serially; the following workflow node waits for every lane tail.
+`parallelism` bounds simultaneous child subgraphs, not requests inside each child:
+32 lanes of single-request `run` nodes cap requests at 32, but nested parallel nodes
+or multi-request Runners can increase that bound. Safety estimates include them.
+
+The variable binds `$prefix` only inside `node`, including nested counts, delays,
+and prefix references. It must be a valid identifier and cannot shadow a matrix
+dimension or enclosing loop variable. It does not interpolate arbitrary strings.
+Sibling loops may reuse the same variable name. Matrix references remain available.
+
+This expands at compilation into ordinary dependencies, with no runtime loop or
+new Scheduler limit. Generated paths include `cohort.lane_01.member_01.request`.
+Seeds selected explicitly for prefixes remain identical across waves; suffix seeds
+still include each full Runner path and trial. Rewriting an existing explicit graph
+can change suffix seeds because its paths change. Graph size, depth, and planned-span
+limits still apply. Failures retain existing task-instance failure semantics.
 
 ### Sequential batches
 
@@ -352,6 +486,9 @@ seed, trial index, and node path. Named inputs namespace the prefix by input nam
 The default `trial` scope retains the algorithm below. Neither mode shuffles
 submission or implements fairness in Runner/trial logic.
 See [limitations](limitations.md) for creation, queue, deadline, and cache boundaries.
+An explicit `run.prefix_seed` overrides prefix derivation and input-name namespacing;
+see [seed pools and repeated groups](#seed-pools-and-repeated-groups). The suffix seed
+continues to vary by trial and expanded node path.
 
 Batch seeds use the `batch-v1` algorithm:
 
@@ -390,7 +527,7 @@ in the current nested scope; a dotted name is a full node path within the same T
 For example, `depends_on: [{step: branches.left, reuse_messages: true}]` reads that branch.
 Explicit dependencies add to the implicit sequence/parallel dependencies; they never remove
 them. `run` accepts wait-only dependencies; express message reuse between its Workers in
-`request.steps`. A whole multi-request Runner is not a single message source.
+`worker.steps`. A whole multi-request Runner is not a single message source.
 See [multi-turn execution](runtime.md#multi-turn-yaml) for message and adapter constraints.
 
 ## Completion and failure rules
@@ -421,7 +558,9 @@ are not automatically replayed. See [recovery](runtime.md#recovery-and-cutover).
 | Trials per coordinate | 1–1,000 |
 | Instances per definition and total task instances per Campaign | 10,000 |
 | Top-level workflow entries | 1–100 |
-| Parallel branches or nested sequence steps | 1–100 |
+| Explicit parallel branches or nested sequence steps | 1–100 |
+| Counted parallel branches | 1–10,000, subject to the expanded node limit |
+| Prefix pick pool | 1–10,000 unique unsigned 64-bit integers |
 | Repeat count after dimension resolution | 0–100 |
 | Graph nesting depth | 20 |
 | Expanded execution nodes per instance | 10,000 |
@@ -436,7 +575,7 @@ wall-clock completion guarantee. Performance guard limits additionally constrain
 request, token, and concurrency totals and can reject a graph below the structural limits.
 
 Unsupported features include dynamic or unbounded loops, result-conditioned branching,
-quorum or optional joins, per-node Runner overrides, automatic prefix pools, randomized
+quorum or optional joins, arbitrary per-node Runner overrides, adaptive prefix pools, randomized
 admission, and direct cross-instance dependencies. YAML anchors can reuse mappings but do
 not add loops or change compiler semantics. `invoke` requires a single Worker template (`repeat: 1`, no `steps`); use `run` for repeated or multi-step templates.
 
@@ -451,8 +590,10 @@ Campaign YAML → TaskDefinitionCreate / TaskRecipe → TaskGraph
 
 The compiler does not call Providers, wait for delays, or schedule execution. Pydantic
 models validate the external AST; immutable `BaseNode` subclasses implement expansion.
-`RunNode` and `InvokeNode` emit execution rows; `RepeatNode`, `ParallelNode`, and
-`SequenceNode` compute dependencies and delays. `NODE_TYPES` registers the primitives.
+`RunNode` and `InvokeNode` emit execution rows; `RepeatNode`, `ParallelNode`,
+`SequenceNode`, and `ForEachNode` compute dependencies and delays. `ForEachNode`
+binds scalar values and expands into static parallel/serial lanes. `NODE_TYPES`
+registers the primitives.
 
 `CompilationTable` contains instance coordinates, zero-based trial indices, stable logical
 paths, dependency paths, delays, roles, execution kinds, payload references, and seeds.

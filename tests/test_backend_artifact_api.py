@@ -95,8 +95,8 @@ def test_campaign_admission(tmp_path, enforce_campaign_limits):
                             "model": "test-model",
                             "tokenizer": {"id": "organization/tokenizer"},
                             "inputs": {"default": {"tokens": 128}},
-                            "request": {"repeat": 2},
-                            "concurrent_requests": 1,
+                            "worker": {"repeat": 2},
+                            "concurrent_workers": 1,
                         }
                     ],
                 },
@@ -139,7 +139,7 @@ def test_input_reference_rejection(tmp_path):
                         {
                             "provider": "test",
                             "model": "test-model",
-                            "request": {"input": "missing"},
+                            "worker": {"input": "missing"},
                         }
                     ],
                 },
@@ -186,7 +186,7 @@ def test_artifact_api(tmp_path, monkeypatch):
                         "campaign": {"name": "artifact-preflight"},
                         "runners": [
                             {
-                                "request": {},
+                                "worker": {},
                                 "provider": "test",
                                 "model": "test-model",
                                 "tokenizer": {
@@ -285,7 +285,7 @@ def test_artifact_stream(tmp_path, monkeypatch):
                                     }
                                 ],
                                 "runner": {
-                                    "request": {},
+                                    "worker": {},
                                     "provider": "test",
                                     "model": "test-model",
                                     "mean_output_tokens": 8,

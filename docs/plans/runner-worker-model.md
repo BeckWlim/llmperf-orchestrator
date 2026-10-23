@@ -2,7 +2,7 @@
 
 Status: implementation plan and tracked boundaries, October 16, 2026. The atomic Worker
 dispatcher, async Runner listener, optional window, generic durable messages, inherited chat
-records, and common trigger evaluators are implemented. Runner owns named inputs and inference settings; `runner.request` defines
+records, and common trigger evaluators are implemented. Runner owns named inputs and inference settings; `runner.worker` defines
 execution logic and message composition; `depends_on` optionally reuses one or multiple committed message sources.
 Runner owns dependency failure checks and cancellation propagation. Current contracts are documented in
 [Tasks](../tasks.md) and [Runtime](../runtime.md).
@@ -58,10 +58,10 @@ Campaign
 A pressure-test Runner creates independent Workers and submits ready steps in parallel.
 Runner controls which work is eligible; Scheduler controls backpressure, fair admission,
 and physical execution capacity. **There is no Runner submission window by default.**
-The finite `request.repeat` and `request.steps` expansion determines the planned Workers. Scheduler admission can interleave
+The finite `worker.repeat` and `worker.steps` expansion determines the planned Workers. Scheduler admission can interleave
 requests from other Runners; submitting eight Workers does not reserve eight slots.
 
-An explicit `runner.concurrent_requests` may be used when an experiment requires a per-Runner
+An explicit `runner.concurrent_workers` may be used when an experiment requires a per-Runner
 ceiling. In that case it is a rolling limit over submitted, unfinished Workers across all
 branches. A committed completion allows a replacement without waiting for the group.
 Queued, executing, and result-awaiting-commit Workers count toward this optional limit.
@@ -70,7 +70,7 @@ Scheduler capacity nor this optional window.
 
 Scheduler backpressure must suspend submission without blocking the Runner's event
 listener. Keep at most one blocked submission operation per Runner; do not create an
-unbounded coroutine for every ready request. The public `concurrent_requests` setting maps to this optional limit. Omission leaves
+unbounded coroutine for every ready request. The public `concurrent_workers` setting maps to this optional limit. Omission leaves
 admission to Scheduler; an explicit value preserves the experiment concurrency ceiling.
 
 ## Asynchronous Runner progression

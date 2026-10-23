@@ -401,7 +401,7 @@ def _execution_runner():
             "adapter": "openai",
             "timeout": 10,
             "repeat": 1,
-            "concurrent_requests": 1,
+            "concurrent_workers": 1,
             "mean_input_tokens": 10,
             "stddev_input_tokens": 0,
             "mean_output_tokens": 1,

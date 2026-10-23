@@ -50,11 +50,11 @@ def test_workload_validation(tmp_path, enforce_campaign_limits):
         'version: "1.0.0"\n'
         "provider: test\n"
         "model: test-model\n"
-        "concurrent_requests: 1\n"
+        "concurrent_workers: 1\n"
         "inputs:\n"
         "  default:\n"
         "    tokens: 819200\n"
-        "request:\n"
+        "worker:\n"
         "  repeat: 256\n",
         encoding="utf-8",
     )

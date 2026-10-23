@@ -54,7 +54,7 @@ def task_runner(runner_id, node_id, role, ttft, hit=None, miss=None):
             "model": "model-a",
             "mean_input_tokens": 100,
             "mean_output_tokens": 8,
-            "concurrent_requests": 1,
+            "concurrent_workers": 1,
             "task_context": context,
         },
         "summary": {

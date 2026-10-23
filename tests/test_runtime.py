@@ -303,3 +303,55 @@ def test_history_identity(monkeypatch):
     assert observed[0]["prompt_hash"] == observed[1]["prompt_hash"]
     assert observed[0]["messages_hash"] != observed[1]["messages_hash"]
     assert [item["history_version"] for item in observed] == [0, 2]
+
+
+def test_targeted_reconciliation(monkeypatch):
+    from unittest.mock import AsyncMock
+    from llmperf_backend.runtime import coordinator as runtime_coordinator
+
+    now = datetime.now(timezone.utc)
+    instances = [
+        {
+            "instance_id": name,
+            "state": "active",
+            "created_at": now,
+            "nodes": [
+                {
+                    "node_id": name,
+                    "dependencies": ("unfinished",),
+                    "delay_seconds": 0,
+                    "state": "blocked",
+                    "completed_at": None,
+                    "terminal_status": None,
+                }
+            ],
+        }
+        for name in ("background", "probe")
+    ]
+    visited = []
+    original_ready = runtime_coordinator.ready_nodes
+
+    def tracked_ready(nodes, created_at, observed_at):
+        visited.append(nodes[0].node_id)
+        return original_ready(nodes, created_at, observed_at)
+
+    monkeypatch.setattr(runtime_coordinator, "ready_nodes", tracked_ready)
+
+    async def exercise():
+        repository = AsyncMock()
+        repository.runtime_snapshot.side_effect = [
+            {"runners": [], "instances": instances},
+            {"runners": [], "instances": instances[:1]},
+            {"runners": [], "instances": instances},
+        ]
+        coordinator = runtime_coordinator.RuntimeCoordinator(repository)
+        await coordinator.reconcile()
+        assert visited == ["background", "probe"]
+        visited.clear()
+        await coordinator.reconcile("completed-background-runner")
+        assert visited == ["background"]
+        visited.clear()
+        await coordinator.reconcile()
+        assert visited == ["background", "probe"]
+
+    asyncio.run(exercise())

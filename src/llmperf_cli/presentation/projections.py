@@ -114,6 +114,7 @@ def project_runner(document: Any, detailed: bool = False) -> Dict[str, Any]:
         error = {"code": None, "message": source["error_message"]}
     projected = {
         "runner_id": source.get("runner_id"),
+        "runtime_id": source.get("runtime_id"),
         "status": source.get("status"),
         "label": source.get("label"),
         "provider": source.get("provider", benchmark.get("provider")),
@@ -159,6 +160,7 @@ def project_runner(document: Any, detailed: bool = False) -> Dict[str, Any]:
                     "dispatch_lag_seconds",
                     "created_at",
                     "cancel_requested",
+                    "log_key",
                 ),
             )
         )
@@ -179,6 +181,7 @@ _CAMPAIGN_FIELDS = (
     "campaign_id",
     "name",
     "description",
+    "runtime_id",
     "status",
     "outcome",
     "has_failures",
@@ -323,7 +326,7 @@ def _campaign_preview(document: Any, detailed: bool) -> Dict[str, Any]:
                         "payload_id",
                         "execution_kind",
                         "planned_workers",
-                        "concurrent_requests",
+                        "concurrent_workers",
                         "message_sources",
                         "payload_kind",
                         "execution_group",
@@ -334,6 +337,8 @@ def _campaign_preview(document: Any, detailed: bool) -> Dict[str, Any]:
                     node["payload_seed"] = raw_node.get("payload_seed")
                 if detailed and "dataset_seed" in raw_node:
                     node["dataset_seed"] = raw_node.get("dataset_seed")
+                if detailed and "prefix_seed" in raw_node:
+                    node["prefix_seed"] = raw_node.get("prefix_seed")
                 nodes.append(node)
             instance = _pick(
                 raw_instance,
@@ -424,6 +429,7 @@ def _preview_groups(document: Any) -> List[Dict[str, Any]]:
 
 
 _PLAN_FIELDS = (
+    "runtime_id",
     "runner_plan_id",
     "campaign_id",
     "name",
@@ -495,6 +501,7 @@ def _scheduler(document: Any, detailed: bool) -> Dict[str, Any]:
             "live_slots",
             "busy_slots",
             "active_runners",
+            "waiting_runners",
             "runtime_error",
             "worker_kind",
             "active_workers",
@@ -726,7 +733,7 @@ def _campaign_one(document: Any, detailed: bool) -> Dict[str, Any]:
 
 def project_campaign_start(document: Any, detailed: bool = False) -> Dict[str, Any]:
     source = _object(document, "campaign.start")
-    result = _pick(source, ("campaign_id", "exported_to"))
+    result = _pick(source, ("campaign_id", "runtime_id", "exported_to"))
     result["summary"] = _workload_summary(source.get("summary"), "campaign.start")
     if detailed:
         result["runners"] = [

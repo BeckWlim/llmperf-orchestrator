@@ -87,7 +87,7 @@ def test_worker_mailbox(postgresql_url):
                     "provider": "test",
                     "model": "test",
                     "repeat": 2,
-                    "concurrent_requests": None,
+                    "concurrent_workers": None,
                 },
                 {},
                 "test",
@@ -261,7 +261,7 @@ def test_schema_structure(postgresql_url, missing):
                     is None
                 )
                 stored_name = await connection.scalar(
-                    text("SELECT name FROM benchmark_campaigns WHERE id = :id"),
+                    text("SELECT name FROM campaigns WHERE id = :id"),
                     {"id": campaign["campaign_id"]},
                 )
                 assert stored_name == "preserve-data"
@@ -309,7 +309,7 @@ def test_history_recovery(postgresql_url):
                 },
                 "timeout": 10,
                 "repeat": 1,
-                "concurrent_requests": 1,
+                "concurrent_workers": 1,
                 "mean_input_tokens": 2,
                 "stddev_input_tokens": 0,
                 "mean_output_tokens": 2,
@@ -452,6 +452,185 @@ def test_schema_rejection(postgresql_url):
         finally:
             async with database.engine.begin() as connection:
                 await connection.execute(text("DROP TABLE IF EXISTS legacy_test"))
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_large_graph_snapshot(postgresql_url, monkeypatch):
+    """Large graph creation yields to runtime work; snapshots exclude heavy payloads."""
+    import threading
+    from sqlalchemy import event
+    from llmperf_backend.compiler.tasks import TaskAssembler, TaskCompiler
+
+    loop_thread = threading.get_ident()
+    compilation_threads = []
+    original_compile = TaskCompiler.compile
+    original_assemble = TaskAssembler.assemble
+
+    def tracked_compile(compiler):
+        compilation_threads.append(threading.get_ident())
+        return original_compile(compiler)
+
+    def tracked_assemble(assembler):
+        compilation_threads.append(threading.get_ident())
+        return original_assemble(assembler)
+
+    monkeypatch.setattr(TaskCompiler, "compile", tracked_compile)
+    monkeypatch.setattr(TaskAssembler, "assemble", tracked_assemble)
+
+    async def exercise():
+        database = Database(DatabaseConfig(url=postgresql_url))
+        statements = []
+
+        def record_sql(connection, cursor, statement, parameters, context, many):
+            statements.append(statement)
+
+        try:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.create_schema()
+            repository = RunnerRepository(database)
+            await repository.acquire_runtime("large-graph")
+            workload = await repository.create_campaign_workload(
+                "large-graph",
+                None,
+                {},
+                [],
+                [],
+                [
+                    {
+                        "definition": {
+                            "name": "large-graph",
+                            "payloads": {"p": {"seed": "p", "text": "hello"}},
+                            "workflow": [
+                                {
+                                    "repeat": {
+                                        "name": "rounds",
+                                        "count": 12,
+                                        "node": {
+                                            "parallel": {
+                                                "name": "wave",
+                                                "count": 100,
+                                                "node": {
+                                                    "invoke": {
+                                                        "name": "request",
+                                                        "payload": "p",
+                                                    }
+                                                },
+                                            }
+                                        },
+                                    }
+                                }
+                            ],
+                        },
+                        "runner_template": {
+                            "label": "large-graph",
+                            "metadata": {},
+                            "benchmark": {
+                                "provider": "test",
+                                "model": "test",
+                                "adapter": "openai",
+                                "tokenizer": {
+                                    "id": "test",
+                                    "revision": "a" * 40,
+                                    "requested_revision": "main",
+                                    "immutable_revision": True,
+                                    "selection": "explicit",
+                                    "accuracy": "compatible",
+                                },
+                                "mean_input_tokens": 2,
+                                "stddev_input_tokens": 0,
+                                "mean_output_tokens": 2,
+                                "stddev_output_tokens": 0,
+                                "repeat": 1,
+                                "concurrent_workers": 1,
+                            },
+                        },
+                    }
+                ],
+                "test",
+            )
+            assert workload["summary"]["task_nodes"] == 1200
+            assert len(compilation_threads) == 2
+            assert all(thread != loop_thread for thread in compilation_threads)
+            event.listen(
+                database.engine.sync_engine, "before_cursor_execute", record_sql
+            )
+            snapshot = await repository.runtime_snapshot()
+            assert len(snapshot["instances"]) == 1
+            nodes = snapshot["instances"][0]["nodes"]
+            assert len(nodes) == 100
+            assert sum(not node["dependencies"] for node in nodes) == 100
+            node_queries = [sql for sql in statements if "FROM execution_nodes" in sql]
+            assert len(node_queries) == 1
+            assert "runner_template" not in node_queries[0]
+            assert "lineage" in node_queries[0]
+            statements.clear()
+            first_node = next(node for node in nodes if not node["dependencies"])
+            runner = await repository.activate_node(
+                first_node["node_id"], datetime.now(timezone.utc)
+            )
+            assert runner is not None
+            assert await repository.start_selected(runner["runner_id"], "large-graph")
+            assert await repository.complete_runner(
+                runner["runner_id"],
+                {},
+                [{"error_code": None, "request_metadata": {"prompt_hash": "stable"}}],
+                0,
+                "",
+                "",
+            )
+            after_completion = await repository.runtime_snapshot()
+            assert after_completion["instances"][0]["state"] == "active"
+            assert len(after_completion["instances"][0]["nodes"]) == 99
+            # A synchronized wave must wait for every predecessor. Completing
+            # the remaining first-wave requests releases exactly one next wave,
+            # with all predecessor timestamps available for its timer barrier.
+            for remaining_node in nodes:
+                if remaining_node["node_id"] == first_node["node_id"]:
+                    continue
+                next_runner = await repository.activate_node(
+                    remaining_node["node_id"], datetime.now(timezone.utc)
+                )
+                assert next_runner is not None
+                assert await repository.start_selected(
+                    next_runner["runner_id"], "large-graph"
+                )
+                assert await repository.complete_runner(
+                    next_runner["runner_id"],
+                    {},
+                    [
+                        {
+                            "error_code": None,
+                            "request_metadata": {"prompt_hash": "stable"},
+                        }
+                    ],
+                    0,
+                    "",
+                    "",
+                )
+            next_snapshot = await repository.runtime_snapshot()
+            frontier_nodes = next_snapshot["instances"][0]["nodes"]
+            assert len(frontier_nodes) == 200
+            assert (
+                sum(node["terminal_status"] == "succeeded" for node in frontier_nodes)
+                == 100
+            )
+            assert (
+                sum(node["state"] in {"pending", "blocked"} for node in frontier_nodes)
+                == 100
+            )
+            assert not any("LEFT OUTER JOIN runners" in sql for sql in statements)
+        finally:
+            if event.contains(
+                database.engine.sync_engine, "before_cursor_execute", record_sql
+            ):
+                event.remove(
+                    database.engine.sync_engine, "before_cursor_execute", record_sql
+                )
+            async with database.engine.begin() as connection:
                 await connection.run_sync(Base.metadata.drop_all)
             await database.dispose()
 

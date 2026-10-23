@@ -17,6 +17,7 @@ from llmperf.datasets.preparation import (
     CorpusCalibration,
     PromptPlan,
     calibrate,
+    calibrate_corpus,
     render_chunk,
 )
 from llmperf.datasets.prompts import PromptDatasetSource, prepare_prompt_requests
@@ -37,7 +38,7 @@ def indexed_seed(seed: int, namespace: str) -> int:
 
 
 def worker_steps(
-    benchmark: Mapping[str, Any], calibrated: bool
+    benchmark: Mapping[str, Any], calibrated: bool = True
 ) -> Sequence[RequestStep]:
     """Expand descriptions only: no tokenizer, corpus reads, or prompt allocation."""
     probe = benchmark.get("cache_probe")
@@ -94,7 +95,8 @@ def worker_steps(
             prefix_seed = (
                 indexed_seed(base_prefix_seed, input_name)
                 if base_prefix_seed is not None
-                else None
+                and context.get("prefix_seed_version") != "explicit-prefix-v1"
+                else base_prefix_seed
             )
         else:
             seed = base_seed
@@ -125,7 +127,9 @@ def worker_steps(
             ),
             dataset_adapter=dataset["adapter"] if dataset else None,
             dataset_filename=dataset["filename"] if dataset else None,
-            calibrated=calibrated and not atomic and not probe,
+            calibrated=calibrated
+            and benchmark.get("input_token_count", "estimate") == "estimate"
+            and not probe,
             atomic=atomic,
             output_token_count=benchmark.get("output_token_count", "provider"),
             output_tokens=int(benchmark.get("mean_output_tokens", 150)),
@@ -233,9 +237,34 @@ class WorkerInputPreparer:
             )
             if recipe.dataset_adapter and not dataset_path:
                 raise ValueError("Worker dataset path is missing")
-            get_length = lambda text: len(
-                tokenizer.encode(text, add_special_tokens=False)
+            calibration_key = json.dumps(
+                [
+                    recipe.dataset_adapter,
+                    recipe.dataset_filename,
+                    dataset_path,
+                    environment[TOKENIZER_PATH],
+                    environment.get(TOKENIZER_FAST, "true"),
+                ]
             )
+            if recipe.calibrated:
+                if calibration_key not in self.calibrations:
+                    self.calibrations[calibration_key] = calibrate_corpus(
+                        tokenizer, source
+                    )
+                self.calibrations.move_to_end(calibration_key)
+                if len(self.calibrations) > 4:
+                    self.calibrations.popitem(last=False)
+            corpus_calibration = (
+                self.calibrations[calibration_key] if recipe.calibrated else None
+            )
+
+            def get_length(text: str) -> int:
+                if corpus_calibration is not None:
+                    return max(
+                        0, round(len(text) / corpus_calibration.characters_per_token)
+                    )
+                return len(tokenizer.encode(text, add_special_tokens=False))
+
             if recipe.text is not None:
                 prompt = (recipe.text, get_length(recipe.text))
                 evidence: Dict[str, Any] = {"source": "literal"}
@@ -260,15 +289,6 @@ class WorkerInputPreparer:
                 )
                 cached_plan = self.plans.get(cache_key)
                 if cached_plan is None:
-                    calibration_key = json.dumps(
-                        [
-                            recipe.dataset_adapter,
-                            recipe.dataset_filename,
-                            dataset_path,
-                            environment[TOKENIZER_PATH],
-                            environment.get(TOKENIZER_FAST, "true"),
-                        ]
-                    )
                     cached_plan = calibrate(
                         tokenizer,
                         recipe.seed,
@@ -278,16 +298,8 @@ class WorkerInputPreparer:
                         recipe.output_tokens,
                         source=source,
                         shared_prefix_seed=recipe.prefix_seed,
-                        calibration=self.calibrations.get(calibration_key),
+                        calibration=corpus_calibration,
                     )
-                    if source.is_external:
-                        self.calibrations[calibration_key] = CorpusCalibration(
-                            cached_plan.characters_per_token,
-                            cached_plan.calibration_records,
-                        )
-                        self.calibrations.move_to_end(calibration_key)
-                        if len(self.calibrations) > 4:
-                            self.calibrations.popitem(last=False)
                     self.plans[cache_key] = cached_plan
                     self.prefix_bytes += 4 * len(cached_plan.prefix)
                     while len(self.plans) > 1 and (
@@ -324,6 +336,17 @@ class WorkerInputPreparer:
                     ),
                 )
                 prompt, evidence = prompts[0], evidences[0]
+            evidence["input_count_source"] = (
+                "calibrated_estimate" if recipe.calibrated else "tokenizer"
+            )
+            if corpus_calibration is not None:
+                estimated_count = evidence.pop("actual_input_tokens", None)
+                if estimated_count is not None:
+                    evidence["estimated_input_tokens"] = estimated_count
+                evidence["characters_per_token"] = (
+                    corpus_calibration.characters_per_token
+                )
+                evidence["calibration_records"] = corpus_calibration.record_count
             metadata = dict(request.metadata or {})
             if recipe.probe:
                 probe_config = {**recipe.probe, "trials": 1, "repeats_after_prime": 1}

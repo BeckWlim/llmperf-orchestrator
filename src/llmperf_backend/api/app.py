@@ -132,10 +132,10 @@ def _compile_campaign_task_preview(
                         if node_row.execution_kind == "atomic"
                         else (planned_worker_count(template_benchmark))
                     ),
-                    "concurrent_requests": (
+                    "concurrent_workers": (
                         1
                         if node_row.execution_kind == "atomic"
-                        else (definition.runner.concurrent_requests)
+                        else (definition.runner.concurrent_workers)
                     ),
                     "payload_id": node_row.payload_id,
                     "message_sources": list(node_row.message_sources),
@@ -152,6 +152,8 @@ def _compile_campaign_task_preview(
                         else "payload_seed"
                     )
                     node_preview[seed_field] = node_row.payload_seed
+                    if node_row.prefix_seed is not None:
+                        node_preview["prefix_seed"] = node_row.prefix_seed
                 node_previews.append(node_preview)
             instance_previews.append(
                 {
@@ -254,7 +256,11 @@ def create_app(
     store = config_store or ConfigStore()
     validated_config = store.current()
     db = database or Database(validated_config.database)
-    repository = RunnerRepository(db)
+    repository = RunnerRepository(
+        db,
+        log_directory=validated_config.scheduler.log_directory,
+        log_bytes_limit=validated_config.scheduler.log_bytes_limit,
+    )
     providers = provider_registry or ProviderRegistry.from_loader(
         load_provider_profiles
     )
@@ -504,6 +510,7 @@ def create_app(
         ] = None,
     ) -> Dict[str, Any]:
         return {
+            "runtime": dump_model(runner_plan.runtime),
             "plan": {
                 "name": runner_plan.name,
                 "timezone": runner_plan.timezone,
@@ -522,15 +529,36 @@ def create_app(
             ),
         }
 
-    def enforce_performance_guard(
+    async def enforce_performance_guard(
         request: Request,
         runners: Any = (),
         runner_plans: Any = (),
         task_definitions: Any = (),
+        runtime_concurrent_workers: Optional[int] = None,
+        campaign_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         config = request.app.state.config_store.current()
+        limits = (
+            [runtime_concurrent_workers]
+            if runtime_concurrent_workers is not None
+            else []
+        )
+        if campaign_id is not None:
+            repository = request.app.state.runner_repository
+            campaign_document = await repository.get_campaign(campaign_id)
+            if campaign_document is None:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            parent_runtime_id = campaign_document.get("runtime_id")
+            if parent_runtime_id is not None:
+                parent_runtime = await repository.get_submission_runtime(
+                    parent_runtime_id
+                )
+                if parent_runtime is not None:
+                    limits.extend(parent_runtime["limits"].values())
+        effective_runtime_limit = min(limits) if limits else None
         try:
-            assessment = assess_workload(
+            assessment = await asyncio.to_thread(
+                assess_workload,
                 runners,
                 runner_plans,
                 task_definitions,
@@ -540,6 +568,7 @@ def create_app(
                 ray_actor_max_concurrency=(
                     request.app.state.scheduler.config.ray_actor_max_concurrency
                 ),
+                runtime_concurrent_workers=effective_runtime_limit,
             )
         except WorkloadSafetyError as exc:
             raise HTTPException(
@@ -643,16 +672,10 @@ def create_app(
                     detail="compiled tasks require stddev_output_tokens=0",
                 )
             resolved_tokenizer = resolved_benchmark.get("tokenizer") or {}
-            if (
-                not resolved_tokenizer.get("immutable_revision")
-                or resolved_tokenizer.get("accuracy") == "approximate"
-            ):
+            if not resolved_tokenizer.get("immutable_revision"):
                 raise HTTPException(
                     status_code=422,
-                    detail=(
-                        "compiled tasks require an explicit/model-bound "
-                        "tokenizer at an immutable Hugging Face revision"
-                    ),
+                    detail=("compiled tasks require an immutable tokenizer revision"),
                 )
             resolved_task_definitions.append(
                 {
@@ -660,11 +683,12 @@ def create_app(
                     "runner_template": resolved_runner,
                 }
             )
-        enforce_performance_guard(
+        await enforce_performance_guard(
             request,
             runners=resolved_runners,
             runner_plans=resolved_runner_plans,
             task_definitions=resolved_task_definitions,
+            runtime_concurrent_workers=payload.runtime.concurrent_workers,
         )
         return (
             resolved_runners,
@@ -753,13 +777,19 @@ def create_app(
             request.app.state.config_store.snapshot().config["benchmark"],
         )
         resolved_benchmark = resolved_runner["benchmark"]
-        enforce_performance_guard(request, runners=[resolved_runner])
+        await enforce_performance_guard(
+            request,
+            runners=[resolved_runner],
+            runtime_concurrent_workers=payload.runtime.concurrent_workers,
+            campaign_id=payload.campaign_id,
+        )
         runner = await request.app.state.runner_repository.create_runner(
             resolved_benchmark,
             payload.metadata,
             actor,
             campaign_id=payload.campaign_id,
             label=payload.label,
+            runtime=payload.runtime,
         )
         if runner is None:
             raise HTTPException(status_code=404, detail="Campaign not found")
@@ -779,7 +809,11 @@ def create_app(
                 status_code=422, detail="Use /campaigns/start to submit Runner rounds"
             )
         return await request.app.state.runner_repository.create_campaign(
-            payload.name, payload.description, payload.tags, actor
+            payload.name,
+            payload.description,
+            payload.tags,
+            actor,
+            runtime=payload.runtime,
         )
 
     async def validate_campaign_artifact_document(
@@ -963,6 +997,7 @@ def create_app(
             runner_plans,
             task_definitions,
             actor,
+            runtime=payload.runtime,
         )
         campaign_id = workload["campaign"]["campaign_id"]
         workload_summary = workload["summary"]
@@ -1001,13 +1036,22 @@ def create_app(
             await resolve_runner(request, runner, default_benchmark)
             for runner in payload.runners
         ]
-        enforce_performance_guard(request, runners=runners)
+        await enforce_performance_guard(
+            request,
+            runners=runners,
+            runtime_concurrent_workers=payload.runtime.concurrent_workers,
+            campaign_id=campaign_id,
+        )
         created = await request.app.state.runner_repository.create_runners(
-            campaign_id, runners, actor
+            campaign_id, runners, actor, runtime=payload.runtime
         )
         if created is None:
             raise HTTPException(status_code=404, detail="Campaign not found")
-        return {"campaign_id": campaign_id, "items": created}
+        return {
+            "campaign_id": campaign_id,
+            "runtime_id": created[0]["runtime_id"],
+            "items": created,
+        }
 
     @api.post("/runner-plans/preview", tags=["planner"])
     async def preview_runner_plan(
@@ -1045,12 +1089,18 @@ def create_app(
             "benchmark"
         ]
         resolved_plan = await resolve_plan(request, payload, default_benchmark)
-        enforce_performance_guard(request, runner_plans=[resolved_plan])
+        await enforce_performance_guard(
+            request,
+            runner_plans=[resolved_plan],
+            runtime_concurrent_workers=payload.runtime.concurrent_workers,
+            campaign_id=campaign_id,
+        )
         plan = await request.app.state.runner_repository.create_runner_plan(
             campaign_id,
             resolved_plan["plan"],
             resolved_plan["runner_template"],
             actor,
+            runtime=payload.runtime,
         )
         if plan is None:
             raise HTTPException(status_code=404, detail="Campaign not found")
@@ -1164,6 +1214,18 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ProviderDiscoveryError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @api.get("/runtimes/{runtime_id}", tags=["runtime"])
+    async def get_submission_runtime(
+        request: Request, runtime_id: str
+    ) -> Dict[str, Any]:
+        require_role(request, "viewer")
+        runtime_document = (
+            await request.app.state.runner_repository.get_submission_runtime(runtime_id)
+        )
+        if runtime_document is None:
+            raise HTTPException(status_code=404, detail="Submission runtime not found")
+        return runtime_document
 
     @api.get("/campaigns", tags=["campaigns"])
     async def list_campaigns(
@@ -1280,13 +1342,20 @@ def create_app(
         runner = await request.app.state.runner_repository.get_runner(runner_id)
         if runner is None:
             raise HTTPException(status_code=404, detail="Runner not found")
+        try:
+            logs = await request.app.state.runner_repository.read_logs(
+                runner.get("log_key")
+            )
+        except (OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=503, detail="Runner log file unavailable"
+            ) from exc
         return {
             "runner_id": runner["runner_id"],
             "status": runner["status"],
             "scheduler_id": runner.get("scheduler_id"),
             "worker": runner.get("worker"),
-            "stdout": runner.get("stdout"),
-            "stderr": runner.get("stderr"),
+            **logs,
         }
 
     @api.post("/runners/{runner_id}/cancel", tags=["runners"])

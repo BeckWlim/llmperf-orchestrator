@@ -77,7 +77,7 @@ def validate_document(
             [
                 (
                     runner_model.execution_document()
-                    if runner_model.request is not None
+                    if runner_model.worker is not None
                     or runner_model.inputs is not None
                     else {"benchmark": None}
                 )
@@ -101,7 +101,7 @@ def validate_document(
     runner_templates = [
         (
             runner.execution_document()
-            if runner.request is not None or runner.inputs is not None
+            if runner.worker is not None or runner.inputs is not None
             else {"benchmark": None}
         )
         for runner in campaign.runners
@@ -130,7 +130,7 @@ def validate_document(
         plan_document.pop("runner")
         plan_runner_document = (
             runner_plan.runner.execution_document()
-            if runner_plan.runner.request is not None
+            if runner_plan.runner.worker is not None
             or runner_plan.runner.inputs is not None
             else {"benchmark": None}
         )
@@ -142,7 +142,7 @@ def validate_document(
         task_document.pop("runner")
         task_runner_document = (
             definition.runner.execution_document()
-            if definition.runner.request is not None
+            if definition.runner.worker is not None
             or definition.runner.inputs is not None
             else {"benchmark": None}
         )
@@ -157,6 +157,7 @@ def validate_document(
         scheduler_slots,
         ray_actor_capacity,
         ray_actor_max_concurrency=ray_actor_max_concurrency,
+        runtime_concurrent_workers=campaign.runtime.concurrent_workers,
     )
     return (
         "valid campaign workload: "

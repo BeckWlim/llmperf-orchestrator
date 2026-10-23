@@ -36,7 +36,7 @@ server:
 benchmark:
   provider: test
   model: test-model
-  concurrent_requests: 2
+  concurrent_workers: 2
 """
 
 
@@ -45,7 +45,7 @@ def test_defaults():
 
     assert config.environment == "test"
     assert config.server.port == 9000
-    assert config.benchmark.concurrent_requests == 2
+    assert config.benchmark.concurrent_workers == 2
     assert config.benchmark.timeout.seconds == 90
     assert config.planner.enabled is True
     assert config.planner.batch_size == 20
@@ -200,14 +200,8 @@ scheduler:
 
 
 def test_protocol_version():
-    assert {
-        runtime_version,
-        cli_version,
-        RELEASE_VERSION,
-        PROTOCOL_VERSION,
-        TASK_FORMAT_VERSION,
-        RESULTS_VERSION,
-    } == {"1.0.0"}
+    assert {runtime_version, cli_version, RELEASE_VERSION} == {"1.0.1"}
+    assert {PROTOCOL_VERSION, TASK_FORMAT_VERSION, RESULTS_VERSION} == {"1.0.0"}
     with pytest.raises(ConfigError, match="1.0.0"):
         load_config_text(VALID_CONFIG.replace('version: "1.0.0"', "version: 1"))
     with pytest.raises(ConfigError, match="version"):

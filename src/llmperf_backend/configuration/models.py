@@ -9,6 +9,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -38,6 +39,16 @@ class StrictModel(BaseModel):
     """Base model that rejects misspelled or unsupported configuration keys."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+class SubmissionRuntimeConfig(StrictModel):
+    """Workload-independent ceilings; omission permits the full available quota."""
+
+    concurrent_workers: Optional[int] = Field(default=None, strict=True, gt=0)
+
+
+class RuntimeSubmission(StrictModel):
+    runtime: SubmissionRuntimeConfig = Field(default_factory=SubmissionRuntimeConfig)
 
 
 class ServerConfig(StrictModel):
@@ -121,7 +132,9 @@ class BatchTaskContext(TaskExecutionContext):
     dataset_seed: int = Field(ge=0, le=18_446_744_073_709_551_615)
     seed_version: Literal["batch-v1", "family-suffix-v1"] = "batch-v1"
     shared_prefix_seed: Optional[int] = Field(default=None, ge=0, le=2**64 - 1)
-    prefix_seed_version: Optional[Literal["family-prefix-v1"]] = None
+    prefix_seed_version: Optional[Literal["family-prefix-v1", "explicit-prefix-v1"]] = (
+        None
+    )
 
 
 class DatasetSpec(StrictModel):
@@ -146,7 +159,11 @@ class RunnerExecutionSettings(StrictModel):
     """Runner lifecycle settings, independent of the Worker request template."""
 
     timeout: Duration = Field(default_factory=lambda: Duration(value=90))
-    concurrent_requests: Optional[int] = Field(default=None, gt=0)
+    concurrent_workers: Optional[int] = Field(
+        default=None,
+        gt=0,
+        validation_alias=AliasChoices("concurrent_workers", "concurrent_requests"),
+    )
 
     @field_validator("timeout")
     @classmethod
@@ -155,7 +172,7 @@ class RunnerExecutionSettings(StrictModel):
             raise ValueError("timeout must be positive")
         return duration
 
-    @field_validator("concurrent_requests", mode="before")
+    @field_validator("concurrent_workers", mode="before")
     @classmethod
     def validate_optional_window(cls, value: object) -> object:
         if isinstance(value, str) and value.strip().lower() in {"", "null"}:
@@ -169,6 +186,7 @@ class RunnerGenerationSettings(StrictModel):
     mean_output_tokens: int = Field(default=150, gt=0)
     stddev_output_tokens: int = Field(default=80, ge=0)
     output_token_count: Literal["provider", "local"] = "provider"
+    input_token_count: Literal["estimate", "tokenizer"] = "estimate"
     additional_sampling_params: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -252,6 +270,13 @@ class _RequestFields(RequestPlan):
 
     @model_validator(mode="after")
     def validate_cache_probe(self) -> "_RequestFields":
+        if self.every is not None and self.cache_probe is not None:
+            raise ValueError("worker.every cannot combine with cache_probe")
+        if self.every is not None and getattr(self, "concurrent_workers", None) not in (
+            None,
+            1,
+        ):
+            raise ValueError("worker.every requires concurrent_workers: 1 or omitted")
         required_inputs = (
             {step.input or self.input for step in self.steps}
             if self.steps
@@ -293,13 +318,15 @@ class _RequestFields(RequestPlan):
         return self
 
 
-class RequestTemplateConfig(RequestPlan):
+class WorkerTemplateConfig(RequestPlan):
     """Execution logic and message composition; all input data belongs to Runner."""
 
     cache_probe: Optional[CacheProbeConfig] = None
 
     @model_validator(mode="after")
-    def validate_probe(self) -> "RequestTemplateConfig":
+    def validate_probe(self) -> "WorkerTemplateConfig":
+        if self.every is not None and self.cache_probe is not None:
+            raise ValueError("worker.every cannot combine with cache_probe")
         if self.cache_probe is not None and (
             self.steps is not None or self.repeat != 1
         ):
@@ -356,7 +383,7 @@ class CompiledBenchmarkConfig(ResolvedBenchmarkConfig):
             )
         if self.cache_probe is not None:
             raise ValueError("compiled benchmark cannot define cache_probe")
-        if self.worker_count != 1 or self.concurrent_requests != 1:
+        if self.worker_count != 1 or self.concurrent_workers != 1:
             raise ValueError("compiled benchmark must contain exactly one request")
         return self
 
@@ -388,7 +415,7 @@ class GroupedBenchmarkConfig(ResolvedBenchmarkConfig):
         if (
             self.cache_probe is not None
             or self.worker_count != count
-            or self.concurrent_requests != count
+            or self.concurrent_workers != count
         ):
             raise ValueError(
                 "grouped benchmark requires one concurrent request per task context"
@@ -426,6 +453,7 @@ class SchedulerConfig(StrictModel):
     cancel_grace_seconds: float = Field(default=5.0, gt=0)
     stale_after_seconds: int = Field(default=300, gt=0)
     log_bytes_limit: int = Field(default=1_000_000, ge=1024)
+    log_directory: str = "~/.local/state/llmperf/runner-logs"
     ray_address: Optional[str] = Field(default=None, min_length=1)
     ray_num_cpus: int = Field(default=8, ge=1, le=1024)
     ray_actor_num_cpus: float = Field(default=1.0, gt=0, le=64)
@@ -555,14 +583,22 @@ class BenchmarkRunnerSpec(RunnerExecutionSettings, RunnerGenerationSettings):
     inputs: Optional[Dict[str, InputTemplateConfig]] = Field(
         default=None, min_length=1, max_length=100
     )
-    request: Optional[RequestTemplateConfig] = None
+    worker: Optional[WorkerTemplateConfig] = Field(
+        default=None, validation_alias=AliasChoices("worker", "request")
+    )
     metadata: Dict[str, Any] = Field(default_factory=dict)
     label: Optional[str] = Field(default=None, min_length=1, max_length=200)
 
     @model_validator(mode="after")
     def validate_message_input(self) -> "BenchmarkRunnerSpec":
+        if (
+            self.worker is not None
+            and self.worker.every is not None
+            and self.concurrent_workers not in (None, 1)
+        ):
+            raise ValueError("worker.every requires concurrent_workers: 1 or omitted")
         if self.inputs is not None:
-            plan = self.request or RequestTemplateConfig()
+            plan = self.worker or WorkerTemplateConfig()
             required_inputs = (
                 {step.input or plan.input for step in plan.steps}
                 if plan.steps
@@ -571,8 +607,8 @@ class BenchmarkRunnerSpec(RunnerExecutionSettings, RunnerGenerationSettings):
             if not required_inputs <= self.inputs.keys():
                 raise ValueError("request references an unknown Runner input")
         if (
-            self.request is not None
-            and any(step.message_sources for step in self.request.steps or ())
+            self.worker is not None
+            and any(step.message_sources for step in self.worker.steps or ())
             and "messages" in self.additional_sampling_params
         ):
             raise ValueError("sampling messages cannot override reused messages")
@@ -583,7 +619,7 @@ class BenchmarkRunnerSpec(RunnerExecutionSettings, RunnerGenerationSettings):
     ) -> Dict[str, Any]:
         """Normalize public Worker templates into the persisted execution document."""
         template = dict(defaults or {})
-        request_template = self.request or RequestTemplateConfig()
+        request_template = self.worker or WorkerTemplateConfig()
         template.update(request_template.model_dump(mode="json"))
         if self.inputs is not None:
             selected_input = template.get("input", "default")
@@ -614,7 +650,7 @@ class BenchmarkRunnerSpec(RunnerExecutionSettings, RunnerGenerationSettings):
                 template[target_field] = defaults[target_field]
         for field_name in (
             "timeout",
-            "concurrent_requests",
+            "concurrent_workers",
             *RunnerGenerationSettings.model_fields,
         ):
             if field_name in self.model_fields_set or field_name not in template:
@@ -652,14 +688,14 @@ class BenchmarkRunnerSpec(RunnerExecutionSettings, RunnerGenerationSettings):
 TaskDefinitionCreate = CompilerTaskDefinitionCreate[BenchmarkRunnerSpec]
 
 
-class BenchmarkRunnerCreate(BenchmarkRunnerSpec):
+class BenchmarkRunnerCreate(BenchmarkRunnerSpec, RuntimeSubmission):
     """Start one Runner, optionally attached to a Campaign."""
 
     version: ProtocolVersion = PROTOCOL_VERSION
     campaign_id: Optional[str] = Field(default=None, min_length=1, max_length=36)
 
 
-class BenchmarkRunnerBatchCreate(StrictModel):
+class BenchmarkRunnerBatchCreate(RuntimeSubmission):
     """Atomically start multiple Runners in one Campaign."""
 
     version: ProtocolVersion = PROTOCOL_VERSION
@@ -747,7 +783,7 @@ class RunnerPlanPreview(RunnerPlanTiming):
     count: int = Field(default=10, ge=1, le=100)
 
 
-class RunnerPlanCreate(RunnerPlanTiming):
+class RunnerPlanCreate(RunnerPlanTiming, RuntimeSubmission):
     name: str = Field(min_length=1, max_length=200)
     runner: BenchmarkRunnerSpec
 
@@ -823,7 +859,7 @@ class RunnerGroup(StrictModel):
         return prod(len(values) for values in self.matrix.values())
 
 
-class BenchmarkCampaignCreate(StrictModel):
+class BenchmarkCampaignCreate(RuntimeSubmission):
     """Create a durable grouping for multiple benchmark Runners."""
 
     name: str = Field(min_length=1, max_length=200)
@@ -832,7 +868,7 @@ class BenchmarkCampaignCreate(StrictModel):
     rounds: Optional[RunnerRounds] = None
 
 
-class BenchmarkCampaignStart(StrictModel):
+class BenchmarkCampaignStart(RuntimeSubmission):
     """Atomically create one Campaign and its initial workload."""
 
     version: ProtocolVersion = PROTOCOL_VERSION
@@ -850,6 +886,8 @@ class BenchmarkCampaignStart(StrictModel):
 
     @model_validator(mode="after")
     def validate_workload(self) -> "BenchmarkCampaignStart":
+        if self.campaign.runtime.concurrent_workers is not None:
+            raise ValueError("runtime configuration belongs at the submission root")
         workload_size = (
             len(self.runners)
             + len(self.runner_groups)
@@ -897,7 +935,7 @@ class BenchmarkCampaignStart(StrictModel):
                     "each round phase must contain at least one Runner template"
                 )
             if rounds.prefix_seed_scope == "family" and any(
-                runner.request is not None and runner.request.cache_probe is not None
+                runner.worker is not None and runner.worker.cache_probe is not None
                 for runner in [
                     *self.runners,
                     *(group.runner for group in self.runner_groups),
@@ -910,8 +948,8 @@ class BenchmarkCampaignStart(StrictModel):
         for definition in self.task_definitions:
             instance_count += definition.instance_count
             if (
-                definition.runner.request is not None
-                and definition.runner.request.cache_probe is not None
+                definition.runner.worker is not None
+                and definition.runner.worker.cache_probe is not None
             ):
                 raise ValueError("compiled task runner cannot define cache_probe")
         if instance_count > 10_000:

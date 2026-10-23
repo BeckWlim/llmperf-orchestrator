@@ -13,7 +13,7 @@ runners:
   provider: aliyun
   model: deepseek-v4-pro
   timeout: 60
-  concurrent_requests: 1
+  concurrent_workers: 1
   mean_output_tokens: 16
   stddev_output_tokens: 0
   additional_sampling_params:
@@ -21,7 +21,7 @@ runners:
   inputs:
     default:
       tokens: 128
-  request:
+  worker:
     repeat: 2
 - label: example-parallel
   metadata:
@@ -29,7 +29,7 @@ runners:
   provider: aliyun
   model: deepseek-v4-pro
   timeout: 60
-  concurrent_requests: 2
+  concurrent_workers: 2
   mean_output_tokens: 16
   stddev_output_tokens: 0
   additional_sampling_params:
@@ -37,7 +37,7 @@ runners:
   inputs:
     default:
       tokens: 128
-  request:
+  worker:
     repeat: 2
 task_definitions:
 - name: example-replay-task
@@ -68,7 +68,7 @@ task_definitions:
       revision: main
       use_fast: true
     timeout: 60
-    concurrent_requests: 1
+    concurrent_workers: 1
     mean_output_tokens: 16
     stddev_output_tokens: 0
     additional_sampling_params:
@@ -76,4 +76,4 @@ task_definitions:
     inputs:
       default:
         tokens: 128
-    request: {}
+    worker: {}

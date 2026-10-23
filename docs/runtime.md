@@ -1,5 +1,59 @@
 # Runtime, storage, and multi-turn execution
 
+## Submission limits and rolling Runner admission
+
+Every submission receives a durable `runtime_id`. Its optional top-level
+`runtime.concurrent_workers` ceiling applies to all Workers produced by that
+submission, whether it creates a Runner, a batch, a Campaign, or a RunnerPlan.
+Omitting the ceiling allows use of all available Backend Worker quota. Child
+submissions retain their parent's limit; a child ceiling can only tighten it.
+`GET /api/v1/runtimes/{runtime_id}` returns the stored configuration and inherited limits.
+
+```yaml
+runtime: {concurrent_workers: 24}
+campaign: {name: pressure}
+# ... task definitions or Runners ...
+```
+
+Worker permits are acquired from child runtime to parent runtime, then from the
+Backend pool. Waiting for a runtime quota does not reserve a physical Worker slot.
+Cancellation retains permits until physical execution finishes.
+
+A Runner's `concurrent_workers` bounds its own outstanding Workers. Its canonical
+Worker template is `worker: {repeat: 156, every: 544}`. `every` is an optional
+completion-relative cooldown, including after a failed Worker; it requires serial
+execution and cannot be combined with explicit `steps` or `cache_probe`. Each Worker
+remains an independent request, without retry or an added dependency edge.
+Legacy input aliases `request` and `concurrent_requests` remain readable; serialization
+and examples use `worker` and `concurrent_workers`.
+
+Runners release active Runner admission during timed waits with no outstanding Worker.
+Other Runners can take that slot. A due Runner rejoins the same admission queue, retaining
+its seed, remaining repetitions, and original timeout. Waiting progression remains in
+memory and in the durable mailbox; it is not automatically replayed after a restart.
+The active Runner limit and physical Worker capacity stay independent.
+
+## Compact storage and log files
+
+PostgreSQL stores scheduling identities, state, counts, summaries, and log keys.
+Detailed stdout/stderr live in immutable, content-addressed files under
+`LLMPERF_LOG_DIRECTORY` (default `~/.local/state/llmperf/runner-logs`). Files are written
+atomically before their key is committed. `LLMPERF_LOG_LIMIT` bounds each stream.
+Persist this directory outside the container; `/runners/{id}/logs` reads the file
+and checks its digest. Removed files return empty logs; their metadata remains usable.
+Runner listings and exports carry the key rather than embedding log text.
+
+`workers` stores only reservation identity, generation, state, timestamps and a
+completion digest. The durable `runner_messages` mailbox holds the sole full Worker
+completion payload; no second request/result JSON copy is kept in the reservation row.
+The separate result metrics remain available for benchmark analysis.
+
+Campaign list progress uses grouped SQL totals and only merges live telemetry for
+resident Runners. It does not transfer every historical Runner to Python or read log
+files. A campaign/status index supports the summary query. These changes require a
+fresh schema; follow the [cutover guidance](#recovery-and-cutover) for existing installations.
+
+
 The Backend runs one runtime coordinator and one Scheduler. PostgreSQL stores accepted
 work, execution intent, checkpoints, results, and message history. Runtime queues and Ray
 actors manage live work. Tables live in the PostgreSQL schema selected by the connection
@@ -40,6 +94,11 @@ or conversation history. Planner materializes outer RunnerPlan occurrences and r
 calendar, overlap, and misfire policies. Runner timers publish `timer.due` messages and
 never submit Workers themselves.
 
+For compiled tasks, reconciliation reads the pending dependency frontier and its
+successful parent checkpoints, rather than materializing every future round. The
+coordinator evaluates completion-relative delays and wave barriers from those
+checkpoints. Periodic reads reconstruct this frontier after missed notifications.
+
 Outer task `run` nodes create multi-request Runners; `invoke` creates a one-request Runner.
 Both use the atomic request dispatcher. A batch advances its outer node only after its
 aggregate outcome commits. Failed or cancelled batches terminate their instance and cancel
@@ -61,7 +120,7 @@ process environment to switch Providers.
 `LLMPERF_RUNNERS_MAX` independently bounds active logical Runner handles. Its default is
 1024, independently of eight Backend aggregation threads. An existing explicit
 value of 8 remains a limit of eight simultaneous one-request Runners. Ordinary Runners can
-omit `concurrent_requests` to leave admission to Scheduler. An explicit value sets an
+omit `concurrent_workers` to leave admission to Scheduler. An explicit value sets an
 optional rolling ceiling on outstanding Workers, including queued and uncommitted results. The shared router fairly
 rotates queued requests between Runners and enforces the global capacity across Campaigns.
 
@@ -219,12 +278,13 @@ YAML does not change an already accepted campaign.
 
 | Tables | Purpose |
 |---|---|
-| `benchmark_campaigns`, `benchmark_runner_plans` | Ownership, recurrence, durable control intent |
-| `benchmark_task_definitions`, `benchmark_task_instances` | Recipes, compiled instance metadata, checkpoints and outcomes |
+| `runtimes` | Submission identity, parent scope, and Worker quota configuration |
+| `campaigns`, `runner_plans` | Ownership, recurrence, durable control intent |
+| `task_definitions`, `task_instances` | Recipes, compiled instance metadata, checkpoints and outcomes |
 | `execution_nodes` | Durable node identities, dependencies, completed timing, and Runner linkage |
-| `benchmark_runners`, `task_attempts` | Logical execution status and fenced execution attempt |
-| `benchmark_request_results` | Request metrics and history-version references |
-| `worker_steps` | Per-Runner request reservations, fenced status, and individual committed outputs |
+| `runners`, `runner_attempts` | Logical execution status and fenced execution attempt |
+| `worker_results` | Request metrics and history-version references |
+| `workers` | Worker identity, reservation state, timing, and completion digest |
 | `runner_messages`, `runner_message_receipts` | Generic Runner mailbox and per-consumer acknowledgement |
 | `conversation_messages` | Joined subclass of the generic message record, adding ordered role/content and conversation identity |
 | `execution_leases` | Single active Backend owner, expiry and increasing fencing generation |
@@ -232,8 +292,8 @@ YAML does not change an already accepted campaign.
 
 `execution_nodes` replaces `benchmark_runner_dispatches`. Its pending/blocked fields
 describe durable progress; SQL no longer decides graph readiness. Repository transactions
-still verify payload identity and terminal state. Existing metadata table names remain
-where their responsibilities are unchanged. Event tables remain purpose-specific audit
+still verify payload identity and terminal state. Table names use concise plural domain
+nouns without the redundant `benchmark_` prefix. Event tables remain purpose-specific audit
 records, not a database message bus.
 
 An attempt records one Runner execution. Each Worker result and its `worker.completed`
@@ -250,7 +310,7 @@ mailbox as an exactly-once Provider execution guarantee.
 ## Worker templates and message reuse
 
 `runner.inputs` defines named text/dataset inputs and new-input token budgets.
-`runner.request` describes a finite execution and message-composition graph. Its default is one
+`runner.worker` describes a finite execution and message-composition graph. Its default is one
 Worker; `repeat` repeats the template or complete `steps` graph. `depends_on` describes
 readiness, with optional `reuse_messages: true` on each source. Multi-turn conversations,
 parallel independent requests, and merging several earlier message lists use these same
@@ -287,7 +347,7 @@ the instant arrives. Runner then checks dependencies, timing, and cancellation a
 submission. A due event is a wakeup, not permission for the timer to execute a Worker.
 The Runner cancels obsolete timers when the waiting work disappears.
 
-`request.steps` currently exposes `after` and `at`. The internal bounded periodic timer
+`worker.steps` currently exposes `after` and `at`. The internal bounded periodic timer
 helper is not a YAML step option. RunnerPlan recurrence remains Planner-owned and creates
 new Runners; latency-threshold triggers remain a planned extension.
 
@@ -307,7 +367,7 @@ single-prompt adapter rejects message reuse.
 
 For outer workflows, `invoke.depends_on` uses the same primitive and reads committed atomic
 Worker messages within its TaskInstance. `run.depends_on` only waits for node success; use
-`request.steps` for message reuse within a multi-request Runner. Each repetition and each
+`worker.steps` for message reuse within a multi-request Runner. Each repetition and each
 TaskInstance has its own dependency identities. There is no named conversation object or
 mutable global history shared by branches.
 

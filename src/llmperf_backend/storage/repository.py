@@ -1,9 +1,13 @@
 """Asynchronous PostgreSQL persistence for benchmark Runners and metrics."""
 
+import asyncio
 import math
+import hashlib
+import json
+import os
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, TypedDict
 from uuid import uuid4, uuid5, NAMESPACE_URL
 from zoneinfo import ZoneInfo
 
@@ -17,6 +21,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     CheckConstraint,
+    case,
     delete,
     func,
     or_,
@@ -32,8 +37,9 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, load_only, mapped_column
 from llmperf_backend.storage.base import Base
+from llmperf_backend.storage.logs import RunnerLogStore
 from llmperf_backend.compiler.requests import planned_worker_count
 from llmperf_backend.storage.messages import (
     ConversationMessageRecord,
@@ -46,7 +52,11 @@ from llmperf.version import PROTOCOL_VERSION, TASK_FORMAT_VERSION
 from llmperf.benchmark.execution import RequestStep
 from llmperf_backend.runtime.runner import WorkerResult
 from llmperf_backend.runtime.messages import RunnerMessage, WorkerCompletion
-from llmperf_backend.configuration.models import DatabaseConfig, GroupedBenchmarkConfig
+from llmperf_backend.configuration.models import (
+    DatabaseConfig,
+    GroupedBenchmarkConfig,
+    SubmissionRuntimeConfig,
+)
 from llmperf_backend.runtime.planner import as_utc, next_fire_details
 from llmperf_backend.compiler.tasks import (
     TaskAssembler,
@@ -109,7 +119,7 @@ class ExecutionLeaseRecord(Base):
 
 
 class TaskAttemptRecord(Base):
-    __tablename__ = "task_attempts"
+    __tablename__ = "runner_attempts"
     __table_args__ = (
         CheckConstraint(
             "state IN ('executing', 'succeeded', 'failed', 'cancelled', 'indeterminate')",
@@ -118,7 +128,7 @@ class TaskAttemptRecord(Base):
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     runner_id: Mapped[str] = mapped_column(
-        ForeignKey("benchmark_runners.id", ondelete="CASCADE"),
+        ForeignKey("runners.id", ondelete="CASCADE"),
         unique=True,
         nullable=False,
     )
@@ -133,7 +143,7 @@ class TaskAttemptRecord(Base):
 class WorkerStepRecord(Base):
     """Durable single-send reservation and output mailbox for one Runner step."""
 
-    __tablename__ = "worker_steps"
+    __tablename__ = "workers"
     __table_args__ = (
         CheckConstraint(
             "state IN ('submitted', 'succeeded', 'failed', 'cancelled', 'indeterminate')",
@@ -142,7 +152,7 @@ class WorkerStepRecord(Base):
         Index("ix_worker_runner_state", "runner_id", "state"),
     )
     runner_id: Mapped[str] = mapped_column(
-        ForeignKey("benchmark_runners.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey("runners.id", ondelete="CASCADE"), primary_key=True
     )
     step_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     generation: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -151,16 +161,33 @@ class WorkerStepRecord(Base):
         DateTime(timezone=True), nullable=False
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    request: Mapped[Dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
-    result: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON_DOCUMENT)
+    completion_hash: Mapped[Optional[str]] = mapped_column(String(64))
+
+
+class SubmissionRuntimeRecord(Base):
+    """Durable configuration for any submitted workload, independent of its kind."""
+
+    __tablename__ = "runtimes"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    parent_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("runtimes.id")
+    )
+    configuration: Mapped[Dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
 
 
 class BenchmarkCampaignRecord(Base):
-    __tablename__ = "benchmark_campaigns"
+    __tablename__ = "campaigns"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
+    runtime_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("runtimes.id")
+    )
     tags: Mapped[Dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
     created_by: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -169,7 +196,10 @@ class BenchmarkCampaignRecord(Base):
 
 
 class BenchmarkRunnerPlanRecord(Base):
-    __tablename__ = "benchmark_runner_plans"
+    __tablename__ = "runner_plans"
+    runtime_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("runtimes.id")
+    )
     __table_args__ = (
         CheckConstraint(
             "status IN ('active', 'paused', 'completed', 'cancelled')",
@@ -198,7 +228,7 @@ class BenchmarkRunnerPlanRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     campaign_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("benchmark_campaigns.id", ondelete="CASCADE"),
+        ForeignKey("campaigns.id", ondelete="CASCADE"),
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -233,7 +263,7 @@ class BenchmarkRunnerPlanRecord(Base):
 
 
 class BenchmarkTaskDefinitionRecord(Base):
-    __tablename__ = "benchmark_task_definitions"
+    __tablename__ = "task_definitions"
     __table_args__ = (
         Index("ix_task_definition_campaign", "campaign_id", "created_at"),
     )
@@ -241,7 +271,7 @@ class BenchmarkTaskDefinitionRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     campaign_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("benchmark_campaigns.id", ondelete="CASCADE"),
+        ForeignKey("campaigns.id", ondelete="CASCADE"),
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -257,7 +287,7 @@ class BenchmarkTaskDefinitionRecord(Base):
 
 
 class BenchmarkTaskInstanceRecord(Base):
-    __tablename__ = "benchmark_task_instances"
+    __tablename__ = "task_instances"
     __table_args__ = (
         UniqueConstraint("definition_id", "instance_key", name="uq_task_instance_key"),
         CheckConstraint(
@@ -270,12 +300,12 @@ class BenchmarkTaskInstanceRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     definition_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("benchmark_task_definitions.id", ondelete="CASCADE"),
+        ForeignKey("task_definitions.id", ondelete="CASCADE"),
         nullable=False,
     )
     campaign_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("benchmark_campaigns.id", ondelete="CASCADE"),
+        ForeignKey("campaigns.id", ondelete="CASCADE"),
         nullable=False,
     )
     format_version: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -336,16 +366,16 @@ class ExecutionNodeRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     campaign_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("benchmark_campaigns.id", ondelete="CASCADE"),
+        ForeignKey("campaigns.id", ondelete="CASCADE"),
         nullable=False,
     )
     runner_plan_id: Mapped[Optional[str]] = mapped_column(
-        String(36), ForeignKey("benchmark_runner_plans.id", ondelete="CASCADE")
+        String(36), ForeignKey("runner_plans.id", ondelete="CASCADE")
     )
     dispatch_key: Mapped[Optional[str]] = mapped_column(String(80))
     task_instance_id: Mapped[Optional[str]] = mapped_column(
         String(36),
-        ForeignKey("benchmark_task_instances.id", ondelete="CASCADE"),
+        ForeignKey("task_instances.id", ondelete="CASCADE"),
     )
     node_id: Mapped[Optional[str]] = mapped_column(String(80))
     due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -364,7 +394,10 @@ class ExecutionNodeRecord(Base):
 
 
 class BenchmarkRunnerRecord(Base):
-    __tablename__ = "benchmark_runners"
+    __tablename__ = "runners"
+    runtime_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("runtimes.id")
+    )
     __table_args__ = (
         UniqueConstraint(
             "runner_plan_id", "plan_occurrence", name="uq_runner_plan_occurrence"
@@ -375,6 +408,7 @@ class BenchmarkRunnerRecord(Base):
             postgresql_where=text("status = 'queued'"),
         ),
         Index("ix_runners_status_created_at", "status", "created_at"),
+        Index("ix_runners_campaign_status", "campaign_id", "status"),
         Index(
             "ix_runners_running_campaign",
             "campaign_id",
@@ -386,12 +420,12 @@ class BenchmarkRunnerRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     campaign_id: Mapped[Optional[str]] = mapped_column(
         String(36),
-        ForeignKey("benchmark_campaigns.id", ondelete="SET NULL"),
+        ForeignKey("campaigns.id", ondelete="SET NULL"),
         index=True,
     )
     runner_plan_id: Mapped[Optional[str]] = mapped_column(
         String(36),
-        ForeignKey("benchmark_runner_plans.id", ondelete="SET NULL"),
+        ForeignKey("runner_plans.id", ondelete="SET NULL"),
     )
     plan_occurrence: Mapped[Optional[int]] = mapped_column(Integer)
     scheduled_for: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -416,9 +450,9 @@ class BenchmarkRunnerRecord(Base):
     exit_code: Mapped[Optional[int]] = mapped_column(Integer)
     summary: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON_DOCUMENT)
     request_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    planned_workers: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
-    stdout: Mapped[Optional[str]] = mapped_column(Text)
-    stderr: Mapped[Optional[str]] = mapped_column(Text)
+    log_key: Mapped[Optional[str]] = mapped_column(String(80))
 
 
 class RunnerRecordFactory:
@@ -456,6 +490,7 @@ class RunnerRecordFactory:
             created_by=created_by,
             status=QUEUED,
             benchmark_config=normalized_benchmark,
+            planned_workers=planned_worker_count(normalized_benchmark),
             user_metadata=normalized_metadata,
         )
 
@@ -528,7 +563,7 @@ class RunnerRecordFactory:
 
 
 class BenchmarkRequestRecord(Base):
-    __tablename__ = "benchmark_request_results"
+    __tablename__ = "worker_results"
     __table_args__ = (
         CheckConstraint(
             "sequence >= 0",
@@ -538,7 +573,7 @@ class BenchmarkRequestRecord(Base):
 
     runner_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("benchmark_runners.id", ondelete="CASCADE"),
+        ForeignKey("runners.id", ondelete="CASCADE"),
         nullable=False,
         primary_key=True,
     )
@@ -550,12 +585,12 @@ class BenchmarkRequestRecord(Base):
 
 
 class BenchmarkRunnerEventRecord(Base):
-    __tablename__ = "benchmark_runner_events"
+    __tablename__ = "runner_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     runner_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("benchmark_runners.id", ondelete="CASCADE"),
+        ForeignKey("runners.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -567,7 +602,7 @@ class BenchmarkRunnerEventRecord(Base):
 
 
 class BenchmarkRunnerPlanEventRecord(Base):
-    __tablename__ = "benchmark_runner_plan_events"
+    __tablename__ = "runner_plan_events"
     __table_args__ = (
         Index("ix_runner_plan_event_time", "runner_plan_id", "created_at"),
     )
@@ -575,14 +610,14 @@ class BenchmarkRunnerPlanEventRecord(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     runner_plan_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("benchmark_runner_plans.id", ondelete="CASCADE"),
+        ForeignKey("runner_plans.id", ondelete="CASCADE"),
         nullable=False,
     )
     event_type: Mapped[str] = mapped_column(String(30), nullable=False)
     occurrence: Mapped[Optional[int]] = mapped_column(Integer)
     scheduled_for: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     runner_id: Mapped[Optional[str]] = mapped_column(
-        String(36), ForeignKey("benchmark_runners.id", ondelete="SET NULL")
+        String(36), ForeignKey("runners.id", ondelete="SET NULL")
     )
     message: Mapped[Optional[str]] = mapped_column(Text)
     details: Mapped[Dict[str, Any]] = mapped_column(
@@ -723,6 +758,11 @@ class Database:
 
 
 def _runner_dict(runner: BenchmarkRunnerRecord) -> Dict[str, Any]:
+    benchmark_document = dict(runner.benchmark_config)
+    if "concurrent_requests" in benchmark_document:
+        benchmark_document.setdefault(
+            "concurrent_workers", benchmark_document.pop("concurrent_requests")
+        )
     dispatch_lag = (
         (runner.started_at - runner.scheduled_for).total_seconds()
         if runner.started_at is not None and runner.scheduled_for is not None
@@ -730,6 +770,7 @@ def _runner_dict(runner: BenchmarkRunnerRecord) -> Dict[str, Any]:
     )
     return {
         "runner_id": runner.id,
+        "runtime_id": runner.runtime_id,
         "campaign_id": runner.campaign_id,
         "runner_plan_id": runner.runner_plan_id,
         "plan_occurrence": runner.plan_occurrence,
@@ -739,7 +780,7 @@ def _runner_dict(runner: BenchmarkRunnerRecord) -> Dict[str, Any]:
         "label": runner.label,
         "created_by": runner.created_by,
         "status": runner.status,
-        "benchmark": runner.benchmark_config,
+        "benchmark": benchmark_document,
         "metadata": runner.user_metadata,
         "created_at": runner.created_at,
         "started_at": runner.started_at,
@@ -750,8 +791,9 @@ def _runner_dict(runner: BenchmarkRunnerRecord) -> Dict[str, Any]:
         "summary": runner.summary,
         "request_count": runner.request_count,
         "error_message": runner.error_message,
-        "stdout": runner.stdout,
-        "stderr": runner.stderr,
+        "log_key": runner.log_key,
+        "stdout": None,
+        "stderr": None,
         "worker": {
             "process_id": None,
             "exit_code": runner.exit_code,
@@ -773,6 +815,7 @@ def _runner_list_dict(runner: BenchmarkRunnerRecord) -> Dict[str, Any]:
     )
     return {
         "runner_id": runner.id,
+        "runtime_id": runner.runtime_id,
         "campaign_id": runner.campaign_id,
         "runner_plan_id": runner.runner_plan_id,
         "plan_occurrence": runner.plan_occurrence,
@@ -812,6 +855,7 @@ def _runner_plan_dict(plan: BenchmarkRunnerPlanRecord) -> Dict[str, Any]:
     )
     return {
         "runner_plan_id": plan.id,
+        "runtime_id": plan.runtime_id,
         "campaign_id": plan.campaign_id,
         "name": plan.name,
         "status": plan.status,
@@ -887,11 +931,86 @@ def _dispatch_dict(dispatch: ExecutionNodeRecord) -> Dict[str, Any]:
     }
 
 
+class CampaignWorkerProgress(TypedDict):
+    planned: int
+    created: int
+    unknown_created: int
+    submitted: int
+    not_submitted: int
+    pending_results: int
+    succeeded: int
+    failed: int
+    cancelled: int
+    indeterminate: int
+    creation_phases: Dict[str, int]
+
+
 class RunnerRepository:
     """Transactional Runner state and result operations."""
 
-    def __init__(self, database: Database):
+    @staticmethod
+    async def _create_submission_runtime(
+        session: AsyncSession,
+        configuration: Optional[SubmissionRuntimeConfig],
+        created_by: str,
+        parent_id: Optional[str] = None,
+    ) -> SubmissionRuntimeRecord:
+        settings = configuration or SubmissionRuntimeConfig()
+        record = SubmissionRuntimeRecord(
+            id=str(uuid4()),
+            parent_id=parent_id,
+            configuration=settings.model_dump(mode="json"),
+            created_by=created_by,
+        )
+        session.add(record)
+        await session.flush()
+        return record
+
+    @staticmethod
+    async def _runtime_limits(
+        session: AsyncSession, runtime_id: Optional[str]
+    ) -> Dict[str, int]:
+        limits: Dict[str, int] = {}
+        visited: set[str] = set()
+        current_id = runtime_id
+        while current_id is not None:
+            if current_id in visited:
+                raise ValueError("Submission runtime parent cycle")
+            visited.add(current_id)
+            record = await session.get(SubmissionRuntimeRecord, current_id)
+            if record is None:
+                raise ValueError("Submission runtime is missing")
+            settings = SubmissionRuntimeConfig.model_validate(record.configuration)
+            if settings.concurrent_workers is not None:
+                limits[current_id] = settings.concurrent_workers
+            current_id = record.parent_id
+        return limits
+
+    async def get_submission_runtime(self, runtime_id: str) -> Optional[Dict[str, Any]]:
+        async with self.database.sessions() as session:
+            record = await session.get(SubmissionRuntimeRecord, runtime_id)
+            if record is None:
+                return None
+            return {
+                "runtime_id": record.id,
+                "parent_runtime_id": record.parent_id,
+                "configuration": record.configuration,
+                "limits": await self._runtime_limits(session, record.id),
+                "created_at": record.created_at,
+            }
+
+    def __init__(
+        self,
+        database: Database,
+        *,
+        log_directory: Optional[str] = None,
+        log_bytes_limit: int = 1_000_000,
+    ):
         self.database = database
+        resolved_log_directory = log_directory or os.environ.get(
+            "LLMPERF_LOG_DIRECTORY", "~/.local/state/llmperf/runner-logs"
+        )
+        self.log_store = RunnerLogStore(resolved_log_directory, log_bytes_limit)
         self.runtime_owner: Optional[str] = None
         self.runtime_generation = 0
         self.lease_seconds = 30
@@ -988,7 +1107,13 @@ class RunnerRepository:
                 if round_campaigns
                 else []
             )
-            instance_query = select(BenchmarkTaskInstanceRecord)
+            instance_query = select(BenchmarkTaskInstanceRecord).options(
+                load_only(
+                    BenchmarkTaskInstanceRecord.id,
+                    BenchmarkTaskInstanceRecord.state,
+                    BenchmarkTaskInstanceRecord.created_at,
+                )
+            )
             if runner_id is None:
                 instance_query = instance_query.where(
                     BenchmarkTaskInstanceRecord.state.in_(TASK_INSTANCE_PENDING_STATES)
@@ -1004,15 +1129,58 @@ class RunnerRepository:
                     BenchmarkTaskInstanceRecord.id == context.get("instance_id", "")
                 )
             instances = list((await session.execute(instance_query)).scalars())
+            # Fetch only the dependency frontier and its checkpoints. Future
+            # rounds can contain hundreds of thousands of nodes; materializing
+            # them on every timer tick blocks unrelated request completions.
+            # The coordinator still owns delay evaluation and activation.
+            frontier_ids = text(
+                """
+                WITH frontier AS MATERIALIZED (
+                    SELECT candidate.id, candidate.lineage
+                    FROM execution_nodes AS candidate
+                    WHERE candidate.task_instance_id = ANY(:instance_ids)
+                      AND candidate.state IN ('pending', 'blocked')
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements_text(
+                            COALESCE(candidate.lineage->'dependencies', '[]'::jsonb)
+                        ) AS dependency(id)
+                        LEFT JOIN execution_nodes AS parent
+                          ON parent.id = dependency.id
+                         AND parent.task_instance_id = candidate.task_instance_id
+                        WHERE parent.lineage->>'terminal_status'
+                                  IS DISTINCT FROM 'succeeded'
+                           OR parent.lineage->>'actual_completed_at' IS NULL
+                      )
+                )
+                SELECT id FROM frontier
+                UNION
+                SELECT dependency.id FROM frontier
+                CROSS JOIN LATERAL jsonb_array_elements_text(
+                    COALESCE(frontier.lineage->'dependencies', '[]'::jsonb)
+                ) AS dependency(id)
+                """
+            ).bindparams(
+                instance_ids=[
+                    instance.id
+                    for instance in instances
+                    if instance.state in TASK_INSTANCE_PENDING_STATES
+                ]
+            )
             node_rows = (
                 list(
                     (
                         await session.execute(
-                            select(ExecutionNodeRecord).where(
-                                ExecutionNodeRecord.task_instance_id.in_(
-                                    [instance.id for instance in instances]
+                            select(ExecutionNodeRecord)
+                            .options(
+                                load_only(
+                                    ExecutionNodeRecord.id,
+                                    ExecutionNodeRecord.task_instance_id,
+                                    ExecutionNodeRecord.state,
+                                    ExecutionNodeRecord.lineage,
                                 )
                             )
+                            .where(ExecutionNodeRecord.id.in_(frontier_ids))
                         )
                     ).scalars()
                 )
@@ -1122,6 +1290,7 @@ class RunnerRepository:
             runner.started_at = utcnow()
             runner.heartbeat_at = runner.started_at
             runner.scheduler_id = owner
+            runtime_limits = await self._runtime_limits(session, runner.runtime_id)
             session.add(
                 TaskAttemptRecord(
                     id=str(uuid4()),
@@ -1170,8 +1339,11 @@ class RunnerRepository:
                 execution_benchmark["input_messages"] = reused_messages
                 resolved_runner = _runner_dict(runner)
                 resolved_runner["benchmark"] = execution_benchmark
+                resolved_runner["runtime_limits"] = runtime_limits
                 return resolved_runner
-            return _runner_dict(runner)
+            admitted_runner = _runner_dict(runner)
+            admitted_runner["runtime_limits"] = runtime_limits
+            return admitted_runner
 
     @staticmethod
     def _event(runner_id: str, status: str, message: Optional[str] = None):
@@ -1297,6 +1469,7 @@ class RunnerRepository:
         created_by: str,
         campaign_id: Optional[str] = None,
         label: Optional[str] = None,
+        runtime: Optional[SubmissionRuntimeConfig] = None,
     ) -> Optional[Dict[str, Any]]:
         runner = RunnerRecordFactory.queued(
             benchmark_config=benchmark,
@@ -1306,10 +1479,16 @@ class RunnerRepository:
             label=label,
         )
         async with self.database.sessions() as session, session.begin():
+            parent_runtime_id: Optional[str] = None
             if campaign_id is not None:
                 campaign = await session.get(BenchmarkCampaignRecord, campaign_id)
                 if campaign is None:
                     return None
+                parent_runtime_id = campaign.runtime_id
+            submission_runtime = await self._create_submission_runtime(
+                session, runtime, created_by, parent_runtime_id
+            )
+            runner.runtime_id = submission_runtime.id
             session.add(runner)
             # No ORM relationship is declared between Runners and events. Flush the
             # parent explicitly so PostgreSQL never sees the event INSERT first.
@@ -1319,7 +1498,11 @@ class RunnerRepository:
         return _runner_dict(runner)
 
     async def create_runners(
-        self, campaign_id: str, runners: Sequence[Dict[str, Any]], created_by: str
+        self,
+        campaign_id: str,
+        runners: Sequence[Dict[str, Any]],
+        created_by: str,
+        runtime: Optional[SubmissionRuntimeConfig] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         records = [
             RunnerRecordFactory.from_template(
@@ -1333,6 +1516,11 @@ class RunnerRepository:
             campaign = await session.get(BenchmarkCampaignRecord, campaign_id)
             if campaign is None:
                 return None
+            submission_runtime = await self._create_submission_runtime(
+                session, runtime, created_by, campaign.runtime_id
+            )
+            for record in records:
+                record.runtime_id = submission_runtime.id
             session.add_all(records)
             # Establish every parent row before inserting FK-dependent events.
             await session.flush()
@@ -1349,6 +1537,7 @@ class RunnerRepository:
         description: Optional[str],
         tags: Dict[str, Any],
         created_by: str,
+        runtime: Optional[SubmissionRuntimeConfig] = None,
     ) -> Dict[str, Any]:
         campaign = BenchmarkCampaignRecord(
             id=str(uuid4()),
@@ -1358,6 +1547,10 @@ class RunnerRepository:
             created_by=created_by,
         )
         async with self.database.sessions() as session, session.begin():
+            submission_runtime = await self._create_submission_runtime(
+                session, runtime, created_by
+            )
+            campaign.runtime_id = submission_runtime.id
             session.add(campaign)
             await session.flush()
         return self._campaign_dict(campaign)
@@ -1371,6 +1564,7 @@ class RunnerRepository:
         runner_plans: Sequence[Dict[str, Any]],
         task_definitions: Sequence[Dict[str, Any]],
         created_by: str,
+        runtime: Optional[SubmissionRuntimeConfig] = None,
     ) -> Dict[str, Any]:
         """Create a Campaign and its validated workload in one transaction."""
 
@@ -1395,6 +1589,12 @@ class RunnerRepository:
         instance_records: List[BenchmarkTaskInstanceRecord] = []
         dispatch_records: List[ExecutionNodeRecord] = []
         async with self.database.sessions() as session, session.begin():
+            submission_runtime = await self._create_submission_runtime(
+                session, runtime, created_by
+            )
+            campaign.runtime_id = submission_runtime.id
+            for record in records:
+                record.runtime_id = submission_runtime.id
             database_now = utcnow()
             if runner_plans or task_definitions:
                 database_now = as_utc(
@@ -1412,6 +1612,17 @@ class RunnerRepository:
                     for runner_plan in runner_plans
                 ]
                 plans = [item[0] for item in plans_with_adjustments]
+                for plan_record, submitted_plan in zip(plans, runner_plans):
+                    plan_settings = SubmissionRuntimeConfig.model_validate(
+                        submitted_plan.get("runtime") or {}
+                    )
+                    if plan_settings.concurrent_workers is None:
+                        plan_record.runtime_id = submission_runtime.id
+                    else:
+                        plan_runtime = await self._create_submission_runtime(
+                            session, plan_settings, created_by, submission_runtime.id
+                        )
+                        plan_record.runtime_id = plan_runtime.id
             session.add(campaign)
             await session.flush()
             for submitted in task_definitions:
@@ -1436,10 +1647,9 @@ class RunnerRepository:
                     runner_template=submitted["runner_template"],
                 )
                 compiler = TaskCompiler(compile_context)
-                compilation_table = compiler.compile()
-                assemblies = TaskAssembler(
-                    compile_context, compilation_table
-                ).assemble()
+                compilation_table = await asyncio.to_thread(compiler.compile)
+                assembler = TaskAssembler(compile_context, compilation_table)
+                assemblies = await asyncio.to_thread(assembler.assemble)
                 for assembly in assemblies:
                     instance_records.append(
                         BenchmarkTaskInstanceRecord(
@@ -1460,6 +1670,9 @@ class RunnerRepository:
                         )
                     )
                     for node in assembly.nodes:
+                        if len(dispatch_records) % 256 == 0:
+                            # Keep runtime lease renewal responsive during large submissions.
+                            await asyncio.sleep(0)
                         dispatch_records.append(
                             ExecutionNodeRecord(
                                 id=node.dispatch_id,
@@ -1503,8 +1716,9 @@ class RunnerRepository:
             # an ORM relationship. Establish every parent row explicitly before the
             # dependent Dispatch INSERT batch so flush ordering is deterministic.
             await session.flush()
-            session.add_all(dispatch_records)
-            await session.flush()
+            for batch_start in range(0, len(dispatch_records), 1000):
+                session.add_all(dispatch_records[batch_start : batch_start + 1000])
+                await session.flush()
             session.add_all(
                 self._event(runner.id, QUEUED, "Runner accepted in Campaign")
                 for runner in records
@@ -1522,6 +1736,7 @@ class RunnerRepository:
             await session.flush()
         return {
             "campaign": self._campaign_dict(campaign),
+            "runtime_id": campaign.runtime_id,
             "summary": {
                 "immediate_runners": len(records),
                 "runner_plans": len(plans),
@@ -1542,6 +1757,7 @@ class RunnerRepository:
         payload: Dict[str, Any],
         runner_template: Dict[str, Any],
         created_by: str,
+        runtime: Optional[SubmissionRuntimeConfig] = None,
     ) -> Optional[Dict[str, Any]]:
         async with self.database.sessions() as session, session.begin():
             campaign = await session.get(BenchmarkCampaignRecord, campaign_id)
@@ -1557,6 +1773,10 @@ class RunnerRepository:
                 created_by,
                 database_now,
             )
+            submission_runtime = await self._create_submission_runtime(
+                session, runtime, created_by, campaign.runtime_id
+            )
+            plan.runtime_id = submission_runtime.id
             session.add(plan)
             await session.flush()
             session.add(
@@ -1729,6 +1949,20 @@ class RunnerRepository:
         planner_id: Optional[str],
     ) -> None:
         runner = RunnerRecordFactory.from_dispatch(dispatch)
+        if dispatch.runner_plan_id is not None:
+            source_plan = await session.get(
+                BenchmarkRunnerPlanRecord, dispatch.runner_plan_id
+            )
+            if source_plan is None:
+                raise ValueError("Dispatch has no owning RunnerPlan")
+            runner.runtime_id = source_plan.runtime_id
+        else:
+            source_campaign = await session.get(
+                BenchmarkCampaignRecord, dispatch.campaign_id
+            )
+            if source_campaign is None:
+                raise ValueError("Dispatch has no owning Campaign")
+            runner.runtime_id = source_campaign.runtime_id
         members = [dispatch]
         session.add(runner)
         await session.flush()
@@ -1926,6 +2160,7 @@ class RunnerRepository:
             "campaign_id": campaign.id,
             "name": campaign.name,
             "description": campaign.description,
+            "runtime_id": campaign.runtime_id,
             "tags": campaign.tags,
             "created_by": campaign.created_by,
             "created_at": campaign.created_at,
@@ -2302,6 +2537,90 @@ class RunnerRepository:
             runner = await session.get(BenchmarkRunnerRecord, runner_id)
             return _runner_dict(runner) if runner is not None else None
 
+    async def campaign_worker_progress(
+        self, campaign_ids: Sequence[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return one aggregate per Campaign, independent of its Runner count."""
+        progress: Dict[str, CampaignWorkerProgress] = {
+            campaign_id: CampaignWorkerProgress(
+                planned=0,
+                created=0,
+                unknown_created=0,
+                submitted=0,
+                not_submitted=0,
+                pending_results=0,
+                succeeded=0,
+                failed=0,
+                cancelled=0,
+                indeterminate=0,
+                creation_phases={},
+            )
+            for campaign_id in campaign_ids
+        }
+        if not campaign_ids:
+            return {}
+        created = BenchmarkRunnerRecord.summary["worker_creation"][
+            "created"
+        ].as_integer()
+        statement = (
+            select(
+                BenchmarkRunnerRecord.campaign_id,
+                BenchmarkRunnerRecord.status,
+                func.count(),
+                func.sum(BenchmarkRunnerRecord.planned_workers),
+                func.sum(func.coalesce(created, 0)),
+                func.sum(case((created.is_(None), 1), else_=0)),
+            )
+            .where(BenchmarkRunnerRecord.campaign_id.in_(campaign_ids))
+            .group_by(BenchmarkRunnerRecord.campaign_id, BenchmarkRunnerRecord.status)
+        )
+        worker_statement = (
+            select(
+                BenchmarkRunnerRecord.campaign_id,
+                WorkerStepRecord.state,
+                func.count(),
+            )
+            .join(
+                WorkerStepRecord, WorkerStepRecord.runner_id == BenchmarkRunnerRecord.id
+            )
+            .where(BenchmarkRunnerRecord.campaign_id.in_(campaign_ids))
+            .group_by(BenchmarkRunnerRecord.campaign_id, WorkerStepRecord.state)
+        )
+        async with self.database.sessions() as session:
+            for (
+                campaign_id,
+                runner_state,
+                count,
+                planned,
+                known_created,
+                unknown,
+            ) in await session.execute(statement):
+                item = progress[campaign_id]
+                item["planned"] += int(planned)
+                item["created"] += int(known_created)
+                item["unknown_created"] += int(unknown) if runner_state != QUEUED else 0
+                item["creation_phases"][
+                    "waiting" if runner_state == QUEUED else runner_state
+                ] = int(count)
+            for campaign_id, worker_state, count in await session.execute(
+                worker_statement
+            ):
+                item = progress[campaign_id]
+                item["submitted"] += int(count)
+                if worker_state == "submitted":
+                    item["pending_results"] += int(count)
+                elif worker_state == "succeeded":
+                    item["succeeded"] += int(count)
+                elif worker_state == "failed":
+                    item["failed"] += int(count)
+                elif worker_state == "cancelled":
+                    item["cancelled"] += int(count)
+                elif worker_state == "indeterminate":
+                    item["indeterminate"] += int(count)
+        for item in progress.values():
+            item["not_submitted"] = max(0, item["planned"] - item["submitted"])
+        return {campaign_id: dict(item) for campaign_id, item in progress.items()}
+
     async def worker_progress(
         self, *, campaign_ids: Sequence[str] = (), runner_ids: Sequence[str] = ()
     ) -> Dict[str, Dict[str, Any]]:
@@ -2390,14 +2709,18 @@ class RunnerRepository:
             serializer = _runner_dict if full else _runner_list_dict
             return [serializer(row) for row in rows]
 
+    async def read_logs(self, key: Optional[str]) -> Dict[str, Optional[str]]:
+        return await asyncio.to_thread(self.log_store.read, key)
+
     async def set_logs(
         self, runner_id: str, exit_code: int, stdout: str, stderr: str
     ) -> None:
+        log_key = await asyncio.to_thread(self.log_store.write, stdout, stderr)
         async with self.database.sessions() as session, session.begin():
             await session.execute(
                 update(BenchmarkRunnerRecord)
                 .where(BenchmarkRunnerRecord.id == runner_id)
-                .values(exit_code=exit_code, stdout=stdout, stderr=stderr)
+                .values(exit_code=exit_code, log_key=log_key)
             )
 
     async def heartbeat(self, runner_id: str) -> bool:
@@ -2615,18 +2938,22 @@ class RunnerRepository:
                 checkpoint["payload_evidence"] = payload_evidence
             instance.checkpoint = json_safe(checkpoint)
 
-        dispatch_rows_statement = self._task_dispatch_rows_statement(instance_id)
-        rows = list((await session.execute(dispatch_rows_statement)).all())
-        instance.state = (
-            "completed"
-            if rows
-            and all(
-                dispatch.state == "emitted"
-                and (dispatch.lineage or {}).get("terminal_status") == SUCCEEDED
-                for dispatch, _ in rows
+        # The instance row already serializes checkpoints. Do not load every
+        # request template and result merely to check for an unfinished sibling.
+        unfinished_node = await session.scalar(
+            select(ExecutionNodeRecord.id)
+            .where(
+                ExecutionNodeRecord.task_instance_id == instance_id,
+                or_(
+                    ExecutionNodeRecord.state != "emitted",
+                    ExecutionNodeRecord.lineage[
+                        "terminal_status"
+                    ].astext.is_distinct_from(SUCCEEDED),
+                ),
             )
-            else "active"
+            .limit(1)
         )
+        instance.state = "completed" if unfinished_node is None else "active"
         instance.error = None
 
     @staticmethod
@@ -2819,7 +3146,6 @@ class RunnerRepository:
                     generation=self.runtime_generation,
                     state="submitted",
                     submitted_at=utcnow(),
-                    request=json_safe(step.request.model_dump(mode="json")),
                 )
             )
         return True
@@ -2844,11 +3170,14 @@ class RunnerRepository:
                     "request": result.response[2].model_dump(mode="json"),
                 }
             )
+            completion_hash = hashlib.sha256(
+                json.dumps(output, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
             if record.state != "submitted":
-                return record.result == output
+                return record.completion_hash == completion_hash
             record.state = SUCCEEDED if result.succeeded else FAILED
             record.completed_at = result.completed_at
-            record.result = output
+            record.completion_hash = completion_hash
             session.add(
                 MessageRecord(
                     id=str(
@@ -2880,6 +3209,7 @@ class RunnerRepository:
     ) -> bool:
         if terminal_status not in {SUCCEEDED, FAILED}:
             raise ValueError(f"Unsupported result status: {terminal_status}")
+        log_key = await asyncio.to_thread(self.log_store.write, stdout, stderr)
         safe_summary = json_safe(summary)
         safe_requests = [json_safe(item) for item in request_metrics]
         async with self.database.sessions() as session, session.begin():
@@ -2974,8 +3304,7 @@ class RunnerRepository:
                     exit_code=exit_code,
                     summary=safe_summary,
                     request_count=len(safe_requests),
-                    stdout=stdout,
-                    stderr=stderr,
+                    log_key=log_key,
                     error_message=error_message,
                 )
             )
@@ -3009,6 +3338,7 @@ class RunnerRepository:
     ) -> bool:
         if status not in {FAILED, CANCELLED}:
             raise ValueError(f"Unsupported terminal status: {status}")
+        log_key = await asyncio.to_thread(self.log_store.write, stdout, stderr)
         async with self.database.sessions() as session, session.begin():
             await self._check_runtime(session)
             statement = (
@@ -3028,8 +3358,7 @@ class RunnerRepository:
             runner.heartbeat_at = finished_at
             runner.exit_code = exit_code
             runner.error_message = message
-            runner.stdout = stdout
-            runner.stderr = stderr
+            runner.log_key = log_key
             await session.execute(
                 update(WorkerStepRecord)
                 .where(

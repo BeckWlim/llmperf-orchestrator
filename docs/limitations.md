@@ -8,6 +8,15 @@ The suffix batch seed derives from that family seed, trial index, and run node p
 Calibrated generation additionally derives a suffix seed for each request index.
 Named inputs namespace prefix seeds by input name.
 
+An explicit `run.prefix_seed` overrides prefix derivation and passes its integer
+unchanged to generation, including named inputs. It may be a literal, matrix
+reference, or deterministic `{pick: [...]}` selection. Picks are with replacement.
+`{pick: {seed: PARENT, count: SIZE}}` generates the finite pool deterministically.
+The parent seed controls pool membership independently of the task selection seed.
+Selection occurs once per Runner; equal seeds can recur within and across rounds. Input configuration
+must still match to reproduce text. The task seed and expanded node path select the
+pool entry but do not modify the chosen seed. Suffix derivation stays separate.
+
 ```text
 task seed + matrix coordinates -> family prefix seed -> stable prefix
 family prefix seed + trial + node path -> suffix seed -> request suffixes
@@ -42,7 +51,7 @@ through both stages. No separate preparation actors are started on this path.
 request actors, so this update does not silently increase the shared slot count.
 
 The request pool remains independently bounded: eight request actors with eight
-slots each provide 64 simultaneous requests. Explicit Runner `concurrent_requests`
+slots each provide 64 simultaneous requests. Explicit Runner `concurrent_workers`
 bounds outstanding Workers, including admission waits. A value of 1 allows one
 outstanding Worker from that Runner. Omitting it delegates capacity to shared
 Worker admission.
@@ -56,7 +65,7 @@ from one Runner therefore does not outrank other queued Runners.
 This fairness applies to ready, waiting work. It does not preempt requests already
 running, reserve slots for Runners still preparing, or guarantee equal completion
 rates when request lengths differ. It also does not guarantee uniform seed-family
-sampling. Pressure workloads may omit `concurrent_requests`; fairness must not
+sampling. Pressure workloads may omit `concurrent_workers`; fairness must not
 depend on configuring that optional per-Runner ceiling.
 The basic-pressure workload explicitly sets it to 8 as a defensive bound on
 outstanding Workers per Runner. This does not reserve eight slots or move fairness
@@ -161,7 +170,7 @@ All cycles are expanded and persisted upfront without preparing prompts. Cycles 
 Runners per cycle must not exceed 10,000; there is no unbounded mode or lazy cycle
 materialization. `rounds.count` limits work, not elapsed time. Budget throughput,
 Runner deadlines, database results and export volume. Active Runner limits do not
-bypass phase barriers or Worker slots. `request.repeat` repeats within a Runner,
+bypass phase barriers or Worker slots. `worker.repeat` repeats within a Runner,
 not across global phases or cycles.
 
 The optional recall profiles use this configuration-only pattern:

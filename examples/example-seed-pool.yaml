@@ -1,0 +1,44 @@
+version: 1.0.0
+wait: true
+campaign:
+  name: seed-pool-rounds
+  description: Two sequential groups of four Runners draw prefixes from eight seeds.
+task_definitions:
+- name: recall
+  instances:
+    trials: 1
+    seed: 20261021
+  workflow:
+  - repeat:
+      name: rounds
+      count: 2
+      node:
+        parallel:
+          name: members
+          count: 4
+          node:
+            run:
+              name: batch
+              prefix_seed:
+                pick:
+                  seed: 20261020
+                  count: 8
+  runner:
+    label: recall
+    provider: dfs-chat
+    model: spark-x2.5-1.7b-L4
+    tokenizer:
+      id: hf-internal-testing/llama-tokenizer
+      revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0
+    timeout: 60
+    concurrent_workers: 2
+    mean_output_tokens: 8
+    stddev_output_tokens: 0
+    additional_sampling_params:
+      temperature: 0
+    inputs:
+      default:
+        tokens: 128
+        shared_prefix_tokens: 96
+    worker:
+      repeat: 4

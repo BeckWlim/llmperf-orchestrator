@@ -331,3 +331,45 @@ def test_literal_history(monkeypatch):
         "question",
     ]
     assert prepared.metadata["history_version"] == 2
+
+
+@pytest.mark.parametrize(
+    "literal", [None, "a literal input that changes between requests"]
+)
+def test_default_estimation(monkeypatch, literal):
+    from llmperf_backend.configuration.models import BenchmarkRunnerSpec
+
+    assert BenchmarkRunnerSpec().input_token_count == "estimate"
+    tokenizer = Mock(wraps=Tokenizer())
+    monkeypatch.setattr(
+        "llmperf_backend.runtime.worker_input._prepared_tokenizer",
+        lambda *args: tokenizer,
+    )
+    environment = {TOKENIZER_PATH: "general-tokenizer"}
+    preparer = WorkerInputPreparer()
+    initial_benchmark = benchmark(prompt=literal)
+    initial_request = worker_steps(initial_benchmark)[0].request
+    first = preparer.prepare(initial_request, environment)
+    initial_calls = tokenizer.encode.call_count
+    assert initial_calls > 0
+    later_benchmark = benchmark(
+        prompt=literal, dataset_seed=321, shared_prefix_seed=4321
+    )
+    later = preparer.prepare(worker_steps(later_benchmark)[0].request, environment)
+    assert tokenizer.encode.call_count == initial_calls
+    assert first.metadata is not None and later.metadata is not None
+    assert (
+        first.metadata["prompt_evidence"]["input_count_source"] == "calibrated_estimate"
+    )
+    assert (
+        later.metadata["prompt_evidence"]["input_count_source"] == "calibrated_estimate"
+    )
+    exact_benchmark = benchmark(prompt=literal, input_token_count="tokenizer")
+    exact_request = worker_steps(exact_benchmark)[0].request
+    exact = preparer.prepare(exact_request, environment)
+    assert exact.metadata is not None
+    after_exact = tokenizer.encode.call_count
+    assert after_exact > initial_calls
+    preparer.prepare(exact_request, environment)
+    assert tokenizer.encode.call_count > after_exact
+    assert exact.metadata["prompt_evidence"]["input_count_source"] == "tokenizer"

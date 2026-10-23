@@ -62,6 +62,26 @@ def _indexed_dataset(source: PromptDatasetSource) -> PromptDataset:
     return load_prompt_dataset(source)
 
 
+def calibrate_corpus(
+    tokenizer: Encoder, source: PromptDatasetSource
+) -> CorpusCalibration:
+    """Measure one bounded sample; reuse its ratio for subsequent requests."""
+    dataset = _indexed_dataset(source)
+    sample_positions = random.Random(0).sample(
+        range(len(dataset.records)), min(128, len(dataset.records))
+    )
+    sampled_characters = 0
+    sampled_tokens = 0
+    for position in sample_positions:
+        _, record_text = dataset.records[position]
+        sample_text = (record_text + dataset.separator)[:4096]
+        sampled_characters += len(sample_text)
+        sampled_tokens += len(tokenizer.encode(sample_text, add_special_tokens=False))
+    if sampled_characters == 0 or sampled_tokens == 0:
+        raise ValueError("Prompt dataset cannot calibrate token estimates")
+    return CorpusCalibration(sampled_characters / sampled_tokens, len(sample_positions))
+
+
 def _assemble_dataset(
     dataset: PromptDataset, characters_per_token: float, budget: int, seed: int
 ) -> Tuple[str, List[int]]:
@@ -127,26 +147,9 @@ def calibrate(
     prefix_seed = seed if shared_prefix_seed is None else shared_prefix_seed
     if source is not None and source.is_external:
         dataset = _indexed_dataset(source)
-        if calibration is None:
-            sample_positions = random.Random(0).sample(
-                range(len(dataset.records)), min(128, len(dataset.records))
-            )
-            sampled_characters = 0
-            sampled_tokens = 0
-            for position in sample_positions:
-                _, record_text = dataset.records[position]
-                sample_text = (record_text + dataset.separator)[:4096]
-                sampled_characters += len(sample_text)
-                sampled_tokens += len(
-                    tokenizer.encode(sample_text, add_special_tokens=False)
-                )
-            if sampled_characters == 0 or sampled_tokens == 0:
-                raise ValueError("Prompt dataset cannot calibrate token estimates")
-            characters_per_token = sampled_characters / sampled_tokens
-            calibration_records = len(sample_positions)
-        else:
-            characters_per_token = calibration.characters_per_token
-            calibration_records = calibration.record_count
+        corpus_calibration = calibration or calibrate_corpus(tokenizer, source)
+        characters_per_token = corpus_calibration.characters_per_token
+        calibration_records = corpus_calibration.record_count
         prefix, prefix_indices = _assemble_dataset(
             dataset, characters_per_token, shared_prefix_tokens, prefix_seed
         )
@@ -167,11 +170,19 @@ def calibrate(
     dataset = load_prompt_dataset(PromptDatasetSource.builtin_sonnet())
     records = tuple(text + dataset.separator for _, text in dataset.records)
     lengths = tuple(
-        max(1, len(tokenizer.encode(text, add_special_tokens=False)))
+        (
+            max(1, round(len(text) / calibration.characters_per_token))
+            if calibration is not None
+            else max(1, len(tokenizer.encode(text, add_special_tokens=False)))
+        )
         for text in records
     )
     instruction = dataset.instruction(output_tokens)
-    instruction_tokens = len(tokenizer.encode(instruction, add_special_tokens=False))
+    instruction_tokens = (
+        round(len(instruction) / calibration.characters_per_token)
+        if calibration is not None
+        else len(tokenizer.encode(instruction, add_special_tokens=False))
+    )
     prefix_budget = max(instruction_tokens, shared_prefix_tokens)
     prefix_body, _ = _assemble(
         records, lengths, prefix_budget - instruction_tokens, prefix_seed

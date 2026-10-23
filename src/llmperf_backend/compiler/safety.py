@@ -133,14 +133,16 @@ def _benchmark_cost(
     if probe:
         requests = int(probe["trials"]) * (1 + int(probe.get("repeats_after_prime", 1)))
         concurrency = min(
-            int(benchmark.get("concurrent_requests") or scheduler_capacity),
+            int(benchmark.get("concurrent_workers") or scheduler_capacity),
             int(probe["trials"]),
         )
     else:
         requests = planned_worker_count(benchmark)
         concurrency = min(
-            int(benchmark.get("concurrent_requests") or scheduler_capacity), requests
+            int(benchmark.get("concurrent_workers") or scheduler_capacity), requests
         )
+        if benchmark.get("every") is not None:
+            concurrency = min(concurrency, 1)
     return {
         "requests": requests,
         "tokens": planned_token_budget(benchmark),
@@ -197,11 +199,14 @@ def assess_workload(
     ray_actor_capacity: Optional[int] = None,
     now: Optional[datetime] = None,
     ray_actor_max_concurrency: int = 1,
+    runtime_concurrent_workers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Always check request limits; enforce campaign totals only when opted in."""
 
     if ray_actor_max_concurrency < 1:
         raise ValueError("ray_actor_max_concurrency must be positive")
+    if runtime_concurrent_workers is not None and runtime_concurrent_workers < 1:
+        raise ValueError("Runtime concurrent_workers must be positive")
     assessed_at = now or datetime.now(UTC)
     scheduler_capacity = (
         ray_actor_capacity * ray_actor_max_concurrency
@@ -246,8 +251,8 @@ def assess_workload(
         template = item.get("runner_template", embedded_runner)
         benchmark = template.get("benchmark")
         estimated_benchmark = (
-            {**benchmark, "concurrent_requests": scheduler_capacity}
-            if benchmark is not None and benchmark.get("concurrent_requests") is None
+            {**benchmark, "concurrent_workers": scheduler_capacity}
+            if benchmark is not None and benchmark.get("concurrent_workers") is None
             else benchmark
         )
         expansion = TaskCompiler.estimate(
@@ -285,6 +290,8 @@ def assess_workload(
         min(total["planned_runners"], scheduler_slots)
         * total["max_runner_concurrency"],
     )
+    if runtime_concurrent_workers is not None:
+        effective_concurrency = min(effective_concurrency, runtime_concurrent_workers)
     requested_concurrency = effective_concurrency
     if ray_actor_capacity is not None:
         effective_concurrency = min(

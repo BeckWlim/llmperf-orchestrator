@@ -13,6 +13,24 @@ from llmperf_backend.configuration.models import SchedulerConfig
 @pytest.mark.parametrize("age", [1.0, 30.0])
 def test_campaign_progress(age):
     repository = Mock()
+    repository.campaign_worker_progress = AsyncMock(
+        return_value={
+            campaign: {
+                "planned": 10 * count,
+                "created": 0,
+                "unknown_created": count,
+                "submitted": 4 * count,
+                "not_submitted": 6 * count,
+                "pending_results": 2 * count,
+                "succeeded": count,
+                "failed": count,
+                "cancelled": 0,
+                "indeterminate": 0,
+                "creation_phases": {"running": count},
+            }
+            for campaign, count in (("a", 2), ("b", 1))
+        }
+    )
     repository.worker_progress = AsyncMock(
         return_value={
             identifier: {
@@ -52,6 +70,10 @@ def test_campaign_progress(age):
     }
     records: list[dict[str, JsonValue]] = [{"campaign_id": "a"}, {"campaign_id": "b"}]
     asyncio.run(attach_progress(records, repository, scheduler, campaigns=True))
+    repository.campaign_worker_progress.assert_awaited_once_with(["a", "b"])
+    repository.worker_progress.assert_awaited_once_with(
+        runner_ids=["one", "two", "three"]
+    )
     first = records[0]["workers"]
     second = records[1]["workers"]
     slots = records[0]["request_slots"]

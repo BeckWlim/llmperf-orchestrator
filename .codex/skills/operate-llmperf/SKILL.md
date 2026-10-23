@@ -43,7 +43,7 @@ Apply these invariants:
    the stable provider ID and model ID in workload YAML.
 7. Each compiled invoke sends one request and completes independently. A compiled `run`
    dispatches a multi-request Runner and advances after its aggregate success commits.
-   Batch nodes expand `request.repeat` and `request.steps` into atomic Workers. Parallel invokes
+   Batch nodes expand `worker.repeat` and `worker.steps` into atomic Workers. Parallel invokes
    share actor capacity dynamically instead of waiting for a static group. Role names are
    metadata. `depends_on` requires committed success; `reuse_messages` optionally combines
    source message lists in declaration order. Runner cancels unsubmitted descendants of a
@@ -52,7 +52,7 @@ Apply these invariants:
 8. Distinguish Campaign lifecycle `status` from aggregate execution `outcome`.
    Never infer that `completed` means every Runner succeeded.
 9. The Runner message bus persists outputs and timer events. The reconciliation notifier
-   only carries disposable wakeup hints. An omitted `concurrent_requests` leaves capacity
+   only carries disposable wakeup hints. An omitted `concurrent_workers` leaves capacity
    to Scheduler; an explicit value bounds outstanding Workers. Interrupted Runners are
    indeterminate, not resumed automatically from mailbox receipts.
 

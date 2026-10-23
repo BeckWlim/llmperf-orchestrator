@@ -18,6 +18,8 @@ configurable concurrency, and per-request results stored in PostgreSQL.
 - **Composable experiments:** combine sequences, parallel branches, repeats, delay
   matrices, and deterministic payload replay. Task `run` steps execute multi-request
   Runners, letting families advance through independent batch sequences.
+  [Seed pools](examples/example-seed-pool.yaml) and counted parallel groups express
+  large workloads compactly, with one reproducible prefix selection per Runner.
 - **Multi-turn conversations:** pass committed message history between ordered invokes.
 - **Performance evidence:** measure latency, throughput, errors, and available cache
   counters; export JSON and prepare HTML reports.
@@ -143,7 +145,8 @@ to prepare an HTML report.
 - [Performance guard: defaults, budgets, and runtime controls](docs/runtime.md#performance-guard)
 - [systemd deployment](deploy/systemd/README.md) · [Testing](docs/testing.md)
 
-Existing installations: the Backend checks required tables and columns. For older
+Release 1.0.1 requires a schema cutover from older installations; workload and export
+document-format markers remain `1.0.0`. The Backend checks required tables and columns. For older
 database layouts, follow the [cutover guidance](docs/runtime.md#recovery-and-cutover).
 Provider definitions now require a Provider file; migrate former `backend.env` profile
 fields using the [migration table](docs/usage.md#migrating-environment-defined-providers).
@@ -157,7 +160,7 @@ pytest -q
 ```
 
 Runner owns Provider/model/tokenizer, generation settings, and named `inputs`.
-`request` defines Worker execution logic: repetition, steps, dependencies, timing, and
+`worker` defines Worker execution logic: repetition, steps, dependencies, timing, and
 message composition. Runner handles failure cancellation; Scheduler owns request slots.
 See the [definition rules](docs/tasks.md#runner-data-and-request-logic) and
 [message merge example](examples/example-message-merge.yaml).

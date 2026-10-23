@@ -24,6 +24,7 @@ scheduler:
   cancel_grace_seconds: "${LLMPERF_RUNNER_GRACE:-5.0}"
   stale_after_seconds: "${LLMPERF_RUNNER_STALE:-300}"
   log_bytes_limit: "${LLMPERF_LOG_LIMIT:-1000000}"
+  log_directory: "${LLMPERF_LOG_DIRECTORY:-~/.local/state/llmperf/runner-logs}"
   # Empty starts one Backend-owned shared Ray runtime; otherwise connect externally.
   ray_address: "${LLMPERF_RAY_ADDRESS:-}"
   ray_num_cpus: "${LLMPERF_RAY_CPUS:-8}"
@@ -91,7 +92,7 @@ benchmark:
     revision: main
     use_fast: true
   timeout: "${LLMPERF_TIMEOUT_SECONDS:-90}"
-  concurrent_requests: ${LLMPERF_CONCURRENT_REQUESTS:-null}
+  concurrent_workers: ${LLMPERF_CONCURRENT_REQUESTS:-null}
   mean_input_tokens: "${LLMPERF_INPUT_MEAN:-550}"
   stddev_input_tokens: "${LLMPERF_INPUT_STD:-150}"
   shared_prefix_tokens: "${LLMPERF_PREFIX_TOKENS:-0}"
@@ -101,4 +102,5 @@ benchmark:
   mean_output_tokens: "${LLMPERF_OUTPUT_MEAN:-150}"
   stddev_output_tokens: "${LLMPERF_OUTPUT_STD:-80}"
   output_token_count: provider
+  input_token_count: estimate
   additional_sampling_params: {}
