@@ -66,6 +66,9 @@ class SchedulerRepository(RuntimeRepository, DispatchRepository, Protocol):
     async def requeue_stale(self, stale_after_seconds: int) -> int: ...
 
     async def heartbeat(self, runner_id: str) -> bool: ...
+    async def heartbeat_runners(
+        self, runner_ids: Sequence[str], *, refresh: bool = True
+    ) -> set[str]: ...
 
     async def complete_runner(
         self,
@@ -94,6 +97,7 @@ class SchedulerRepository(RuntimeRepository, DispatchRepository, Protocol):
     async def requeue_runner(self, runner_id: str, message: str) -> None: ...
 
     async def acquire_runtime(self, owner: str) -> None: ...
+    async def renew_runtime(self) -> None: ...
     async def release_runtime(self) -> None: ...
 
 
@@ -130,6 +134,9 @@ class Scheduler:
         self._busy_runners = self._runner_admission.active
         self._execution_tasks: set[asyncio.Task[None]] = set()
         self._stop: Optional[asyncio.Event] = None
+        self._maintenance_task: Optional[asyncio.Task[None]] = None
+        self._runner_cancellations: dict[str, asyncio.Event] = {}
+        self._runtime_error: Optional[str] = None
         self._ray_module: Any = None
         self._ray_context: Any = None
         self._ray_address: Optional[str] = None
@@ -168,17 +175,31 @@ class Scheduler:
             LOGGER.info("Scheduler %s is disabled", self.scheduler_id)
             return
         self._stop = asyncio.Event()
+        runtime_acquired = False
         try:
             await self._start_ray_runtime()
             await self.repository.acquire_runtime(self.scheduler_id)
+            runtime_acquired = True
+            self._runtime_error = None
+            self._maintenance_task = asyncio.create_task(
+                self._maintain_runtime(), name="llmperf-runtime-maintenance"
+            )
             await self.repository.requeue_stale(self.config.stale_after_seconds)
             await self.coordinator.start()
+            if self._stop.is_set():
+                raise RuntimeError("Runtime maintenance failed during startup")
             self._runner_tasks = [
                 asyncio.create_task(self._worker(0), name="llmperf-runner-admission")
             ]
         except Exception:
+            await self._stop_maintenance()
             await self.coordinator.stop()
             await self._stop_ray_runtime()
+            if runtime_acquired:
+                try:
+                    await self.repository.release_runtime()
+                except Exception:
+                    LOGGER.exception("Failed to release runtime after startup failure")
             self._stop = None
             raise
         LOGGER.info(
@@ -199,6 +220,7 @@ class Scheduler:
             execution_task.cancel()
         await asyncio.gather(*self._execution_tasks, return_exceptions=True)
         self._execution_tasks.clear()
+        await self._stop_maintenance()
         if self._ray_monitor_task is not None:
             self._ray_monitor_task.cancel()
             await asyncio.gather(self._ray_monitor_task, return_exceptions=True)
@@ -211,6 +233,49 @@ class Scheduler:
         self._stop = None
         self._atomic_executor.shutdown(wait=False, cancel_futures=True)
         LOGGER.info("Scheduler %s stopped", self.scheduler_id)
+
+    async def _stop_maintenance(self) -> None:
+        if self._maintenance_task is not None:
+            self._maintenance_task.cancel()
+            await asyncio.gather(self._maintenance_task, return_exceptions=True)
+            self._maintenance_task = None
+
+    async def _maintain_runtime(self) -> None:
+        """Renew one lease and batch heartbeats/cancellation checks for all Runners."""
+        loop = asyncio.get_running_loop()
+        next_renewal_at = loop.time()
+        next_heartbeat_at = loop.time()
+        heartbeat_seconds = min(5.0, self.config.stale_after_seconds / 3.0)
+        try:
+            while self._stop is not None and not self._stop.is_set():
+                if loop.time() >= next_renewal_at:
+                    await self.repository.renew_runtime()
+                    next_renewal_at = loop.time() + 5.0
+                refresh = loop.time() >= next_heartbeat_at
+                runner_ids = tuple(self._runner_cancellations)
+                for offset in range(0, len(runner_ids), 128):
+                    cancelled = await self.repository.heartbeat_runners(
+                        runner_ids[offset : offset + 128], refresh=refresh
+                    )
+                    for runner_id in cancelled:
+                        cancellation = self._runner_cancellations.get(runner_id)
+                        if cancellation is not None:
+                            cancellation.set()
+                if refresh:
+                    next_heartbeat_at = loop.time() + heartbeat_seconds
+                await asyncio.sleep(
+                    min(self.config.poll_interval_seconds, heartbeat_seconds, 5.0)
+                )
+        except Exception as exc:
+            self._runtime_error = type(exc).__name__
+            LOGGER.exception(
+                "Runtime maintenance failed; stopping admission and execution"
+            )
+            if self._stop is not None:
+                self._stop.set()
+            for task in (*self._runner_tasks, *self._execution_tasks):
+                task.cancel()
+            await self.coordinator.stop()
 
     def status(self) -> Dict[str, Any]:
         state = (
@@ -230,7 +295,7 @@ class Scheduler:
             "active_runners": active_runners,
             "waiting_runners": len(set(self._active_workers) - self._busy_runners),
             "request_pool": dict(self._pool_status),
-            "runtime_error": self.coordinator.last_error,
+            "runtime_error": self._runtime_error or self.coordinator.last_error,
             "worker_kind": "atomic_requests",
             "active_workers": (
                 len(self._dispatcher.active)
@@ -378,6 +443,8 @@ class Scheduler:
         )
 
     async def _stop_ray_runtime(self) -> None:
+        if self._dispatcher is not None:
+            await self._dispatcher.reconciler.close()
         ray = self._ray_module
         self._ray_healthy = False
         self._ray_object_store_tripped = False
@@ -654,27 +721,33 @@ class Scheduler:
     async def _wait_worker(
         self, worker: Worker | RunnerPreparation, runner_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Listen for one Worker result while polling durable cancellation state."""
+        """Listen for a result or cancellation delivered by shared maintenance."""
 
         if self._stop is None:
             raise RuntimeError("Scheduler must be started before supervising Workers")
         result_task = asyncio.create_task(
             worker.result_async(), name=f"llmperf-worker-result-{runner_id}"
         )
+        cancellation = self._runner_cancellations.setdefault(runner_id, asyncio.Event())
+        cancelled_task = asyncio.create_task(cancellation.wait())
+        stopping_task = asyncio.create_task(self._stop.wait())
         try:
-            while not self._stop.is_set():
-                completed_tasks, _ = await asyncio.wait(
-                    {result_task}, timeout=self.config.poll_interval_seconds
-                )
-                if completed_tasks:
-                    return result_task.result()
-                if await self.repository.heartbeat(runner_id):
-                    return None
-            raise asyncio.CancelledError
+            completed_tasks, _ = await asyncio.wait(
+                {result_task, cancelled_task, stopping_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stopping_task in completed_tasks:
+                raise asyncio.CancelledError
+            if cancelled_task in completed_tasks:
+                return None
+            return result_task.result()
         finally:
+            cancelled_task.cancel()
+            stopping_task.cancel()
             if not result_task.done():
                 result_task.cancel()
                 await asyncio.gather(result_task, return_exceptions=True)
+            await asyncio.gather(cancelled_task, stopping_task, return_exceptions=True)
 
     async def _cancel_worker(self, worker: Worker | RunnerPreparation) -> None:
         if self._request_router is not None:
@@ -689,6 +762,7 @@ class Scheduler:
 
     async def _execute(self, runner: Dict[str, Any]) -> None:
         runner_id = runner["runner_id"]
+        self._runner_cancellations[runner_id] = asyncio.Event()
         worker: Optional[Worker | RunnerPreparation] = None
         try:
             environment = await self._prepare_worker_environment(
@@ -888,6 +962,7 @@ class Scheduler:
             if worker is not None:
                 worker.close()
             self._active_workers.pop(runner_id, None)
+            self._runner_cancellations.pop(runner_id, None)
             if self._dispatcher is not None:
                 await self._dispatcher.unregister(runner_id)
             self.coordinator.release_runner(runner_id)

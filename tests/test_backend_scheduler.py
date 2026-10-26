@@ -23,6 +23,7 @@ from llmperf_backend.runtime.scheduler import (
 from llmperf_backend.artifacts.resolver import DatasetResolution
 from llmperf_backend.artifacts.resolver import TokenizerResolution
 from llmperf_backend.runtime.worker import Worker, WORKER_DATASET_PATH
+from llmperf_backend.runtime.messages import RunnerMessage
 
 
 class UnusedRepository:
@@ -31,7 +32,7 @@ class UnusedRepository:
     async def reserve_worker(self, runner_id, step, window) -> bool:
         raise AssertionError("reserve_worker is not expected")
 
-    async def commit_worker(self, runner_id, result) -> bool:
+    async def commit_worker(self, runner_id, result) -> Optional[RunnerMessage]:
         raise AssertionError("commit_worker is not expected")
 
     async def publish_message(self, message) -> bool:
@@ -39,6 +40,20 @@ class UnusedRepository:
 
     async def pending_messages(self, runner_id, destination, consumer, limit):
         raise AssertionError("pending_messages is not expected")
+
+    async def pending_messages_batch(
+        self, runner_ids, destination, consumer, limit
+    ) -> Sequence[RunnerMessage]:
+        raise AssertionError("pending_messages_batch is not expected")
+
+    async def acknowledge_messages(self, runner_id, message_ids, consumer) -> None:
+        raise AssertionError("acknowledge_messages is not expected")
+
+    async def renew_runtime(self) -> None:
+        raise AssertionError("renew_runtime is not expected")
+
+    async def heartbeat_runners(self, runner_ids, *, refresh=True) -> set[str]:
+        raise AssertionError("heartbeat_runners is not expected")
 
     async def acknowledge_message(self, runner_id, message_id, consumer) -> None:
         raise AssertionError("acknowledge_message is not expected")
@@ -573,6 +588,9 @@ def test_async_worker_wait():
 
     async def exercise():
         scheduler._stop = asyncio.Event()
+        cancellation = asyncio.Event()
+        scheduler._runner_cancellations["runner-1"] = cancellation
+        asyncio.get_running_loop().call_later(0.01, cancellation.set)
         payload = await scheduler._wait_worker(worker, "runner-1")
         release_listener.set()
         await asyncio.sleep(0)
@@ -583,6 +601,68 @@ def test_async_worker_wait():
 
     assert payload is None
     assert listener_started.is_set()
+
+
+def test_batched_runtime_maintenance():
+    class MaintenanceRepository(UnusedRepository):
+        def __init__(self):
+            self.renewals = 0
+            self.batches: list[tuple[str, ...]] = []
+            self.checked = asyncio.Event()
+
+        async def renew_runtime(self):
+            self.renewals += 1
+
+        async def heartbeat_runners(self, runner_ids, *, refresh=True) -> set[str]:
+            self.batches.append(tuple(runner_ids))
+            if sum(map(len, self.batches)) == 300:
+                self.checked.set()
+            return {identifier for identifier in runner_ids if identifier == "17"}
+
+    async def exercise():
+        repository = MaintenanceRepository()
+        scheduler = Scheduler(
+            repository,
+            SchedulerConfig(),
+            DatabaseConfig(),
+            ProviderRegistry([], allow_empty=True),
+        )
+        scheduler._stop = asyncio.Event()
+        scheduler._runner_cancellations = {
+            str(index): asyncio.Event() for index in range(300)
+        }
+        maintenance = asyncio.create_task(scheduler._maintain_runtime())
+        await asyncio.wait_for(repository.checked.wait(), 1)
+        assert repository.renewals == 1
+        assert [len(batch) for batch in repository.batches] == [128, 128, 44]
+        assert scheduler._runner_cancellations["17"].is_set()
+        assert not scheduler._runner_cancellations["18"].is_set()
+        maintenance.cancel()
+        await asyncio.gather(maintenance, return_exceptions=True)
+        scheduler._atomic_executor.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_maintenance_failure_stops():
+    class FencedRepository(UnusedRepository):
+        async def renew_runtime(self):
+            raise RuntimeError("fenced")
+
+    async def exercise():
+        scheduler = Scheduler(
+            FencedRepository(),
+            SchedulerConfig(),
+            DatabaseConfig(),
+            ProviderRegistry([], allow_empty=True),
+        )
+        scheduler._stop = asyncio.Event()
+        await scheduler._maintain_runtime()
+        assert scheduler._stop.is_set()
+        assert scheduler.status()["runtime_error"] == "RuntimeError"
+        scheduler._atomic_executor.shutdown()
+
+    asyncio.run(exercise())
 
 
 def test_preworker_cancel(tmp_path: Path, monkeypatch):

@@ -69,8 +69,16 @@ Backend no longer starts separate preparation actors. Each request actor seriali
 CPU preparation and overlaps Provider I/O. One physical slot covers one complete
 Worker. Ordinary concatenate recipes retain calibrated indexed generation; other
 generated inputs use versioned deterministic request seeds. Round barriers consume
-no request slots while waiting. Runtime lease checks renew valid ownership but never
-revive an expired or superseded lease.
+no request slots while waiting. Dedicated Backend maintenance renews the runtime lease
+every five seconds; ordinary fenced writes share its row lock through commit. Read-only
+dependency scans hold no lease lock. Expired or superseded ownership is never revived.
+
+The dispatcher delivers committed events directly to bounded Backend mailboxes. One shared
+reconciler recovers missed deliveries from PostgreSQL in bounded batches; do not restore
+per-Runner polling on the managed path. Acknowledge processed batches only after progression.
+Recovered backlogs request another pass after acknowledgment. Heartbeat writes and durable
+cancellation checks are batched by Backend maintenance. Preserve single-send reservations,
+committed-before-delivered ordering, and indeterminate recovery for interrupted Runners.
 
 ## Persistence
 

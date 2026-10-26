@@ -401,7 +401,7 @@ class RunnerRuntime:
                                 )
                             known_steps[new_step.step_id] = new_step
                             pending[new_step.step_id] = new_step
-                        await self.bus.acknowledge(message, consumer)
+                    await self.bus.acknowledge_many(messages, consumer)
                     message_task = asyncio.create_task(self.bus.receive(consumer))
                 if submission_task is not None and submission_task.done():
                     submission_task.result()

@@ -57,6 +57,8 @@ flowchart LR
 
 PostgreSQL holds metadata, checkpoints, results, and conversation history. The runtime
 coordinator manages dependencies; Ray executes requests under the Scheduler's supervision.
+Committed events reach Runners through bounded Backend mailboxes, with shared database
+reconciliation for missed deliveries and batched heartbeat/cancellation checks.
 
 ## Quick start
 

@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.orm import Mapped, load_only, mapped_column
 from llmperf_backend.storage.base import Base
 from llmperf_backend.storage.logs import RunnerLogStore
@@ -1040,11 +1040,18 @@ class RunnerRepository:
         self.runtime_owner = owner
         self.runtime_generation = generation
 
-    async def _check_runtime(self, session: AsyncSession, renew: bool = True) -> None:
+    async def _check_runtime(
+        self, session: AsyncSession, *, renew: bool = False, lock: bool = True
+    ) -> None:
         # Repository-only administrative/test calls do not acquire runtime ownership.
         if self.runtime_owner is None:
             return
-        lease = await session.get(ExecutionLeaseRecord, 1, with_for_update=True)
+        # Writers share the fencing lock. Renewal/takeover waits for in-flight
+        # fenced transactions, without serializing unrelated Runner writes.
+        statement = select(ExecutionLeaseRecord).where(ExecutionLeaseRecord.id == 1)
+        if lock:
+            statement = statement.with_for_update(read=not renew)
+        lease = (await session.execute(statement)).scalar_one_or_none()
         now = utcnow()
         if (
             lease is None
@@ -1055,6 +1062,10 @@ class RunnerRepository:
             raise RuntimeError("Runtime ownership expired or was fenced")
         if renew:
             lease.expires_at = now + timedelta(seconds=self.lease_seconds)
+
+    async def renew_runtime(self) -> None:
+        async with self.database.sessions() as session, session.begin():
+            await self._check_runtime(session, renew=True)
 
     async def release_runtime(self) -> None:
         async with self.database.sessions() as session, session.begin():
@@ -1071,7 +1082,8 @@ class RunnerRepository:
 
     async def runtime_snapshot(self, runner_id: Optional[str] = None) -> Dict[str, Any]:
         async with self.database.sessions() as session, session.begin():
-            await self._check_runtime(session, renew=True)
+            # A read-only dependency scan must not hold the runtime fencing lock.
+            await self._check_runtime(session, lock=False)
             runners = (
                 list(
                     (
@@ -2754,19 +2766,48 @@ class RunnerRepository:
             )
 
     async def heartbeat(self, runner_id: str) -> bool:
+        return runner_id in await self.heartbeat_runners([runner_id])
+
+    async def heartbeat_runners(
+        self, runner_ids: Sequence[str], *, refresh: bool = True
+    ) -> set[str]:
+        if not runner_ids:
+            return set()
         async with self.database.sessions() as session, session.begin():
-            await self._check_runtime(session)
-            statement = (
-                update(BenchmarkRunnerRecord)
-                .where(
-                    BenchmarkRunnerRecord.id == runner_id,
-                    BenchmarkRunnerRecord.status == RUNNING,
+            if refresh:
+                await self._check_runtime(session)
+            continuing_ids = (
+                (
+                    await session.execute(
+                        select(BenchmarkRunnerRecord.id).where(
+                            BenchmarkRunnerRecord.id.in_(runner_ids),
+                            BenchmarkRunnerRecord.status == RUNNING,
+                            BenchmarkRunnerRecord.cancel_requested.is_(False),
+                        )
+                    )
                 )
-                .values(heartbeat_at=utcnow())
-                .returning(BenchmarkRunnerRecord.cancel_requested)
+                .scalars()
+                .all()
             )
-            cancellation = (await session.execute(statement)).scalar_one_or_none()
-            return cancellation is None or bool(cancellation)
+            if refresh:
+                # Do not wait on a result/cancellation transaction or introduce
+                # multi-Runner lock cycles merely to refresh liveness timestamps.
+                unlocked_ids = (
+                    select(BenchmarkRunnerRecord.id)
+                    .where(
+                        BenchmarkRunnerRecord.id.in_(continuing_ids),
+                        BenchmarkRunnerRecord.status == RUNNING,
+                    )
+                    .order_by(BenchmarkRunnerRecord.id)
+                    .with_for_update(skip_locked=True)
+                )
+                await session.execute(
+                    update(BenchmarkRunnerRecord)
+                    .where(BenchmarkRunnerRecord.id.in_(unlocked_ids))
+                    .values(heartbeat_at=utcnow())
+                    .execution_options(synchronize_session=False)
+                )
+            return set(runner_ids) - set(continuing_ids)
 
     async def request_cancel(self, runner_id: str) -> Optional[Dict[str, Any]]:
         async with self.database.sessions() as session, session.begin():
@@ -3118,21 +3159,104 @@ class RunnerRepository:
     async def acknowledge_message(
         self, runner_id: str, message_id: str, consumer: str
     ) -> None:
+        await self.acknowledge_messages(runner_id, [message_id], consumer)
+
+    async def pending_messages_batch(
+        self, runner_ids: Sequence[str], destination: str, consumer: str, limit: int
+    ) -> Sequence[RunnerMessage]:
+        if not runner_ids:
+            return []
+        if limit < 1:
+            raise ValueError("message limit must be positive")
+        # Apply a per-Runner limit so a busy mailbox cannot starve the others.
+        statement = select(MessageRecord).from_statement(
+            text(
+                """
+            SELECT pending.*
+            FROM unnest(CAST(:runner_ids AS text[])) AS owner(runner_id)
+            CROSS JOIN LATERAL (
+                SELECT message.* FROM runner_messages AS message
+                WHERE message.runner_id = owner.runner_id
+                  AND message.destination = :destination
+                  AND NOT EXISTS (
+                    SELECT 1 FROM runner_message_receipts AS receipt
+                    WHERE receipt.message_id = message.id AND receipt.consumer = :consumer
+                  )
+                ORDER BY message.created_at, message.id
+                LIMIT :message_limit
+            ) AS pending
+        """
+            )
+        )
+        async with self.database.sessions() as session:
+            records = (
+                (
+                    await session.execute(
+                        statement,
+                        {
+                            "runner_ids": list(runner_ids),
+                            "destination": destination,
+                            "consumer": consumer,
+                            "message_limit": limit,
+                        },
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            return [
+                RunnerMessage(
+                    runner_id=record.runner_id,
+                    topic=record.topic,
+                    payload=record.payload,
+                    id=record.id,
+                    source=record.source,
+                    destination=record.destination,
+                    created_at=record.created_at,
+                )
+                for record in records
+            ]
+
+    async def acknowledge_messages(
+        self, runner_id: str, message_ids: Sequence[str], consumer: str
+    ) -> None:
+        identifiers = set(message_ids)
+        if not identifiers:
+            return
         async with self.database.sessions() as session, session.begin():
             await self._check_runtime(session)
             await session.get(BenchmarkRunnerRecord, runner_id, with_for_update=True)
-            message = await session.get(MessageRecord, message_id)
-            if message is None or message.runner_id != runner_id:
-                raise ValueError("Message does not belong to Runner")
-            receipt = await session.get(MessageReceiptRecord, (message_id, consumer))
-            if receipt is None:
-                session.add(
-                    MessageReceiptRecord(
-                        message_id=message_id,
-                        consumer=consumer,
-                        acknowledged_at=utcnow(),
+            owned_ids = set(
+                (
+                    await session.execute(
+                        select(MessageRecord.id).where(
+                            MessageRecord.id.in_(identifiers),
+                            MessageRecord.runner_id == runner_id,
+                        )
                     )
+                ).scalars()
+            )
+            if owned_ids != identifiers:
+                raise ValueError("Message does not belong to Runner")
+            await session.execute(
+                insert(MessageReceiptRecord)
+                .values(
+                    [
+                        {
+                            "message_id": identifier,
+                            "consumer": consumer,
+                            "acknowledged_at": utcnow(),
+                        }
+                        for identifier in sorted(identifiers)
+                    ]
                 )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        MessageReceiptRecord.message_id,
+                        MessageReceiptRecord.consumer,
+                    ]
+                )
+            )
 
     async def reserve_worker(
         self, runner_id: str, step: RequestStep, window: Optional[int]
@@ -3180,7 +3304,9 @@ class RunnerRepository:
             )
         return True
 
-    async def commit_worker(self, runner_id: str, result: WorkerResult) -> bool:
+    async def commit_worker(
+        self, runner_id: str, result: WorkerResult
+    ) -> Optional[RunnerMessage]:
         """Commit output once; successors may read it only after this returns."""
 
         async with self.database.sessions() as session, session.begin():
@@ -3189,10 +3315,10 @@ class RunnerRepository:
                 BenchmarkRunnerRecord, runner_id, with_for_update=True
             )
             if runner is None or runner.status != RUNNING:
-                return False
+                return None
             record = await session.get(WorkerStepRecord, (runner_id, result.step_id))
             if record is None or record.generation != self.runtime_generation:
-                return False
+                return None
             output = json_safe(
                 {
                     "metrics": result.response[0],
@@ -3203,28 +3329,47 @@ class RunnerRepository:
             completion_hash = hashlib.sha256(
                 json.dumps(output, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
+            message_id = str(
+                uuid5(NAMESPACE_URL, f"llmperf:{runner_id}:{result.step_id}:completed")
+            )
             if record.state != "submitted":
-                return record.completion_hash == completion_hash
+                if record.completion_hash != completion_hash:
+                    return None
+                stored_message = await session.get(MessageRecord, message_id)
+                if stored_message is None:
+                    return None
+                return RunnerMessage(
+                    runner_id=runner_id,
+                    id=stored_message.id,
+                    topic=stored_message.topic,
+                    payload=stored_message.payload,
+                    source=stored_message.source,
+                    destination=stored_message.destination,
+                    created_at=stored_message.created_at,
+                )
             record.state = SUCCEEDED if result.succeeded else FAILED
             record.completed_at = result.completed_at
             record.completion_hash = completion_hash
+            committed_message = RunnerMessage(
+                runner_id=runner_id,
+                id=message_id,
+                source=result.step_id,
+                topic="worker.completed",
+                payload=json_safe(result.completion().model_dump(mode="json")),
+                created_at=result.completed_at,
+            )
             session.add(
                 MessageRecord(
-                    id=str(
-                        uuid5(
-                            NAMESPACE_URL,
-                            f"llmperf:{runner_id}:{result.step_id}:completed",
-                        )
-                    ),
+                    id=committed_message.id,
                     runner_id=runner_id,
                     source=result.step_id,
                     destination="runner",
                     topic="worker.completed",
-                    payload=json_safe(result.completion().model_dump(mode="json")),
+                    payload=committed_message.payload,
                     created_at=result.completed_at,
                 )
             )
-        return True
+        return committed_message
 
     async def complete_runner(
         self,

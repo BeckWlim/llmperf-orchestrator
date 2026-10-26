@@ -10,7 +10,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from llmperf.benchmark.execution import RequestStep
 from llmperf.clients.base import LLMResponse
 from llmperf.metrics import constants
-from llmperf_backend.runtime.messages import MessageStore, RunnerMessageBus
+from llmperf_backend.runtime.messages import (
+    MessageStore,
+    MessageReconciler,
+    RunnerMessage,
+    RunnerMessageBus,
+)
 from llmperf_backend.runtime.request_pool import RouterHandle
 from llmperf_backend.runtime.runner import WorkerResult
 
@@ -19,7 +24,9 @@ class DispatchRepository(MessageStore, Protocol):
     async def reserve_worker(
         self, runner_id: str, step: RequestStep, window: Optional[int]
     ) -> bool: ...
-    async def commit_worker(self, runner_id: str, result: WorkerResult) -> bool: ...
+    async def commit_worker(
+        self, runner_id: str, result: WorkerResult
+    ) -> Optional[RunnerMessage]: ...
 
 
 class WorkerDispatcher:
@@ -30,6 +37,7 @@ class WorkerDispatcher:
             raise ValueError("Scheduler admission capacity must be positive")
         self.router = router
         self.repository = repository
+        self.reconciler = MessageReconciler(repository)
         self._capacity = asyncio.Semaphore(capacity)
         self.buses: Dict[str, RunnerMessageBus] = {}
         self.environments: Dict[str, Dict[str, str]] = {}
@@ -55,7 +63,7 @@ class WorkerDispatcher:
             self.runtime_limits[runtime_id] = limit
             self.runtime_gates.setdefault(runtime_id, asyncio.Semaphore(limit))
         self.runner_runtimes[runner_id] = tuple(runtime_limits or {})
-        bus = RunnerMessageBus(runner_id, self.repository)
+        bus = RunnerMessageBus(runner_id, self.repository, reconciler=self.reconciler)
         self.buses[runner_id] = bus
         self.environments[runner_id] = dict(environment)
         return bus
@@ -163,13 +171,16 @@ class WorkerDispatcher:
             )
             while True:
                 try:
-                    if not await self.repository.commit_worker(runner_id, result):
+                    committed_message = await self.repository.commit_worker(
+                        runner_id, result
+                    )
+                    if committed_message is None:
                         raise RuntimeError("Worker result commit rejected")
                     break
                 except SQLAlchemyError:
                     # Retain this completed result, never resend the request.
                     await asyncio.sleep(1.0)
-            await self.buses[runner_id].notify()
+            await self.buses[runner_id].deliver_committed(committed_message)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

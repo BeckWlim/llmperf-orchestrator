@@ -94,10 +94,17 @@ older batch-generation versions. Family prefixes and repeat-count reuse remain
 deterministic across actor placement. Explicit legacy cache-probe schedule settings
 retain their requested order; ordinary trials add no random scheduling.
 
-Validated runtime activity renews the ownership lease. Runner claims are serialized
-before acquiring database connections, and reconciliation fetches nodes in one
-query instead of one query per instance. Expired or superseded ownership is still
-rejected; it is never silently revived or used to replay Provider requests.
+A dedicated Backend task renews the ownership lease. Fenced mutations share the lease-row
+lock; only renewal and takeover require exclusivity. Read-only readiness scans hold no
+lease lock. Runner claims are serialized before acquiring database connections, and
+reconciliation fetches nodes in one query instead of one query per instance. Expired or
+superseded ownership is rejected; it is never revived or used to replay Provider requests.
+
+Committed events normally reach Runners through bounded Backend buffers. One shared
+reconciler recovers missed deliveries from PostgreSQL every five seconds. Overflow may
+therefore delay progression, but does not discard durable events. Each mailbox subscription
+holds at most 64 events; this is not a byte limit. Acknowledgments are batched after
+progression, and interrupted Runners remain indeterminate rather than being replayed.
 
 ## Status semantics
 

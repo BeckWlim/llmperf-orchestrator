@@ -11,7 +11,11 @@ from pydantic import TypeAdapter, JsonValue
 
 from llmperf.benchmark.execution import RequestStep
 from llmperf.clients.models import RequestConfig
-from llmperf_backend.runtime.messages import RunnerMessage, RunnerMessageBus
+from llmperf_backend.runtime.messages import (
+    MessageReconciler,
+    RunnerMessage,
+    RunnerMessageBus,
+)
 from llmperf_backend.runtime.runner import RunnerRuntime, WorkflowTaskLogic
 from llmperf_backend.runtime.runner import RunnerExecutionLog, WorkerResult
 from llmperf_backend.runtime.dispatch import WorkerDispatcher
@@ -49,6 +53,18 @@ class MemoryMessages:
     ) -> None:
         assert self.messages[message_id].runner_id == runner_id
         self.receipts.add((message_id, consumer))
+
+    async def acknowledge_messages(self, runner_id, message_ids, consumer):
+        for message_id in message_ids:
+            await self.acknowledge_message(runner_id, message_id, consumer)
+
+    async def pending_messages_batch(self, runner_ids, destination, consumer, limit):
+        messages = []
+        for runner_id in runner_ids:
+            messages.extend(
+                await self.pending_messages(runner_id, destination, consumer, limit)
+            )
+        return messages
 
 
 class FakeScheduler:
@@ -347,6 +363,147 @@ def test_mailbox_recovery():
     asyncio.run(run())
 
 
+def test_committed_delivery():
+    async def exercise():
+        store = MemoryMessages()
+        reconciler = MessageReconciler(store, interval_seconds=3600)
+        bus = RunnerMessageBus("runner", store, reconciler=reconciler)
+        await reconciler.close()
+        receiver = asyncio.create_task(bus.receive("consumer"))
+        await asyncio.sleep(0)
+        commit_allowed = asyncio.Event()
+        publish_started = asyncio.Event()
+        original_publish = store.publish_message
+
+        async def publish(message):
+            publish_started.set()
+            await commit_allowed.wait()
+            return await original_publish(message)
+
+        store.publish_message = publish
+        message = RunnerMessage("runner", "output", {"value": 1})
+        publisher = asyncio.create_task(bus.publish(message))
+        await publish_started.wait()
+        assert not receiver.done()
+        assert not store.messages
+        commit_allowed.set()
+        assert await publisher
+        # Recovery is stopped: committed delivery itself must wake the receiver.
+        assert await asyncio.wait_for(receiver, 1) == [message]
+        await bus.acknowledge(message, "consumer")
+        await bus.close()
+
+    asyncio.run(exercise())
+
+
+def test_mailbox_overflow():
+    async def exercise():
+        store = MemoryMessages()
+        reconciler = MessageReconciler(store)
+        bus = RunnerMessageBus("runner", store, reconciler=reconciler, capacity=1)
+        await reconciler.close()
+        receiver = asyncio.create_task(bus.receive("consumer"))
+        await asyncio.sleep(0)
+        messages = [
+            RunnerMessage("runner", "output", {"index": index}) for index in range(3)
+        ]
+        for message in messages:
+            await bus.publish(message)
+        assert await asyncio.wait_for(receiver, 1) == [messages[0]]
+        for message in messages:
+            assert await bus.receive("consumer") == [message]
+            await bus.acknowledge(message, "consumer")
+            await reconciler.reconcile()
+        assert len(store.receipts) == 3
+        await bus.close()
+
+    asyncio.run(exercise())
+
+
+def test_recovery_ack_race():
+    async def exercise():
+        store = MemoryMessages()
+        reconciler = MessageReconciler(store)
+        bus = RunnerMessageBus("runner", store, reconciler=reconciler)
+        await reconciler.close()
+        receiver = asyncio.create_task(bus.receive("consumer"))
+        await asyncio.sleep(0)
+        message = RunnerMessage("runner", "output", {})
+        await bus.publish(message)
+        assert await receiver == [message]
+        snapshot_read = asyncio.Event()
+        finish_read = asyncio.Event()
+        original_read = store.pending_messages_batch
+
+        async def pending(runner_ids, destination, consumer, limit):
+            snapshot = await original_read(runner_ids, destination, consumer, limit)
+            snapshot_read.set()
+            await finish_read.wait()
+            return snapshot
+
+        store.pending_messages_batch = pending
+        recovery = asyncio.create_task(reconciler.reconcile())
+        await snapshot_read.wait()
+        await bus.acknowledge(message, "consumer")
+        finish_read.set()
+        await recovery
+        next_receive = asyncio.create_task(bus.receive("consumer"))
+        await asyncio.sleep(0)
+        assert (
+            not next_receive.done()
+        ), "stale recovery must not resurrect an acknowledged event"
+        await bus.close()
+        with pytest.raises(asyncio.CancelledError):
+            await next_receive
+
+    asyncio.run(exercise())
+
+
+def test_batched_mailbox_recovery():
+    async def exercise():
+        store = MemoryMessages()
+        reconciler = MessageReconciler(store)
+        buses = [
+            RunnerMessageBus(str(index), store, reconciler=reconciler)
+            for index in range(130)
+        ]
+        await reconciler.close()
+        receivers = [asyncio.create_task(bus.receive("consumer")) for bus in buses]
+        await asyncio.sleep(0)
+        for bus in buses:
+            await store.publish_message(RunnerMessage(bus.runner_id, "output", {}))
+        read_batches = AsyncMock(wraps=store.pending_messages_batch)
+        store.pending_messages_batch = read_batches
+        await reconciler.reconcile()
+        received = await asyncio.wait_for(asyncio.gather(*receivers), 1)
+        assert all(len(messages) == 1 for messages in received)
+        assert read_batches.await_count == 3
+        assert max(len(call.args[0]) for call in read_batches.call_args_list) == 64
+        for bus in buses:
+            await bus.close()
+
+    asyncio.run(exercise())
+
+
+def test_failed_receipt_retry():
+    async def exercise():
+        store = MemoryMessages()
+        bus = RunnerMessageBus("runner", store)
+        message = RunnerMessage("runner", "output", {})
+        await bus.publish(message)
+        assert await bus.receive("consumer") == [message]
+        original_acknowledge = store.acknowledge_messages
+        store.acknowledge_messages = AsyncMock(side_effect=RuntimeError("unavailable"))
+        with pytest.raises(RuntimeError, match="unavailable"):
+            await bus.acknowledge(message, "consumer")
+        assert await bus.receive("consumer") == [message]
+        store.acknowledge_messages = original_acknowledge
+        await bus.acknowledge(message, "consumer")
+        await bus.close()
+
+    asyncio.run(exercise())
+
+
 def test_periodic_messages():
     async def run() -> None:
         store = MemoryMessages()
@@ -433,7 +590,9 @@ class MemoryJournal(MemoryMessages):
         self.reserved.add(key)
         return True
 
-    async def commit_worker(self, runner_id: str, result: WorkerResult) -> bool:
+    async def commit_worker(
+        self, runner_id: str, result: WorkerResult
+    ) -> Optional[RunnerMessage]:
         self.results[(runner_id, result.step_id)] = result
         payload = TypeAdapter(dict[str, JsonValue]).validate_python(
             {
@@ -443,11 +602,11 @@ class MemoryJournal(MemoryMessages):
                 "request": result.response[2].model_dump(mode="json"),
             }
         )
-        return await self.publish_message(
-            RunnerMessage(
-                runner_id, "worker.completed", payload, created_at=result.completed_at
-            )
+        message = RunnerMessage(
+            runner_id, "worker.completed", payload, created_at=result.completed_at
         )
+        await self.publish_message(message)
+        return message
 
 
 def test_dispatch_pipeline():

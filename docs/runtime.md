@@ -85,8 +85,11 @@ flowchart TD
     Router --> Provider[Ray request actors and Provider API]
     Provider -->|One request result| Commit[Commit Worker result and message]
     Commit --> DB
-    Commit --> Bus[Runner message bus]
-    Timer[Date and delay timers] --> Bus
+    Commit -->|After commit| Bus[Bounded Backend mailboxes]
+    Timer[Date and delay timers] -->|Persist event first| DB
+    Timer -->|After commit| Bus
+    DB -->|Batched recovery| Recovery[Shared mailbox reconciler]
+    Recovery --> Bus
     Bus --> Runner
 ```
 
@@ -98,6 +101,24 @@ The Scheduler assigns physical request capacity only while that request executes
 uses dependencies, committed outputs, and due times to select the next request. Pressure
 and multi-turn tasks use the same lifecycle. A pending Scheduler submission does not block
 the listener; at most one submission operation waits per Runner.
+
+The shared dispatcher delivers the committed `RunnerMessage` directly to Backend mailbox
+buffers. Each consumer/destination subscription retains at most 64 unacknowledged events;
+the bound counts events, not payload bytes. PostgreSQL remains authoritative. A single
+`MessageReconciler` repairs startup, dropped delivery, and buffer overflow every five
+seconds, or on a recovery hint. It reads at most 64 mailboxes per query and one pending
+event per mailbox per pass, using the existing destination and receipt indexes. Recovery
+therefore makes progress for every subscribed Runner even if another has a backlog.
+Acknowledging a recovered event requests another pass so a backlog drains without a
+five-second pause between every recovered event.
+Standalone buses retain their local recovery timer; Scheduler-managed buses do not run
+individual database polling loops. A recovery read racing with an acknowledgment is
+discarded for that subscription and retried on a later pass.
+
+Runner progression acknowledges each processed message batch in one transaction. A failed
+receipt write leaves the buffer intact. Delivery is at least once: consumers must use
+stable event IDs and idempotent effects. Closing the last managed mailbox stops its
+reconciler; Scheduler shutdown also stops it explicitly.
 
 The separate `ReconcileNotifier` is a bounded, coalescing in-process hint queue. It may
 lose hints; periodic coordinator reconciliation repairs them. It carries no Worker output
@@ -474,6 +495,22 @@ become indeterminate and fail their Runner. Accepted work that never started rem
 recoverable. No automatic Provider retry is introduced. Fencing cannot undo an HTTP request
 already sent. Cancellation prevents queued calls from starting, while a running call keeps
 its physical slot until execution ends.
+
+Backend maintenance renews the ownership lease in a short exclusive transaction every
+five seconds. Ordinary fenced writes hold a shared lease-row lock through commit, so
+unrelated Runners can write concurrently while ownership takeover still waits for those
+transactions. Read-only task-readiness snapshots validate ownership without holding that
+lock over the dependency scan. Expired ownership cannot be renewed.
+
+The same maintenance task checks cancellation in batches of at most 128 Runners at the
+Scheduler polling cadence (capped at five seconds). Heartbeat timestamps refresh every
+five seconds, or one third of the stale threshold when shorter. Refresh skips rows already
+locked by other transactions; a skipped row is not interpreted as cancellation. Waiting
+Runners receive in-memory cancellation events rather than polling PostgreSQL themselves.
+Maintenance failure stops admission and execution supervision; it never authorizes replay.
+
+These mailbox and maintenance changes use the existing schema. Updating an installation
+that already has these tables requires a Backend restart, not a database rebuild.
 
 Completed results awaiting commit remain bounded by Scheduler admission while a transient database
 write failure is retried. Successors remain blocked until commit. A lost runtime lease

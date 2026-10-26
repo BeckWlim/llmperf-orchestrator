@@ -20,12 +20,132 @@ from llmperf_backend.storage.repository import (
     TaskAttemptRecord,
 )
 from llmperf_backend.runtime.coordinator import RuntimeCoordinator
+from llmperf_backend.runtime.messages import RunnerMessage
 
 pytestmark = pytest.mark.postgresql
 
 
-def test_activity_renews_lease(postgresql_url):
-    """Admitting a large ready set renews ownership without allowing resurrection."""
+def test_shared_lease_fencing(postgresql_url):
+    async def exercise():
+        database = Database(DatabaseConfig(url=postgresql_url))
+        repository = RunnerRepository(database)
+        try:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.create_schema()
+            await repository.acquire_runtime("first-owner")
+            async with database.sessions() as first_session, first_session.begin():
+                await repository._check_runtime(first_session)
+                async with (
+                    database.sessions() as second_session,
+                    second_session.begin(),
+                ):
+                    # Ordinary transactions must share ownership without queueing
+                    # behind one another's global lease lock.
+                    await asyncio.wait_for(repository._check_runtime(second_session), 1)
+                renewal = asyncio.create_task(repository.renew_runtime())
+                await asyncio.sleep(0.02)
+                assert not renewal.done(), "renewal must wait for fenced transactions"
+            await asyncio.wait_for(renewal, 1)
+            async with database.sessions() as session, session.begin():
+                await session.execute(
+                    update(ExecutionLeaseRecord).values(
+                        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)
+                    )
+                )
+            successor = RunnerRepository(database)
+            await successor.acquire_runtime("second-owner")
+            with pytest.raises(RuntimeError, match="fenced"):
+                await repository.heartbeat_runners(["missing"])
+            with pytest.raises(RuntimeError, match="fenced"):
+                await repository.renew_runtime()
+            await repository.release_runtime()
+            # Releasing the old owner cannot expire its successor's lease.
+            await successor.renew_runtime()
+        finally:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_batched_durable_messages(postgresql_url):
+    async def exercise():
+        database = Database(DatabaseConfig(url=postgresql_url))
+        repository = RunnerRepository(database)
+        try:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.create_schema()
+            await repository.acquire_runtime("batch-test")
+            runner_ids = []
+            all_messages = []
+            for index in range(2):
+                runner = await repository.create_runner(
+                    {"provider": "test", "model": "test", "repeat": 1}, {}, "test"
+                )
+                assert runner is not None
+                runner_id = runner["runner_id"]
+                runner_ids.append(runner_id)
+                await repository.start_selected(runner_id, "batch-test")
+                for sequence in range(3):
+                    message = RunnerMessage(runner_id, "output", {"sequence": sequence})
+                    await repository.publish_message(message)
+                    all_messages.append(message)
+            recovered = await repository.pending_messages_batch(
+                runner_ids, "runner", "consumer", 1
+            )
+            assert len(recovered) == 2
+            assert {message.runner_id for message in recovered} == set(runner_ids)
+            first_ids = [
+                message.id
+                for message in all_messages
+                if message.runner_id == runner_ids[0]
+            ]
+            await repository.acknowledge_messages(runner_ids[0], first_ids, "consumer")
+            await repository.acknowledge_messages(runner_ids[0], first_ids, "consumer")
+            with pytest.raises(ValueError, match="does not belong"):
+                await repository.acknowledge_messages(
+                    runner_ids[1], first_ids, "consumer"
+                )
+            remaining = await repository.pending_messages_batch(
+                runner_ids, "runner", "consumer", 10
+            )
+            assert len(remaining) == 3
+            assert all(message.runner_id == runner_ids[1] for message in remaining)
+            assert (
+                len(
+                    await repository.pending_messages_batch(
+                        runner_ids, "runner", "other", 10
+                    )
+                )
+                == 6
+            )
+            assert await repository.heartbeat_runners(runner_ids) == set()
+            async with database.sessions() as held_session, held_session.begin():
+                await held_session.execute(
+                    text("SELECT id FROM runners WHERE id = :id FOR UPDATE"),
+                    {"id": runner_ids[0]},
+                )
+                assert (
+                    await asyncio.wait_for(repository.heartbeat_runners(runner_ids), 1)
+                    == set()
+                )
+            await repository.request_cancel(runner_ids[0])
+            assert await repository.heartbeat_runners(runner_ids, refresh=False) == {
+                runner_ids[0]
+            }
+        finally:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_dedicated_lease_renewal(postgresql_url):
+    """Ordinary writes do not renew ownership; maintenance cannot resurrect it."""
 
     async def exercise():
         database = Database(DatabaseConfig(url=postgresql_url))
@@ -49,6 +169,11 @@ def test_activity_renews_lease(postgresql_url):
                 is not None
             )
             async with database.sessions() as session:
+                unchanged = await session.get(ExecutionLeaseRecord, 1)
+                assert unchanged is not None
+                assert unchanged.expires_at == near_expiry
+            await repository.renew_runtime()
+            async with database.sessions() as session:
                 renewed = await session.get(ExecutionLeaseRecord, 1)
                 assert renewed is not None
                 assert renewed.expires_at > near_expiry + timedelta(seconds=20)
@@ -60,6 +185,8 @@ def test_activity_renews_lease(postgresql_url):
                 )
             with pytest.raises(RuntimeError, match="expired"):
                 await repository.heartbeat(runner["runner_id"])
+            with pytest.raises(RuntimeError, match="expired"):
+                await repository.renew_runtime()
         finally:
             async with database.engine.begin() as connection:
                 await connection.run_sync(Base.metadata.drop_all)
