@@ -331,9 +331,8 @@ mailbox as an exactly-once Provider execution guarantee.
 Worker; `repeat` repeats the template or complete `steps` graph. `depends_on` describes
 readiness, with optional `reuse_messages: true` on each source. Multi-turn conversations,
 parallel independent requests, and merging several earlier message lists use these same
-primitives. See [the definition rules](tasks.md#runner-data-and-request-logic),
-[the multi-turn example](../examples/example-multiturn.yaml), and
-[the merge example](../examples/example-message-merge.yaml).
+primitives. See [the definition rules](tasks.md#runner-data-and-request-logic) and
+[the multi-turn merge example](../examples/example-message-merge.yaml).
 
 ```mermaid
 flowchart LR
@@ -465,7 +464,7 @@ This metadata field is reserved for Backend round expansion.
 
 Round boundaries may have preparation/ramp-down gaps. A finite round count is not a
 wall-clock duration or guaranteed continuous occupancy. An 80% shared prefix describes
-offered reuse, not an observed cache-hit ratio. See [example-rounds.yaml](../examples/example-rounds.yaml).
+offered reuse, not an observed cache-hit ratio. See [example-matrix-phases.yaml](../examples/example-matrix-phases.yaml).
 
 ## Recovery and cutover
 

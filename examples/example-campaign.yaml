@@ -1,11 +1,18 @@
+# Main role: compare two immediate load points inside one durable Campaign.
+# Budget: 2 serial + 2 concurrent requests = 4 requests.
+# Setup: replace every provider/model pair with your configured target.
+# Run: llmperfctl campaign start -f examples/example-campaign.yaml --wait
+# Observe: compare the labeled Runners' latency/errors; both share Scheduler capacity.
+# Two requests per point demonstrate configuration, not statistically reliable performance.
 version: 1.0.0
 campaign:
   name: example-campaign
-  description: Combine immediate benchmarks with one compiled replay task.
+  description: Compare serial and concurrent request execution with the same input shape.
   tags:
     provider: aliyun
     model: deepseek-v4-pro
 wait: true
+# These Runners are independently eligible; list order is not a sequence barrier.
 runners:
 - label: example-serial
   metadata:
@@ -13,7 +20,7 @@ runners:
   provider: aliyun
   model: deepseek-v4-pro
   timeout: 60
-  concurrent_workers: 1
+  concurrent_workers: 1 # Serial baseline within this Runner.
   mean_output_tokens: 16
   stddev_output_tokens: 0
   additional_sampling_params:
@@ -29,7 +36,7 @@ runners:
   provider: aliyun
   model: deepseek-v4-pro
   timeout: 60
-  concurrent_workers: 2
+  concurrent_workers: 2 # Allow both requests to overlap if shared capacity is free.
   mean_output_tokens: 16
   stddev_output_tokens: 0
   additional_sampling_params:
@@ -39,41 +46,3 @@ runners:
       tokens: 128
   worker:
     repeat: 2
-task_definitions:
-- name: example-replay-task
-  instances:
-    trials: 1
-    seed: 11111
-  payloads:
-    replay:
-      seed: replay
-  workflow:
-  - invoke:
-      name: prime
-      payload: replay
-  - invoke:
-      name: warm
-      payload: replay
-      after:
-        value: 500
-        unit: ms
-  runner:
-    label: example-replay-task
-    metadata:
-      purpose: deterministic-replay
-    provider: aliyun
-    model: deepseek-v4-pro
-    tokenizer:
-      id: deepseek-ai/DeepSeek-V3
-      revision: main
-      use_fast: true
-    timeout: 60
-    concurrent_workers: 1
-    mean_output_tokens: 16
-    stddev_output_tokens: 0
-    additional_sampling_params:
-      temperature: 0
-    inputs:
-      default:
-        tokens: 128
-    worker: {}

@@ -247,6 +247,9 @@ dist/
 output/
 result_outputs/
 
+# Local benchmark workloads
+/workloads/
+
 # Keep JSON schemas, fixtures, and Skill assets versionable. Put generated benchmark
 # exports and analysis artifacts under the ignored output directories above.
 

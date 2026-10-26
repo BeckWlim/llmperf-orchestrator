@@ -1,0 +1,33 @@
+# Main role: produce paired cache analysis inside one Runner without a Campaign graph.
+# Budget: 2 independent families x (prime + 1 warm repeat) = 4 requests.
+# Setup: replace provider/model and select a compatible tokenizer for the target.
+# Run: llmperfctl runner start -f examples/example-cache-probe.yaml --wait
+# Observe: paired latency, cache-counter coverage, and the cache-probe analysis verdict.
+version: 1.0.0
+label: paired-cache-probe
+provider: aliyun
+model: deepseek-v4-pro
+tokenizer:
+  # Backend resolves the revision; use an immutable compatible revision for comparisons.
+  id: deepseek-ai/DeepSeek-V3
+  revision: main
+  use_fast: true
+timeout: 60
+concurrent_workers: 2 # Families may overlap; each family's warm request waits for its prime.
+mean_output_tokens: 8
+stddev_output_tokens: 0
+additional_sampling_params:
+  temperature: 0
+  stream_options:
+    include_usage: true
+inputs:
+  default:
+    tokens: 2048
+worker:
+  # The probe owns the request graph; do not combine it with Worker repeat or steps.
+  cache_probe:
+    mode: exact_repeat # Replay the identical prompt for the paired warm observation.
+    trials: 2 # Independent prompt families; increase for meaningful statistical evidence.
+    repeats_after_prime: 1 # One planned warm observation per family, not a retry.
+    delay: {value: 500, unit: ms} # Completion-relative pause before the warm observation.
+# This demonstrates paired analysis; two trials cannot establish a cache policy.

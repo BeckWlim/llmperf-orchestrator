@@ -1,3 +1,9 @@
+# Main role: let the Planner materialize bounded, time-based Runner occurrences.
+# Budget: 2 occurrences x 1 request = 2 requests.
+# Setup: replace provider/model in the Runner template with your configured target.
+# Run: llmperfctl planner preview -f examples/example-runner-plan.yaml
+# Then: llmperfctl campaign start -f examples/example-runner-plan.yaml --wait
+# Observe: scheduled occurrences remain durable when the submitting CLI disconnects.
 version: 1.0.0
 campaign:
   name: example-runner-plan
@@ -7,15 +13,17 @@ campaign:
     workload: runner-plan
 wait: true
 runner_plans:
+  # A plan is a template and schedule; waiting for a due time uses no request slot.
 - name: example-runner-plan
   timezone: Asia/Shanghai
-  max_occurrences: 2
+  max_occurrences: 2 # Mandatory finite bound for this introductory example.
   recurrence:
     kind: interval
-    every: 1
-  overlap_policy: queue
-  misfire_grace_seconds: 60
+    every: 1 # Seconds between scheduled due times; not a completion-relative delay.
+  overlap_policy: queue # Queue an occurrence if its predecessor is still active.
+  misfire_grace_seconds: 60 # Allow a late occurrence within this grace window.
   runner:
+    # Every occurrence creates an ordinary Runner from this template.
     label: example-planned-runner
     metadata:
       purpose: bounded-plan

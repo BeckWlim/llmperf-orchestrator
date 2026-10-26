@@ -1,3 +1,9 @@
+# Main role: sample deterministic prefix seeds in compact, counted parallel groups.
+# Budget: 2 sequential groups x 4 Runners x 4 requests = 32 requests.
+# Setup: replace the example dfs-chat profile/model with your configured target.
+# Run: llmperfctl campaign start -f examples/example-seed-pool.yaml --wait
+# Observe: preview --debug exposes each Runner's prefix seed and distinct suffix seed.
+# Use example-cohort-recall.yaml when every seed must be visited once per wave.
 version: 1.0.0
 wait: true
 campaign:
@@ -7,13 +13,15 @@ task_definitions:
 - name: recall
   instances:
     trials: 1
-    seed: 20261021
+    seed: 20261021 # Controls reproducible draws and Runner suffixes.
   workflow:
   - repeat:
+      # The next group waits for successful completion of the preceding group.
       name: rounds
       count: 2
       node:
         parallel:
+          # Expand four copies of one branch; shared Scheduler capacity still applies.
           name: members
           count: 4
           node:
@@ -21,6 +29,8 @@ task_definitions:
               name: batch
               prefix_seed:
                 pick:
+                  # Generate eight candidate seeds and draw once per Runner, with replacement.
+                  # Repeated draws are possible; not all eight seeds must be selected.
                   seed: 20261020
                   count: 8
   runner:
@@ -41,4 +51,4 @@ task_definitions:
         tokens: 128
         shared_prefix_tokens: 96
     worker:
-      repeat: 4
+      repeat: 4 # All four requests use the Runner's selected prefix, with fresh suffixes.

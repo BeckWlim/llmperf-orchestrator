@@ -1,3 +1,9 @@
+# Main role: compare quiet retention with retention after repeated cache accesses.
+# Budget: 4 matrix points; (prime + 0 or 2 warmups + probe + cold) totals 16 requests.
+# Setup: replace provider/model and choose a compatible tokenizer for your target.
+# Run: llmperfctl campaign start -f examples/example-cache.yaml --wait
+# Observe: compare probe/cold latency and available counters at the same quiet interval.
+# Missing counters mean unknown cache use; a short demonstration cannot establish TTL.
 version: 1.0.0
 campaign:
   name: example-cache-replay
@@ -8,8 +14,10 @@ wait: true
 task_definitions:
 - name: repeated-hit-surface
   instances:
+    # Each matrix point has its own payload family, so one delay cannot warm another.
     matrix:
       warmup_count:
+      # Zero measures a quiet interval after prime; two adds access before the interval.
       - 0
       - 2
       quiet_seconds:
@@ -18,15 +26,18 @@ task_definitions:
     trials: 1
     seed: 33333
   payloads:
+    # Prime, warmup, and probe reuse replay; cold uses a separate seed namespace.
     replay:
       seed: replay
     cold:
       seed: cold-control
   workflow:
+  # Top-level entries form a success-dependent sequence of single-request Runners.
   - invoke:
       name: prime
       payload: replay
   - repeat:
+      # Count zero skips this block; positive counts serialize warmup accesses.
       name: warmups
       count: $warmup_count
       every: 0
@@ -35,6 +46,7 @@ task_definitions:
           name: warmup
           payload: replay
   - parallel:
+      # Both observations become eligible after the same completion-relative quiet gap.
       name: observation
       after:
         value: $quiet_seconds
@@ -45,7 +57,7 @@ task_definitions:
           payload: replay
       - invoke:
           name: cold
-          role: cold_control
+          role: cold_control # Analysis tag only; it does not force a Provider cache miss.
           payload: cold
   runner:
     label: repeated-hit-surface
@@ -58,7 +70,7 @@ task_definitions:
       revision: main
       use_fast: true
     timeout: 60
-    concurrent_workers: 1
+    concurrent_workers: 1 # Per atomic Runner; parallel branches may still overlap.
     mean_output_tokens: 8
     stddev_output_tokens: 0
     additional_sampling_params:

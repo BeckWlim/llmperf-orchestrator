@@ -1,19 +1,30 @@
+# Main role: run independent family trials through serial batches with stable prefixes.
+# Budget: 2 families x 2 trials x 2 batches x 2 requests = 16 requests across 8 Runners.
+# Setup: replace the example dfs-chat profile/model with your configured target.
+# Run: llmperfctl campaign start -f examples/example-family-recall.yaml --wait
+# Observe: batches are serial within each trial; other family/trial instances advance freely.
+# This illustrates input identity; trials have no ordering barrier or cache-hit guarantee.
 version: 1.0.0
 wait: true
 campaign:
   name: stable-family-recall
-  description: Three fixed prefixes, two independent trials, changing suffixes.
+  description: Two prefix families, two independent trials, two serial batches per trial.
 task_definitions:
 - name: families
   instances:
     matrix:
-      family: [0, 1, 2]
-    trials: 2
+      family: [1, 2]
+    trials: 2 # Independent workflows, not sequential rounds or retry attempts.
     seed: 20261020
-    prefix_seed_scope: family
+    prefix_seed_scope: family # Exclude trial identity when deriving the family prefix.
   workflow:
-  - run:
-      name: batch
+  - repeat:
+      # Whole batches wait for committed success; there is no cross-instance barrier.
+      name: batches
+      count: 2
+      node:
+        run:
+          name: batch # Execute the entire Runner template, including worker.repeat.
   runner:
     provider: dfs-chat
     model: spark-x2.5-1.7b-L4
@@ -27,7 +38,8 @@ task_definitions:
     stddev_output_tokens: 0
     inputs:
       default:
+        # Keep this input configuration unchanged to reproduce a family's prefix.
         tokens: 128
-        shared_prefix_tokens: 96
+        shared_prefix_tokens: 96 # Included in the 128-token total, not added to it.
     worker:
-      repeat: 4
+      repeat: 2 # Two planned requests inside each batch; distinct from workflow repeat.

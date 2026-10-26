@@ -1,3 +1,8 @@
+# Main role: demonstrate multi-turn history, branching, and an ordered message join.
+# Budget: 3 requests: benefits and risks, then one summary.
+# Setup: replace provider/model with your configured Backend target.
+# Run: llmperfctl campaign start -f examples/example-message-merge.yaml --wait
+# Observe: summary receives benefits history, then risks history, then its own input.
 version: 1.0.0
 wait: true
 campaign:
@@ -20,14 +25,18 @@ runners:
       text: Summarize both answers in one sentence.
   worker:
     steps:
+    # No dependencies between these first two steps; Scheduler capacity controls overlap.
     - name: benefits
       input: benefits
     - name: risks
       input: risks
     - name: summary
       depends_on:
+      # Wait for both to succeed and concatenate histories in this declared order.
+      # A failed predecessor cancels the unsubmitted summary; it cannot use partial history.
       - step: benefits
         reuse_messages: true
       - step: risks
         reuse_messages: true
+      after: {value: 500, unit: ms} # Delay after both sources finish; waiting holds no slot.
       input: summary

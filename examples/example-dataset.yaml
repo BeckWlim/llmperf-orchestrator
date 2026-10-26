@@ -1,3 +1,8 @@
+# Main role: build reproducible prompts from a pinned external dataset and replay them.
+# Budget: 3 requests: prime, exact warm replay, and an independent cold control.
+# Setup: replace provider/model; first use may download the tokenizer and dataset.
+# Run: llmperfctl campaign start -f examples/example-dataset.yaml --wait
+# Observe: compare replay prompt hashes and dataset-selection evidence in the export.
 version: 1.0.0
 campaign:
   name: example-dataset
@@ -11,6 +16,7 @@ task_definitions:
     trials: 1
     seed: 20260819
   payloads:
+    # One payload ID keeps selection identical within the instance; cold is independent.
     replay:
       seed: replay
     cold:
@@ -20,6 +26,7 @@ task_definitions:
       name: prime
       payload: replay
   - parallel:
+      # Warm and cold can overlap after prime succeeds; neither depends on the other.
       name: observation
       branches:
       - invoke:
@@ -50,12 +57,13 @@ task_definitions:
     inputs:
       default:
         dataset:
+          # A commit hash freezes source content; the adapter selects usable user turns.
           source: huggingface
           id: learnanything/sharegpt_v3_unfiltered_cleaned_split
           filename: ShareGPT_V3_unfiltered_cleaned_split.json
           revision: ddc6e27875b7198a46702daec3e61a55e222fc14
           adapter: sharegpt-user
-        dataset_prompt_mode: concatenate
-        dataset_repeat_count: 1
-        tokens: 2048
+        dataset_prompt_mode: concatenate # Seeded record assembly up to the token target.
+        dataset_repeat_count: 1 # Do not duplicate records as a substitute for replay.
+        tokens: 2048 # New-input target; increase only after checking context/capacity limits.
     worker: {}

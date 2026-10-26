@@ -618,8 +618,8 @@ The outer workflow implementation boundaries are [compiler/tasks.py](../src/llmp
 ## Preview and verification
 
 ```bash
-llmperfctl campaign preview -f examples/example-batch-parallel.yaml --debug
-llmperfctl campaign validate -f examples/example-batch-parallel.yaml
+llmperfctl campaign preview -f examples/example-family-recall.yaml --debug
+llmperfctl campaign validate -f examples/example-family-recall.yaml
 llmperfctl scheduler status
 ```
 

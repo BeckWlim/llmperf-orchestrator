@@ -1,0 +1,47 @@
+# Main role: enumerate a fixed prefix cohort in bounded lanes, then recall it.
+# Budget: 4 seeds x (initial wave + 2 recall waves) = 12 single-request Runners.
+# Setup: replace provider/model with your configured Backend target.
+# Run: llmperfctl campaign start -f examples/example-cohort-recall.yaml --wait
+# Observe: each wave visits every seed once; suffixes change while prefixes are retained.
+version: 1.0.0
+wait: true
+campaign:
+  name: fixed-cohort-recall
+  description: Visit four prefix seeds once, then recall the same cohort twice.
+task_definitions:
+- name: cohort
+  instances:
+    trials: 1
+    seed: 20261026
+  workflow:
+  - for_each: &cohort
+      # Enumerate every generated seed; unlike pick, this cannot skip or repeat a member.
+      name: cohort
+      variable: prefix
+      values: {seed: 20261020, count: 4}
+      parallelism: 2 # Two serial lanes; one request per child makes this a two-request cap.
+      node:
+        run:
+          name: request
+          prefix_seed: $prefix # Typed reference to the current cohort value.
+  - repeat:
+      # Each wave waits for all previous lane tails to succeed, then delays one second.
+      name: recalls
+      count: 2
+      every: {value: 1, unit: s}
+      node:
+        for_each: *cohort # YAML alias reuses the exact same cohort and lane definition.
+  runner:
+    provider: aliyun
+    model: deepseek-v4-pro
+    timeout: 60
+    concurrent_workers: 1
+    mean_output_tokens: 8
+    stddev_output_tokens: 0
+    additional_sampling_params:
+      temperature: 0
+    inputs:
+      default:
+        tokens: 128
+        shared_prefix_tokens: 96
+    worker: {}

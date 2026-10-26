@@ -1,0 +1,53 @@
+# Main role: combine Runner matrices, global phase barriers, and stable family prefixes.
+# Budget: 2 families x 3 phases x 2 cycles = 12 single-request Runners.
+# Setup: edit provider/model in the target anchor; all groups inherit that target.
+# Run: llmperfctl campaign start -f examples/example-matrix-phases.yaml --wait
+# Observe: load -> pressure -> read repeats twice, preserving target prefix identity.
+version: 1.0.0
+wait: true
+campaign:
+  name: matrix-phases
+  description: Two cycles of load, pressure, and read with stable target prefixes.
+  rounds:
+    count: 2
+    seed: 20261026
+    prefix_seed_scope: family # Keep target prefixes across phases and cycles.
+    phases: [load, pressure, read] # Labels define order, not Provider cache-tier policies.
+runner_groups:
+- name: target
+  phase: load
+  matrix: &families
+    # Each coordinate expands to one Runner in this phase and each cycle.
+    family: [1, 2]
+  runner: &target
+    provider: aliyun
+    model: deepseek-v4-pro
+    timeout: 60
+    concurrent_workers: 1
+    mean_output_tokens: 8
+    stddev_output_tokens: 0
+    additional_sampling_params:
+      temperature: 0
+    inputs:
+      default:
+        tokens: 128
+        shared_prefix_tokens: 96
+    worker: {}
+- name: pressure
+  # A separate group identity and zero shared prefix avoid reusing the target prefix.
+  phase: pressure
+  matrix:
+    family: [1, 2]
+  runner:
+    <<: *target
+    inputs:
+      default:
+        tokens: 128
+        shared_prefix_tokens: 0
+- name: target
+  # Reuse the same name, coordinates, and input settings to recall the target prefixes.
+  phase: read
+  matrix: *families
+  runner: *target
+# A phase waits for all preceding members to become terminal, including failures.
+# These small inputs demonstrate ordering and seed reuse, not cache eviction.

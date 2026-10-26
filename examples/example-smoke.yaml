@@ -1,16 +1,23 @@
+# Main role: verify one Provider request and persist its result before larger tests.
+# Budget: 1 request, 64 new-input tokens, at most 16 output tokens.
+# Setup: replace provider/model with an available Backend profile and exact model ID.
+# Run: llmperfctl runner start -f examples/example-smoke.yaml --wait
+# Observe: Runner status should be succeeded; use runner logs RUNNER_ID on failure.
 version: 1.0.0
 label: example-smoke
 metadata:
   purpose: verify-provider-and-persistence
+# Endpoints and credentials belong to the Backend profile, not this file.
 provider: aliyun
 model: deepseek-v4-pro
 timeout: 30
-concurrent_workers: 1
+concurrent_workers: 1 # At most one outstanding request in this Runner.
 mean_output_tokens: 16
 stddev_output_tokens: 0
 additional_sampling_params:
   temperature: 0
 inputs:
+  # Runner owns the prompt data; token targets exclude reused conversation history.
   default:
     tokens: 64
-worker: {}
+worker: {} # No repeat or steps means one Worker using the default input.

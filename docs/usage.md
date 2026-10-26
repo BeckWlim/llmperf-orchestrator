@@ -258,11 +258,10 @@ carry no built-in cache behavior. `seed: date` is frozen per API request; use an
 for reproducible preview/submission. `campaign preview` shows the resolved seed,
 phase order, matrix sizes and cycle count without preparing or submitting requests.
 The expanded limit is 10,000 Runners. See [limitations](limitations.md#matrix-phases-and-long-running-experiments)
-for recovery/failure semantics. The operational [background and L4 campaigns](../workloads/README.md)
-use independent task graphs with one request per Runner.
+for recovery/failure semantics.
 
 For independent family sequences, use the bounded
-[`example-batch-sequence.yaml`](../examples/example-batch-sequence.yaml). Each `run` step
+[`example-family-recall.yaml`](../examples/example-family-recall.yaml). Each `run` step
 dispatches a whole Runner with its configured request count and concurrency. A repeated
 step waits for the preceding Runner's committed success, while other family instances
 advance independently. This differs from `campaign.rounds`, which retains a barrier

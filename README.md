@@ -109,7 +109,7 @@ For another Provider or Backend address, see the [configuration guide](docs/usag
 
 ### Run and inspect
 
-Open `examples/example-smoke.yaml` and set `benchmark.model` to an exact model ID from
+Open `examples/example-smoke.yaml` and set `model` to an exact model ID from
 the catalog above that your account can use. Then send one short request:
 
 ```bash

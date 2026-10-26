@@ -192,7 +192,7 @@ configuration to reproduce text. `campaign preview --debug` exposes resolved
 Batch dataset seeds use `batch-v1`: task seed, sorted matrix coordinates, trial index,
 and expanded node path (including repeat indices). Task seeds accept unsigned 64-bit
 integers. Legacy invoke payload seeds remain unchanged. See
-`examples/example-batch-sequence.yaml`. Eight families with 100 batches of 256 requests
+`examples/example-family-recall.yaml`. Eight families with 100 batches of 256 requests
 compile to 800 nodes and 204,800 target requests, with peak concurrency 64 when each batch
 allows eight requests. Counts inside a Runner must be included in safety estimates.
 
@@ -210,7 +210,7 @@ in that order, and appends the current input. Duplicates and structured content 
 Runner-owned cancellation of unsubmitted descendants; independent branches can continue.
 No named conversation object is needed. Outer `run` dependencies only wait; define message
 reuse within its `worker.steps`. Payloads may contain literal `text` in addition to `seed`.
-See `examples/example-multiturn.yaml`, `examples/example-message-merge.yaml`, and `docs/runtime.md`.
+See `examples/example-message-merge.yaml` for multi-turn history and ordered merging, and `docs/runtime.md` for execution semantics.
 
 ```yaml
 task_definitions:
