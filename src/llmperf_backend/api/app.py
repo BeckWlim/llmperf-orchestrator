@@ -1257,6 +1257,45 @@ def create_app(
         )
         return campaign
 
+    @api.get("/campaigns/{campaign_id}/logs", tags=["campaigns"])
+    async def get_campaign_logs(
+        request: Request,
+        campaign_id: str,
+        limit: int = Query(default=20, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> Dict[str, Any]:
+        repository = request.app.state.runner_repository
+        if await repository.get_campaign(campaign_id) is None:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        records = await repository.list_campaign_log_records(
+            campaign_id, limit + 1, offset
+        )
+        items = []
+        for record in records[:limit]:
+            try:
+                logs = await repository.read_logs(record.get("log_key"))
+            except (OSError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Runner log file unavailable: {record['runner_id']}",
+                ) from exc
+            items.append(
+                {
+                    "runner_id": record["runner_id"],
+                    "status": record["status"],
+                    "scheduler_id": record.get("scheduler_id"),
+                    "worker": record.get("worker"),
+                    **logs,
+                }
+            )
+        return {
+            "campaign_id": campaign_id,
+            "items": items,
+            "limit": limit,
+            "offset": offset,
+            "next_offset": offset + limit if len(records) > limit else None,
+        }
+
     @api.post("/campaigns/{campaign_id}/cancel", tags=["campaigns"])
     async def cancel_campaign(request: Request, campaign_id: str) -> Dict[str, Any]:
         require_role(request, "operator")

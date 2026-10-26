@@ -116,6 +116,7 @@ the catalog above that your account can use. Then send one short request:
 llmperfctl runner start -f examples/example-smoke.yaml --wait
 llmperfctl runner list --limit 5
 llmperfctl runner status RUNNER_ID
+llmperfctl runner logs RUNNER_ID
 ```
 
 Use the Runner ID printed by the start command. A successful smoke test ends with

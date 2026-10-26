@@ -798,9 +798,37 @@ def _runner_wait(document: Any, detailed: bool) -> Any:
 
 def _runner_logs(document: Any, detailed: bool) -> Dict[str, Any]:
     source = _object(document, "runner.logs")
-    result = project_runner(source, detailed=True)
+    for field in ("runner_id", "status"):
+        if not isinstance(source.get(field), str) or not source[field]:
+            raise ClientError(f"Runner logs {field} must be nonempty text")
+    for stream in ("stdout", "stderr"):
+        if stream not in source or (
+            source[stream] is not None and not isinstance(source[stream], str)
+        ):
+            raise ClientError(f"Runner logs {stream} must be text or null")
+    result = project_runner(source)
     result["stdout"] = source.get("stdout")
     result["stderr"] = source.get("stderr")
+    return result
+
+
+def _campaign_logs(document: Any, detailed: bool) -> Dict[str, Any]:
+    source = _object(document, "campaign.logs")
+    campaign_id = source.get("campaign_id")
+    if not isinstance(campaign_id, str) or not campaign_id:
+        raise ClientError("Campaign logs campaign_id must be nonempty text")
+    for field in ("limit", "offset", "next_offset"):
+        value = source.get(field)
+        if field == "next_offset" and value is None and field in source:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < (1 if field == "limit" else 0)
+        ):
+            raise ClientError(f"Campaign logs {field} must be a valid pagination count")
+    result = _items(source, "campaign.logs", lambda item: _runner_logs(item, detailed))
+    result.update(campaign_id=campaign_id, next_offset=source["next_offset"])
     return result
 
 
@@ -837,6 +865,7 @@ _ADAPTERS: Dict[str, Projector] = {
     "campaign.start": project_campaign_start,
     "campaign.status": _campaign_status,
     "campaign.list": _campaign_list,
+    "campaign.logs": _campaign_logs,
     "campaign.cancel": _campaign_one,
     "campaign.export": _export_result,
     "runner.start": _runner_one,
@@ -884,6 +913,8 @@ def _renderer(route: str, arguments: Any) -> str:
         return "runner_summary"
     if route == "runner.logs":
         return "runner_logs"
+    if route == "campaign.logs" and not getattr(arguments, "json", False):
+        return "campaign_logs"
     if route == "provider.list" and not getattr(arguments, "json", False):
         return "provider_table"
     if route == "provider.models" and not getattr(arguments, "json", False):

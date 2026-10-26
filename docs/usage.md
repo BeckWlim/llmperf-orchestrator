@@ -300,6 +300,7 @@ Copy the returned `campaign_id`, then inspect the Campaign and its Runners:
 
 ```bash
 llmperfctl campaign status CAMPAIGN_ID
+llmperfctl campaign logs CAMPAIGN_ID
 llmperfctl runner list --limit 20
 ```
 
@@ -423,6 +424,20 @@ llmperfctl campaign status CAMPAIGN_ID
 llmperfctl planner events RUNNER_PLAN_ID
 llmperfctl campaign export CAMPAIGN_ID -o campaign-report.json
 ```
+
+`runner logs RUNNER_ID` includes timestamped execution events for new shared-worker
+runs, including successful Workers, latency/token counts, timeouts, and final counts.
+Logs are saved at completion or explicit cancellation. Long logs retain a bounded tail
+with a truncation notice; older runs may have empty streams.
+
+`campaign logs CAMPAIGN_ID` groups those saved logs by Runner, including each Runner's
+ID and status. It shows up to 20 Runners in creation order; use `--limit` (1–200) and
+`--offset` to page through larger Campaigns, or `--json` for the same structured data.
+The output prints a next-page command when more Runners exist. Pending plans and task
+nodes without materialized Runners have no Runner logs yet. The API is
+`GET /api/v1/campaigns/{campaign_id}/logs?limit=20&offset=0`; its response contains
+`campaign_id`, `items`, `limit`, `offset`, and nullable `next_offset`. Each item carries
+Runner identity/status and saved stdout/stderr. No database migration is required.
 
 Campaign lifecycle `status` and aggregate execution `outcome` are independent.
 For example, `status=completed, outcome=partial_failed` means all bounded work

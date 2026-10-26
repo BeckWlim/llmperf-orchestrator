@@ -355,3 +355,148 @@ def test_targeted_reconciliation(monkeypatch):
         assert visited == ["background", "probe"]
 
     asyncio.run(exercise())
+
+
+def test_incremental_staging():
+    from unittest.mock import AsyncMock
+    from llmperf_backend.runtime.coordinator import RuntimeCoordinator
+
+    async def exercise():
+        second_started = asyncio.Event()
+        release_second = asyncio.Event()
+        repository = AsyncMock()
+        repository.runtime_snapshot.return_value = {
+            "runners": [],
+            "instances": [
+                {
+                    "instance_id": "campaign",
+                    "state": "planned",
+                    "created_at": datetime.now(timezone.utc),
+                    "nodes": [
+                        {
+                            "node_id": node_id,
+                            "dependencies": (),
+                            "delay_seconds": 0,
+                            "state": "pending",
+                            "completed_at": None,
+                            "terminal_status": None,
+                        }
+                        for node_id in ("first", "second")
+                    ],
+                }
+            ],
+        }
+
+        async def activate(node_id, due_at):
+            if node_id == "second":
+                second_started.set()
+                await release_second.wait()
+            return {"runner_id": node_id, "campaign_id": "campaign"}
+
+        repository.activate_node.side_effect = activate
+        coordinator = RuntimeCoordinator(repository, ready_capacity=4096)
+        reconciliation = asyncio.create_task(coordinator.reconcile())
+        try:
+            await asyncio.wait_for(second_started.wait(), 1)
+            assert list(coordinator.queues["campaign"]) == ["first"]
+            await asyncio.wait_for(coordinator.wait_ready(), 1)
+        finally:
+            release_second.set()
+            await reconciliation
+        assert list(coordinator.queues["campaign"]) == ["first", "second"]
+
+    asyncio.run(exercise())
+
+
+def test_materialization_rotation():
+    from unittest.mock import AsyncMock
+    from llmperf_backend.runtime.coordinator import RuntimeCoordinator
+
+    async def exercise():
+        repository = AsyncMock()
+        repository.runtime_snapshot.return_value = {
+            "runners": [],
+            "instances": [
+                {
+                    "instance_id": instance_id,
+                    "state": "planned",
+                    "created_at": datetime.now(timezone.utc),
+                    "nodes": [
+                        {
+                            "node_id": f"{instance_id}-{index}",
+                            "dependencies": (),
+                            "delay_seconds": 0,
+                            "state": "pending",
+                            "completed_at": None,
+                            "terminal_status": None,
+                        }
+                        for index in range(3)
+                    ],
+                }
+                for instance_id in ("first", "second", "third")
+            ],
+        }
+
+        async def activate(node_id, due_at):
+            return {"runner_id": node_id, "campaign_id": node_id.split("-")[0]}
+
+        repository.activate_node.side_effect = activate
+        # A zero time slice deterministically permits one activation per pass.
+        coordinator = RuntimeCoordinator(repository, interval_seconds=0)
+        for _ in range(3):
+            await coordinator.reconcile()
+        assert [call.args[0] for call in repository.activate_node.await_args_list] == [
+            "first-0",
+            "second-0",
+            "third-0",
+        ]
+        assert set(coordinator.queues) == {"first", "second", "third"}
+
+    asyncio.run(exercise())
+
+
+def test_late_campaign():
+    from unittest.mock import AsyncMock
+    from llmperf_backend.runtime.coordinator import RuntimeCoordinator
+
+    async def exercise():
+        repository = AsyncMock()
+        instances = [
+            {
+                "instance_id": instance_id,
+                "state": "planned",
+                "created_at": datetime.now(timezone.utc),
+                "nodes": [
+                    {
+                        "node_id": f"{instance_id}-{index}",
+                        "dependencies": (),
+                        "delay_seconds": 0,
+                        "state": "pending",
+                        "completed_at": None,
+                        "terminal_status": None,
+                    }
+                    for index in range(4)
+                ],
+            }
+            for instance_id in ("existing", "new")
+        ]
+        repository.runtime_snapshot.side_effect = [
+            {"runners": [], "instances": instances[:1]},
+            {"runners": [], "instances": instances},
+        ]
+
+        async def activate(node_id, due_at):
+            return {"runner_id": node_id, "campaign_id": node_id.split("-")[0]}
+
+        repository.activate_node.side_effect = activate
+        coordinator = RuntimeCoordinator(repository, interval_seconds=0)
+        await coordinator.reconcile()
+        await coordinator.reconcile()
+        assert [call.args[0] for call in repository.activate_node.await_args_list] == [
+            "existing-0",
+            "new-0",
+        ]
+        assert len(coordinator.queues["existing"]) == 1
+        assert len(coordinator.queues["new"]) == 1
+
+    asyncio.run(exercise())

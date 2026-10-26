@@ -26,7 +26,11 @@ from llmperf.datasets.tokenizer import TOKENIZER_FAST, TOKENIZER_PATH
 from llmperf_backend.runtime.dispatch import WorkerDispatcher
 from llmperf_backend.runtime.admission import RunnerAdmission
 from llmperf_backend.runtime.request_pool import RouterHandle
-from llmperf_backend.runtime.runner import RunnerRuntime, WorkflowTaskLogic
+from llmperf_backend.runtime.runner import (
+    RunnerExecutionLog,
+    RunnerRuntime,
+    WorkflowTaskLogic,
+)
 from llmperf_backend.runtime.worker import (
     WORKER_DATASET_PATH,
     INPUT_DATASET_PATHS,
@@ -359,6 +363,7 @@ class RunnerPreparation:
         self._cancelled = threading.Event()
         self.phase = "creating"
         self.created_workers = 0
+        self.execution_log: Optional[RunnerExecutionLog] = None
 
     def progress(self) -> Dict[str, Any]:
         phase = (
@@ -380,6 +385,8 @@ class RunnerPreparation:
     ) -> None:
         if self.local_task is not None:
             raise RuntimeError("Runner preparation already started")
+        execution_log = RunnerExecutionLog(self.runner_id, log_limit)
+        self.execution_log = execution_log
         loop = asyncio.get_running_loop()
         bus = self.dispatcher.register(
             self.runner_id,
@@ -392,6 +399,7 @@ class RunnerPreparation:
             import time
 
             try:
+                execution_log.record("runner.started")
                 if self._cancelled.is_set():
                     raise asyncio.CancelledError
                 self.phase = "creating"
@@ -399,6 +407,7 @@ class RunnerPreparation:
                 # performed by the request actor after the router grants its slot.
                 steps = worker_steps(benchmark, calibrated=True)
                 self.created_workers = len(steps)
+                execution_log.record("workers.created", count=self.created_workers)
                 self.phase = "submitting"
                 runtime = RunnerRuntime(
                     self.runner_id,
@@ -408,6 +417,7 @@ class RunnerPreparation:
                     duration_seconds(benchmark["timeout"]),
                     max_outstanding_workers=benchmark.get("concurrent_workers"),
                     admission=self.admission,
+                    execution_log=execution_log,
                     cooldown_seconds=(
                         duration_seconds(benchmark["every"])
                         if benchmark.get("every") is not None
@@ -419,6 +429,7 @@ class RunnerPreparation:
                 responses = await self._dispatch_future
                 finished_at = time.monotonic()
                 self.phase = "aggregating"
+                execution_log.record("runner.aggregating", completed=len(responses))
                 summary, requests = await loop.run_in_executor(
                     self.executor,
                     aggregate_workers,
@@ -432,26 +443,43 @@ class RunnerPreparation:
                 _attach_runtime(summary, execution_runtime)
                 summary["worker_creation"] = {"created": self.created_workers}
                 self.phase = "finished"
+                execution_log.record(
+                    "runner.finished",
+                    succeeded=sum(
+                        result.succeeded for result in runtime.results.values()
+                    ),
+                    failed=sum(
+                        not result.succeeded for result in runtime.results.values()
+                    ),
+                    cancelled=len(runtime.cancelled_steps),
+                    timed_out=runtime.timed_out,
+                    elapsed_seconds=finished_at - started_at,
+                )
                 return {
                     "ok": True,
                     "summary": summary,
                     "requests": requests,
-                    "stdout": "",
+                    "stdout": execution_log.text(),
                     "stderr": "",
                 }
             except asyncio.CancelledError:
                 self.phase = "cancelled"
+                execution_log.record("runner.cancelled")
                 raise
             except Exception as exc:
                 self.phase = "failed"
+                execution_log.record("runner.failed", error_type=type(exc).__name__)
                 return {
                     "ok": False,
                     "error": f"{type(exc).__name__}: {exc}",
-                    "stdout": "",
+                    "stdout": execution_log.text(),
                     "stderr": traceback.format_exc()[-log_limit:],
                 }
 
         self.local_task = asyncio.create_task(execute_workers())
+
+    def captured_stdout(self) -> str:
+        return self.execution_log.text() if self.execution_log is not None else ""
 
     def ready(self) -> bool:
         return self.local_task is not None and self.local_task.done()

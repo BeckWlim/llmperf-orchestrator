@@ -109,6 +109,7 @@ class RuntimeCoordinator:
         self.last_error: Optional[str] = None
         self.instances: Dict[str, Dict[str, Any]] = {}
         self.ready_capacity = ready_capacity
+        self._last_materialized_instance_id: Optional[str] = None
 
     async def start(self) -> None:
         await self.reconcile()
@@ -123,12 +124,14 @@ class RuntimeCoordinator:
         self.order.clear()
         self.admitted.clear()
         self.instances.clear()
+        self._last_materialized_instance_id = None
 
     async def reconcile(self, runner_id: Optional[str] = None) -> None:
         snapshot = await self.repository.runtime_snapshot(runner_id)
         runners = ready_round_runners(
             snapshot["runners"], snapshot.get("round_states", [])
         )
+        await self._enqueue_runners(runners)
         now = datetime.now(timezone.utc)
         if runner_id is None:
             self.instances.clear()
@@ -140,24 +143,50 @@ class RuntimeCoordinator:
         # A Runner notification changes only the returned instance. Rechecking
         # every cached graph here makes each completion scale with all campaigns.
         # Periodic full snapshots still revisit every instance and repair missed events.
-        for instance in snapshot["instances"]:
-            if instance["state"] not in {"planned", "active"}:
-                continue
+        eligible_instances = [
+            instance
+            for instance in snapshot["instances"]
+            if instance["state"] in {"planned", "active"}
+        ]
+        previous_index = next(
+            (
+                index
+                for index, instance in enumerate(eligible_instances)
+                if instance["instance_id"] == self._last_materialized_instance_id
+            ),
+            None,
+        )
+        start_index = previous_index + 1 if previous_index is not None else 0
+        ordered_instances = (
+            eligible_instances[start_index:] + eligible_instances[:start_index]
+        )
+        candidates: deque[tuple[Dict[str, Any], deque[tuple[str, datetime]]]] = deque()
+        for instance in ordered_instances:
             nodes = [NodeSnapshot(**node) for node in instance["nodes"]]
-            for node_id, due_at in ready_nodes(
-                nodes, instance["created_at"], now
-            ).items():
-                if (
-                    len(runners) + sum(map(len, self.queues.values()))
-                    >= self.ready_capacity
-                ):
-                    break
-                runner = await self.repository.activate_node(node_id, due_at)
-                if runner is not None:
-                    runners.append(runner)
-                    for node in instance["nodes"]:
-                        if node["node_id"] == node_id:
-                            node["state"] = "emitted"
+            due_nodes = deque(ready_nodes(nodes, instance["created_at"], now).items())
+            if due_nodes:
+                candidates.append((instance, due_nodes))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.interval_seconds
+        while candidates and sum(map(len, self.queues.values())) < self.ready_capacity:
+            candidate_instance, pending_nodes = candidates.popleft()
+            node_id, due_at = pending_nodes.popleft()
+            runner = await self.repository.activate_node(node_id, due_at)
+            self._last_materialized_instance_id = candidate_instance["instance_id"]
+            if runner is not None:
+                await self._enqueue_runners([runner])
+                for node in candidate_instance["nodes"]:
+                    if node["node_id"] == node_id:
+                        node["state"] = "emitted"
+            if pending_nodes:
+                candidates.append((candidate_instance, pending_nodes))
+            # Refresh the snapshot promptly even when activation is slow. Remember
+            # the last instance so a short pass cannot always favor the first one.
+            if loop.time() >= deadline:
+                break
+
+    async def _enqueue_runners(self, runners: List[Dict[str, Any]]) -> None:
+        """Publish ready work before continuing potentially slow materialization."""
         async with self.condition:
             for runner in runners:
                 if sum(map(len, self.queues.values())) >= self.ready_capacity:

@@ -2,6 +2,7 @@
 
 import asyncio
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 import hashlib
@@ -27,6 +28,75 @@ from llmperf_backend.runtime.triggers import (
     DependencyTrigger,
     Eligibility,
 )
+
+
+class RunnerExecutionLog:
+    """Bounded, Runner-local events; never redirect shared process streams."""
+
+    _TRUNCATED = "[Earlier Runner events omitted: log byte limit reached]\n"
+
+    def __init__(self, runner_id: str, byte_limit: int):
+        self.runner_id = runner_id
+        self.byte_limit = byte_limit
+        self._lines: deque[bytes] = deque()
+        self._size = 0
+        self._truncated = False
+
+    def record(self, event: str, **fields: str | int | float | bool | None) -> None:
+        # JSON-escape identifiers to keep each event on a single terminal-safe line.
+        details = " ".join(
+            f"{name}={json.dumps(value, ensure_ascii=True, allow_nan=False)}"
+            for name, value in fields.items()
+        )
+        line = (
+            f"{datetime.now(timezone.utc).isoformat()} "
+            f"runner={json.dumps(self.runner_id, ensure_ascii=True)} {event} {details}\n"
+        ).encode("utf-8")
+        capacity = max(0, self.byte_limit - len(self._TRUNCATED.encode("utf-8")))
+        if len(line) > capacity:
+            self._truncated = True
+            return
+        while self._lines and self._size + len(line) > capacity:
+            self._size -= len(self._lines.popleft())
+            self._truncated = True
+        self._lines.append(line)
+        self._size += len(line)
+
+    def text(self) -> str:
+        prefix = self._TRUNCATED if self._truncated else ""
+        return prefix[: self.byte_limit] + b"".join(self._lines).decode("utf-8")
+
+    def completion(self, result: "WorkerResult") -> None:
+        fields: dict[str, str | int | float | bool | None] = {
+            "worker": result.step_id,
+            "state": "succeeded" if result.succeeded else "failed",
+        }
+        metrics = result.response[0]
+        for name in (
+            constants.E2E_LAT,
+            constants.TTFT,
+            constants.NUM_INPUT_TOKENS,
+            constants.NUM_OUTPUT_TOKENS,
+        ):
+            value = metrics.get(name)
+            fields[name] = (
+                value
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                else None
+            )
+        # Provider error text may echo credentials or prompts. Keep only short codes.
+        error_code = metrics.get(constants.ERROR_CODE)
+        if isinstance(error_code, int) and not isinstance(error_code, bool):
+            fields["error_code"] = error_code
+        elif (
+            isinstance(error_code, str)
+            and len(error_code) <= 64
+            and all(char.isalnum() or char in "_-" for char in error_code)
+        ):
+            fields["error_code"] = error_code
+        self.record("worker.completed", **fields)
 
 
 @dataclass(frozen=True)
@@ -180,6 +250,7 @@ class RunnerRuntime:
         max_outstanding_workers: Optional[int] = None,
         cooldown_seconds: Optional[float] = None,
         admission: Optional[RunnerAdmission] = None,
+        execution_log: Optional[RunnerExecutionLog] = None,
     ):
         if max_outstanding_workers is not None and max_outstanding_workers < 1:
             raise ValueError("max_outstanding_workers must be positive when specified")
@@ -204,6 +275,7 @@ class RunnerRuntime:
         self.cancelled_steps: Dict[str, WorkerCancellation] = {}
         self.outstanding: set[str] = set()
         self.timed_out = False
+        self.execution_log = execution_log
 
     async def _cancel_step(
         self, step: RequestStep, failed_dependencies: list[str]
@@ -228,11 +300,19 @@ class RunnerRuntime:
             )
         )
         self.cancelled_steps[step.step_id] = cancellation
+        if self.execution_log is not None:
+            self.execution_log.record(
+                "worker.cancelled", worker=step.step_id, reason=cancellation.reason
+            )
 
     async def _submit(self, step: RequestStep) -> None:
+        if self.execution_log is not None:
+            self.execution_log.record("worker.admission_wait", worker=step.step_id)
         if self.admission is not None:
             await self.admission.acquire(self.runner_id)
         await self.scheduler.submit(self.runner_id, step, self.window)
+        if self.execution_log is not None:
+            self.execution_log.record("worker.submitted", worker=step.step_id)
 
     async def run(self) -> List[LLMResponse]:
         loop = asyncio.get_running_loop()
@@ -271,18 +351,21 @@ class RunnerRuntime:
                                 self.next_worker_at = message.created_at + timedelta(
                                     seconds=self.cooldown_seconds
                                 )
-                            self.results.setdefault(
+                            completed_result = WorkerResult(
                                 identifier,
-                                WorkerResult(
-                                    identifier,
-                                    (
-                                        completion.metrics,
-                                        completion.generated_text,
-                                        completion.request,
-                                    ),
-                                    message.created_at,
+                                (
+                                    completion.metrics,
+                                    completion.generated_text,
+                                    completion.request,
                                 ),
+                                message.created_at,
                             )
+                            if (
+                                identifier not in self.results
+                                and self.execution_log is not None
+                            ):
+                                self.execution_log.completion(completed_result)
+                            self.results.setdefault(identifier, completed_result)
                             self.outstanding.discard(identifier)
                         elif message.topic == "worker.cancelled":
                             cancellation = WorkerCancellation.model_validate(
@@ -291,6 +374,15 @@ class RunnerRuntime:
                             if cancellation.step_id not in known_steps:
                                 raise ValueError(
                                     "Worker cancellation does not belong to Runner"
+                                )
+                            if (
+                                cancellation.step_id not in self.cancelled_steps
+                                and self.execution_log is not None
+                            ):
+                                self.execution_log.record(
+                                    "worker.cancelled",
+                                    worker=cancellation.step_id,
+                                    reason=cancellation.reason,
                                 )
                             self.cancelled_steps.setdefault(
                                 cancellation.step_id, cancellation
@@ -420,6 +512,13 @@ class RunnerRuntime:
                 remaining_seconds = deadline - loop.time()
                 if remaining_seconds <= 0:
                     self.timed_out = True
+                    if self.execution_log is not None:
+                        self.execution_log.record(
+                            "runner.timed_out",
+                            timeout_seconds=self.timeout_seconds,
+                            pending=len(pending),
+                            outstanding=len(self.outstanding),
+                        )
                     break
                 if (
                     pending

@@ -1109,6 +1109,24 @@ def print_runner_logs(document: Dict[str, Any]) -> None:
             print("(empty)")
 
 
+def print_campaign_logs(document: Dict[str, Any]) -> None:
+    print(f"Campaign: {document['campaign_id']}")
+    for item in document["items"]:
+        print()
+        print_runner_logs(item)
+    if not document["items"]:
+        print("No Runners found on this page.")
+    print(
+        f"\nShowing {len(document['items'])} Runner(s) "
+        f"(offset={document['offset']}, limit={document['limit']})."
+    )
+    if document["next_offset"] is not None:
+        print(
+            f"Next page: llmperfctl campaign logs {document['campaign_id']} "
+            f"--limit {document['limit']} --offset {document['next_offset']}"
+        )
+
+
 def render_result(result: object) -> None:
     """Render only registered projections; raw documents are rejected."""
 
@@ -1124,6 +1142,7 @@ def render_result(result: object) -> None:
         "runner_table": print_runner_table,
         "runner_summary": print_runner_summary,
         "runner_logs": print_runner_logs,
+        "campaign_logs": print_campaign_logs,
         "provider_table": print_provider_table,
         "provider_models": print_provider_models,
         "provider_reload": print_provider_reload,
@@ -2214,6 +2233,28 @@ Examples:
         action="store_true",
         help="Print the lightweight Campaign list as JSON",
     )
+    campaign_logs = _command_parser(
+        campaign_commands,
+        "logs",
+        help="Show saved logs grouped by Runner",
+        description="Read saved Runner logs in creation order; logs are persisted when execution finishes.",
+        epilog="Example:\n  llmperfctl campaign logs <campaign-id> --limit 20 --offset 0",
+    )
+    campaign_logs.add_argument(
+        "campaign_id", metavar="CAMPAIGN_ID", help="Campaign identifier"
+    )
+    campaign_logs.add_argument(
+        "--limit",
+        type=_preview_limit,
+        default=20,
+        help="Maximum Runners per page (1-200; default: 20)",
+    )
+    campaign_logs.add_argument(
+        "--offset", type=int, default=0, help="Pagination offset (default: 0)"
+    )
+    campaign_logs.add_argument(
+        "--json", action="store_true", help="Print grouped logs as JSON"
+    )
     campaign_cancel = _command_parser(
         campaign_commands,
         "cancel",
@@ -2598,6 +2639,12 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
         if arguments.campaign_command == "list":
             return _validate_campaign_list(
                 client.list_campaigns(arguments.limit, arguments.offset)
+            )
+        if arguments.campaign_command == "logs":
+            if arguments.offset < 0:
+                raise ClientError("Campaign log offset must be nonnegative")
+            return client.get_campaign_logs(
+                arguments.campaign_id, arguments.limit, arguments.offset
             )
         if arguments.campaign_command == "cancel":
             campaign = client.cancel_campaign(arguments.campaign_id)

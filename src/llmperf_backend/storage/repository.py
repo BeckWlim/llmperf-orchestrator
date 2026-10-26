@@ -2712,6 +2712,36 @@ class RunnerRepository:
     async def read_logs(self, key: Optional[str]) -> Dict[str, Optional[str]]:
         return await asyncio.to_thread(self.log_store.read, key)
 
+    async def list_campaign_log_records(
+        self, campaign_id: str, limit: int, offset: int
+    ) -> List[Dict[str, Any]]:
+        """Read log references without loading benchmark or result documents."""
+        statement = (
+            select(
+                BenchmarkRunnerRecord.id,
+                BenchmarkRunnerRecord.status,
+                BenchmarkRunnerRecord.scheduler_id,
+                BenchmarkRunnerRecord.exit_code,
+                BenchmarkRunnerRecord.log_key,
+            )
+            .where(BenchmarkRunnerRecord.campaign_id == campaign_id)
+            .order_by(BenchmarkRunnerRecord.created_at, BenchmarkRunnerRecord.id)
+            .limit(limit)
+            .offset(offset)
+        )
+        async with self.database.sessions() as session:
+            records = (await session.execute(statement)).all()
+            return [
+                {
+                    "runner_id": record.id,
+                    "status": record.status,
+                    "scheduler_id": record.scheduler_id,
+                    "worker": {"process_id": None, "exit_code": record.exit_code},
+                    "log_key": record.log_key,
+                }
+                for record in records
+            ]
+
     async def set_logs(
         self, runner_id: str, exit_code: int, stdout: str, stderr: str
     ) -> None:

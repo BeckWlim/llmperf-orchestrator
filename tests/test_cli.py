@@ -1506,6 +1506,7 @@ def test_adapter_route_registry():
         "auth.revoke",
         "campaign.cancel",
         "campaign.export",
+        "campaign.logs",
         "campaign.list",
         "campaign.preview",
         "campaign.start",
@@ -1606,6 +1607,86 @@ def test_adapter_redaction():
     assert auth_projection.payload == {
         "items": [{"username": "operator", "role": "operator"}]
     }
+
+
+def test_campaign_logs(monkeypatch, capsys):
+    requested_urls = []
+    raw = {
+        "campaign_id": "campaign-1",
+        "items": [
+            {
+                "runner_id": "runner-1",
+                "status": "succeeded",
+                "stdout": "worker.completed worker=first state=succeeded\n",
+                "stderr": None,
+                "log_key": "/private/path",
+                "benchmark": {"credentials": "secret"},
+            },
+            {
+                "runner_id": "runner-2",
+                "status": "failed",
+                "stdout": "worker.submitted worker=second\n",
+                "stderr": "execution failed\n",
+            },
+        ],
+        "limit": 2,
+        "offset": 0,
+        "next_offset": 2,
+    }
+
+    def fake_urlopen(request, timeout):
+        requested_urls.append(request.full_url)
+        return _FakeResponse(raw)
+
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
+    client = LLMPerfClient("http://127.0.0.1:8000")
+    arguments = build_parser().parse_args(
+        ["campaign", "logs", "campaign-1", "--limit", "2"]
+    )
+    document = execute(client, arguments)
+    projection = adapt_cli_response(arguments, document)
+    render_result(projection)
+    output = capsys.readouterr()
+    assert "Campaign: campaign-1" in output.out
+    assert "Runner: runner-1  Status: succeeded" in output.out
+    assert "Runner: runner-2  Status: failed" in output.out
+    assert "worker.completed worker=first state=succeeded" in output.out
+    assert "[stderr]\nexecution failed" in output.out
+    assert "--limit 2 --offset 2" in output.out
+    assert output.err == ""
+    assert "secret" not in str(projection.payload)
+    assert "/private/path" not in str(projection.payload)
+    json_arguments = build_parser().parse_args(
+        ["campaign", "logs", "campaign-1", "--json"]
+    )
+    render_result(adapt_cli_response(json_arguments, document))
+    assert json.loads(capsys.readouterr().out) == projection.payload
+    assert requested_urls == [
+        "http://127.0.0.1:8000/api/v1/campaigns/campaign-1/logs?limit=2&offset=0"
+    ]
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        [],
+        {"stdout": []},
+        {"runner_id": "r", "status": "running", "stdout": {}, "stderr": None},
+    ],
+)
+def test_campaign_log_validation(invalid):
+    arguments = build_parser().parse_args(["campaign", "logs", "campaign-1"])
+    with pytest.raises(ClientError):
+        adapt_cli_response(
+            arguments,
+            {
+                "campaign_id": "campaign-1",
+                "items": [invalid],
+                "limit": 20,
+                "offset": 0,
+                "next_offset": None,
+            },
+        )
 
 
 def test_log_output(capsys):

@@ -156,6 +156,55 @@ def test_worker_status(tmp_path: Path):
     assert scheduler.status()["live_slots"] == 0
 
 
+@pytest.mark.parametrize("runner_capacity", [2048, 4096])
+def test_large_staging(runner_capacity: int):
+    from datetime import datetime, timezone
+
+    class StagingRepository(UnusedRepository):
+        async def runtime_snapshot(self, runner_id=None):
+            return {
+                "runners": [
+                    {"runner_id": f"background-{index}", "campaign_id": "background"}
+                    for index in range(1536)
+                ],
+                "instances": [
+                    {
+                        "instance_id": "second-campaign",
+                        "state": "planned",
+                        "created_at": datetime.now(timezone.utc),
+                        "nodes": [
+                            {
+                                "node_id": "second-request",
+                                "dependencies": (),
+                                "delay_seconds": 0,
+                                "state": "pending",
+                                "completed_at": None,
+                                "terminal_status": None,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        async def activate_node(self, node_id, due_at):
+            return {"runner_id": node_id, "campaign_id": "second-campaign"}
+
+    async def exercise():
+        scheduler = Scheduler(
+            StagingRepository(),
+            SchedulerConfig(max_concurrent_runners=runner_capacity),
+            DatabaseConfig(url="postgresql+asyncpg:///unused_test"),
+            ProviderRegistry([], allow_empty=True),
+        )
+        await scheduler.coordinator.reconcile()
+        assert len(scheduler.coordinator.queues["background"]) == 1536
+        assert list(scheduler.coordinator.queues["second-campaign"]) == [
+            "second-request"
+        ]
+
+    asyncio.run(exercise())
+
+
 def test_tokenizer_injection(tmp_path: Path):
     tokenizer_directory = tmp_path / "tokenizer"
     tokenizer_directory.mkdir()

@@ -141,7 +141,11 @@ class Scheduler:
         self._worker_remote: Any = None
         self._active_workers: Dict[str, Worker | RunnerPreparation] = {}
         self._dispatcher: Optional[WorkerDispatcher] = None
-        self.coordinator = RuntimeCoordinator(repository, config.poll_interval_seconds)
+        self.coordinator = RuntimeCoordinator(
+            repository,
+            config.poll_interval_seconds,
+            ready_capacity=config.max_concurrent_runners,
+        )
         self._request_router: Optional[RouterHandle] = None
         self._request_actors: List[RequestActorHandle] = []
         self._preparation_actors: List[PreparationHandle] = []
@@ -789,7 +793,11 @@ class Scheduler:
                     CANCELLED,
                     "Benchmark cancelled by user",
                     None,
-                    "",
+                    (
+                        worker.captured_stdout()
+                        if isinstance(worker, RunnerPreparation)
+                        else ""
+                    ),
                     "",
                 )
                 LOGGER.info("Runner %s cancelled", runner_id)
@@ -865,7 +873,16 @@ class Scheduler:
             if worker is not None:
                 await self._cancel_worker(worker)
             await self.repository.finish_runner(
-                runner_id, FAILED, str(exc), 1, "", str(exc)
+                runner_id,
+                FAILED,
+                str(exc),
+                1,
+                (
+                    worker.captured_stdout()
+                    if isinstance(worker, RunnerPreparation)
+                    else ""
+                ),
+                str(exc),
             )
         finally:
             if worker is not None:

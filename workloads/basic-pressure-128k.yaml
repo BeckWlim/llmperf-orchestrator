@@ -1,0 +1,47 @@
+# Long-test variant of basic-pressure.yaml; see workloads/README.md.
+# 1,536 families x 156 requests = 239,616 requests, capped at 64 outstanding Workers.
+# Cooldowns are completion-relative; token counts are calibrated targets.
+version: 1.0.0
+wait: false
+runtime: {concurrent_workers: 64}
+campaign:
+  name: background-pressure-128k
+  description: >-
+    Long-running small-model pressure: 1,536 distinct-prefix Runners, 156 requests
+    each, 131,072-token inputs, and 544-second completion-relative cooldowns.
+task_definitions:
+- name: background-families
+  instances: {seed: 202610231201}
+  workflow:
+  - for_each:
+      name: prefixes
+      variable: prefix
+      values: {seed: 202610231101, count: 1536}
+      parallelism: 1536
+      node:
+        run: {name: batch, role: background, prefix_seed: $prefix}
+  runner:
+    mean_output_tokens: 16
+    stddev_output_tokens: 0
+    output_token_count: provider
+    input_token_count: estimate
+    additional_sampling_params:
+      temperature: 0
+      enable_thinking: false
+      stream_options: {include_usage: true}
+    timeout: 172800
+    concurrent_workers: 1
+    provider: dfs-chat
+    model: spark-x2.6-4b-L4-beta
+    tokenizer: {source: huggingface, id: hf-internal-testing/llama-tokenizer, revision: d02ad6cb9dd2c2296a6332199fa2fdca5938fef0,
+      use_fast: true}
+    inputs:
+      default:
+        tokens: 131072
+        shared_prefix_tokens: 104857
+        dataset: {source: huggingface, id: anon8231489123/ShareGPT_Vicuna_unfiltered, filename: ShareGPT_V3_unfiltered_cleaned_split.json,
+          revision: 192ab2185289094fc556ec8ce5ce1e8e587154ca, adapter: sharegpt-user}
+        dataset_prompt_mode: concatenate
+        dataset_repeat_count: 1
+    worker: {repeat: 156, every: 544.0}
+    label: background-prefix-pool-128k

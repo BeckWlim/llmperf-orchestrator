@@ -314,6 +314,37 @@ def test_config_validation(client_factory, postgresql_url):
         assert invalid.status_code == 422
 
 
+def test_campaign_log_storage(client_factory):
+    with client_factory() as client:
+        campaign = client.post("/api/v1/campaigns", json={"name": "logs"}).json()
+        campaign_id = campaign["campaign_id"]
+        runners = client.post(
+            f"/api/v1/campaigns/{campaign_id}/runners",
+            json={"runners": [{"label": "first"}, {"label": "second"}]},
+        ).json()["items"]
+        repository = client.app.state.runner_repository
+        client._active_loop().run_until_complete(
+            repository.set_logs(runners[0]["runner_id"], 0, "execution events\n", "")
+        )
+        records = client._active_loop().run_until_complete(
+            repository.list_campaign_log_records(campaign_id, 1, 0)
+        )
+        assert records[0]["runner_id"] == runners[0]["runner_id"]
+        assert records[0]["log_key"] is not None
+        assert "benchmark" not in records[0]
+        following = client._active_loop().run_until_complete(
+            repository.list_campaign_log_records(campaign_id, 1, 1)
+        )
+        assert following[0]["runner_id"] == runners[1]["runner_id"]
+        assert following[0]["log_key"] is None
+        assert (
+            client._active_loop().run_until_complete(
+                repository.list_campaign_log_records("missing", 20, 0)
+            )
+            == []
+        )
+
+
 def test_runner_lifecycle(client_factory):
     with client_factory() as client:
         campaign = client.post(

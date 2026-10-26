@@ -1,6 +1,6 @@
 # Background pressure and periodic L4 recall
 
-This directory contains two independent campaigns for `dfs-beta` /
+The original two independent campaigns target `dfs-beta` /
 `spark-x2.5-1.7b-L4`. Both use 65,536 input tokens, a 52,428-token shared
 prefix, a fresh suffix, 16 output tokens, and one request per Worker.
 Inputs use the default `input_token_count: estimate`: the pinned general tokenizer
@@ -11,6 +11,7 @@ token numbers are targets; inference-reported usage is authoritative. Set
 | Campaign | Shape | Request budget | Maximum outstanding requests |
 | --- | --- | ---: | ---: |
 | `basic-pressure.yaml` | 1,536 distinct-seed Runners; 156 Workers each; 544-second completion-relative cooldown | 239,616 | 24 |
+| `basic-pressure-128k.yaml` | Same long-test shape; 131,072-token inputs and an independent prefix pool | 239,616 | 64 |
 | `l4-recall.yaml` | Prime 256 prefixes, then 36 recall waves; 32 serial lanes of eight members per wave | 9,472 | 32 |
 
 The background uses the generic submission ceiling `runtime.concurrent_workers: 24`.
@@ -18,6 +19,39 @@ Recall uses 32 serial lanes. Together they offer at most 56 Workers to the 64-sl
 pool, without reserving capacity from other submissions. Runners release active
 Runner admission during cooldown and compete for it again when due; the existing
 1,024 active Runner limit does not need to increase to cover every seed.
+
+## 128K long-test variant
+
+`basic-pressure-128k.yaml` targets `dfs-chat` / `spark-x2.6-4b-L4-beta` and
+preserves the original 1,536-family pool, 156 requests per family,
+544-second completion-relative cooldown, 16-token
+output target, and 172,800-second (48-hour) Runner timeout. Its input target is
+131,072 tokens (128 × 1024), with a 104,857-token shared prefix (80%, rounded down)
+and a 26,215-token fresh suffix. Independent fixed pool and task seeds separate it
+from the original workload. Token counts remain estimates; provider usage is authoritative.
+
+The campaign-wide `runtime.concurrent_workers: 64` bounds outstanding Workers
+across all families; each Runner still allows one at a time. This caps use of the
+128-slot Backend without reserving slots or guaranteeing 64 simultaneous requests.
+The 155 cooldowns total 23 h 25 m 20 s per Runner, plus execution and admission
+time, bounded by the Runner timeout. The full budget is 239,616 requests and
+31,410,782,208 configured input/output tokens. Total budgets are advisory only when
+campaign-total admission is disabled. The original 64K cache-footprint estimates
+below do not apply unchanged to this larger-input variant.
+
+Validate against the 16-actor, eight-requests-per-actor runtime:
+
+```bash
+.venv/bin/python .codex/skills/operate-llmperf/scripts/validate_workload.py \
+  workloads/basic-pressure-128k.yaml --scheduler-slots 4096 --ray-num-cpus 32 \
+  --ray-actor-num-cpus 1.5 --ray-actor-max-concurrency 8 --preparation-workers 8 \
+  --max-runner-concurrency 128 --max-effective-concurrency 128
+```
+
+Artifact validation and model-context acceptance are separate: a successful
+`campaign validate` does not prove that the provider accepts the generated input
+plus output. Prove that with a bounded smoke before starting this long test.
+Creating or copying this YAML does not submit it.
 
 ## Evidence and sizing assumptions
 

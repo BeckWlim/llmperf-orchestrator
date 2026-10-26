@@ -43,6 +43,17 @@ Persist this directory outside the container; `/runners/{id}/logs` reads the fil
 and checks its digest. Removed files return empty logs; their metadata remains usable.
 Runner listings and exports carry the key rather than embedding log text.
 
+Shared-worker Runners retain timestamped execution events in stdout: creation counts,
+Worker admission/submission and completion, numeric latency/token metrics, dependency
+cancellation, timeout, and final counts. Each Runner owns a bounded event buffer;
+older events are dropped with an explicit truncation notice. These logs do not capture
+global process streams or include prompts, generated text, credentials, or raw Provider
+error bodies. Exceptions retain the existing stderr traceback path. Events are persisted
+when the Runner finishes or is explicitly cancelled; `runner logs` is not a live stream.
+An abrupt Backend stop can lose buffered events. Previously completed Runners with empty
+logs cannot acquire these events retroactively; deploying this change requires a Backend
+restart and a new run.
+
 `workers` stores only reservation identity, generation, state, timestamps and a
 completion digest. The durable `runner_messages` mailbox holds the sole full Worker
 completion payload; no second request/result JSON copy is kept in the reservation row.
@@ -118,7 +129,13 @@ messages, metrics, and adapter objects are isolated per request. Actors never ch
 process environment to switch Providers.
 
 `LLMPERF_RUNNERS_MAX` independently bounds active logical Runner handles. Its default is
-1024, independently of eight Backend aggregation threads. An existing explicit
+1024, independently of eight Backend aggregation threads. The coordinator's ready
+queue uses the same budget, so increasing it also allows more task Runners to be
+materialized and staged. Each created Runner is published immediately; execution
+does not wait for the whole materialization batch. Materialization rotates across
+ready task instances and yields after the reconciliation interval so new campaigns
+are discovered while existing family pools are still being created. This does not increase request
+actor capacity. An existing explicit
 value of 8 remains a limit of eight simultaneous one-request Runners. Ordinary Runners can
 omit `concurrent_workers` to leave admission to Scheduler. An explicit value sets an
 optional rolling ceiling on outstanding Workers, including queued and uncommitted results. The shared router fairly

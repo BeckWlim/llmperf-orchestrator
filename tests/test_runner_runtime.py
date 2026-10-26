@@ -13,7 +13,7 @@ from llmperf.benchmark.execution import RequestStep
 from llmperf.clients.models import RequestConfig
 from llmperf_backend.runtime.messages import RunnerMessage, RunnerMessageBus
 from llmperf_backend.runtime.runner import RunnerRuntime, WorkflowTaskLogic
-from llmperf_backend.runtime.runner import WorkerResult
+from llmperf_backend.runtime.runner import RunnerExecutionLog, WorkerResult
 from llmperf_backend.runtime.dispatch import WorkerDispatcher
 from llmperf_backend.runtime.admission import RunnerAdmission
 from llmperf_backend.configuration.models import BenchmarkConfig
@@ -307,17 +307,22 @@ def test_cancel_backpressure():
         bus = RunnerMessageBus("runner", MemoryMessages())
         scheduler = FakeScheduler(bus, 1)
         scheduler.hold = asyncio.Event()
+        execution_log = RunnerExecutionLog("runner", 4096)
         runtime = RunnerRuntime(
             "runner",
             WorkflowTaskLogic(steps(100), datetime.now(timezone.utc)),
             scheduler,
             bus,
             0.02,
+            execution_log=execution_log,
         )
         assert await asyncio.wait_for(runtime.run(), 1) == []
         assert runtime.timed_out
         assert scheduler.cancelled
         assert len(scheduler.submitted) == 1
+        assert "runner.timed_out" in execution_log.text()
+        assert 'worker.submitted worker="0"' in execution_log.text()
+        assert 'worker.submitted worker="1"' not in execution_log.text()
 
     asyncio.run(run())
 
@@ -605,6 +610,19 @@ def test_preparation_yields(monkeypatch):
                         )
                     )
                 assert all(result["ok"] for result in results)
+                for runner, result in zip(runners, results):
+                    output = result["stdout"]
+                    assert "runner.started" in output
+                    assert "workers.created count=1" in output
+                    assert "worker.submitted" in output
+                    assert 'state="succeeded"' in output
+                    assert "runner.finished succeeded=1 failed=0" in output
+                    assert "answer" not in output
+                    assert "unused" not in output
+                    assert all(
+                        f'runner="{runner.runner_id}"' in line
+                        for line in output.splitlines()
+                    )
                 assert all(
                     result["summary"]["worker_creation"]["created"] == 1
                     for result in results
@@ -616,6 +634,111 @@ def test_preparation_yields(monkeypatch):
                 for runner in runners:
                     runner.cancel()
                     await dispatcher.unregister(runner.runner_id)
+
+    asyncio.run(run())
+
+
+def test_execution_log_bounds():
+    execution_log = RunnerExecutionLog("runner", 1024)
+    request = RequestConfig(model="test", prompt=("private prompt", 2))
+    result = WorkerResult(
+        "worker\n\x1b[31m",
+        (
+            {
+                "end_to_end_latency_s": 0.25,
+                "ttft_s": float("nan"),
+                "number_input_tokens": 2,
+                "number_output_tokens": 3,
+                "error_code": 429,
+                "error_msg": "private credentials",
+                "response_headers": {"authorization": "secret"},
+            },
+            "private answer",
+            request,
+        ),
+        datetime.now(timezone.utc),
+    )
+    for _ in range(50):
+        execution_log.completion(result)
+    output = execution_log.text()
+    assert len(output.encode("utf-8")) <= 1024
+    assert output.startswith("[Earlier Runner events omitted")
+    assert 'state="failed"' in output
+    assert "error_code=429" in output
+    assert "end_to_end_latency_s=0.25" in output
+    assert "ttft_s=null" in output
+    assert "private" not in output
+    assert "secret" not in output
+    assert "\x1b" not in output
+    assert "worker\\n\\u001b[31m" in output
+
+
+def test_dependency_logs():
+    async def run():
+        bus = RunnerMessageBus("runner", MemoryMessages())
+        scheduler = FakeScheduler(bus, 1)
+        scheduler.fail.add("0")
+        initial = steps(2)
+        child = RequestStep("1", initial[1].request, ("0",))
+        execution_log = RunnerExecutionLog("runner", 4096)
+        runtime = RunnerRuntime(
+            "runner",
+            WorkflowTaskLogic([initial[0], child], datetime.now(timezone.utc)),
+            scheduler,
+            bus,
+            2,
+            execution_log=execution_log,
+        )
+        await asyncio.wait_for(runtime.run(), 3)
+        output = execution_log.text()
+        assert 'worker.completed worker="0" state="failed"' in output
+        assert 'worker.cancelled worker="1" reason="dependency_failed"' in output
+        assert output.count("worker.completed") == 1
+        assert output.count("worker.cancelled") == 1
+
+    asyncio.run(run())
+
+
+def test_preparation_failure_logs(monkeypatch):
+    import llmperf_backend.runtime.preparation as preparation
+
+    def fail_aggregation(*args):
+        raise RuntimeError("aggregation failed")
+
+    monkeypatch.setattr(preparation, "aggregate_workers", fail_aggregation)
+
+    async def run():
+        router = Mock()
+
+        async def request(runner_id, configuration, environment):
+            return {}, "answer", configuration
+
+        router.execute.remote = AsyncMock(side_effect=request)
+        router.cancel.remote = AsyncMock()
+        dispatcher = WorkerDispatcher(router, MemoryJournal(), 1)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            runner = preparation.RunnerPreparation("runner", executor, dispatcher)
+            runner.start(
+                {
+                    "repeat": 1,
+                    "model": "test",
+                    "adapter": "openai",
+                    "mean_input_tokens": 10,
+                    "timeout": 2,
+                },
+                {},
+                {},
+                4096,
+            )
+            try:
+                result = await asyncio.wait_for(runner.result_async(), 3)
+                assert not result["ok"]
+                assert "worker.completed" in result["stdout"]
+                assert 'runner.failed error_type="RuntimeError"' in result["stdout"]
+                assert "aggregation failed" in result["stderr"]
+            finally:
+                runner.close()
+                await dispatcher.unregister("runner")
 
     asyncio.run(run())
 

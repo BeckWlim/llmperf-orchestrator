@@ -427,6 +427,20 @@ class LLMPerfClient:
     def get_campaign(self, campaign_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/api/v1/campaigns/{campaign_id}")
 
+    def get_campaign_logs(
+        self, campaign_id: str, limit: int = 20, offset: int = 0
+    ) -> Dict[str, Any]:
+        document = self._request(
+            "GET",
+            f"/api/v1/campaigns/{campaign_id}/logs",
+            query={"limit": limit, "offset": offset},
+        )
+        if document.get("campaign_id") != campaign_id:
+            raise ClientError(
+                "Campaign logs response does not match the requested Campaign"
+            )
+        return document
+
     def cancel_campaign(self, campaign_id: str) -> Dict[str, Any]:
         return self._request("POST", f"/api/v1/campaigns/{campaign_id}/cancel")
 

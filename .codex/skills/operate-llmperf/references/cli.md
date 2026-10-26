@@ -46,6 +46,7 @@ llmperfctl campaign start -f examples/example-campaign.yaml
 llmperfctl campaign start -f examples/example-cache.yaml --wait
 llmperfctl campaign list
 llmperfctl campaign status CAMPAIGN_ID
+llmperfctl campaign logs CAMPAIGN_ID
 llmperfctl campaign cancel CAMPAIGN_ID
 llmperfctl campaign export CAMPAIGN_ID -o campaign.json
 ```
@@ -130,6 +131,20 @@ llmperfctl runner logs RUNNER_ID
 ```
 
 Do not dump complete stdout/stderr through ordinary status commands.
+
+For shared-worker runs, `runner logs` includes a bounded, timestamped execution journal
+with Worker IDs, submissions, outcomes, numeric latency/token metrics, timeout and
+dependency-cancellation events, and final counts. These events are persisted on completion
+or explicit cancellation, not streamed live. Earlier events may be omitted with a
+truncation notice. Old runs with empty logs are not backfilled, and abrupt Backend stops
+can lose buffered events. Do not expect prompts, responses, or raw Provider error bodies
+in this journal.
+
+`campaign logs CAMPAIGN_ID` reads the same saved logs grouped by Runner, ordered by
+creation time and ID. It defaults to 20 Runners; `--limit` (1–200) and `--offset`
+select a page, and `--json` retains the same projection. Follow the printed next-page
+command to inspect additional Runners. Unmaterialized nodes and future occurrences
+have no Runner logs. This view reuses existing log files and requires no schema change.
 
 ## Output modes
 
