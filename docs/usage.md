@@ -73,8 +73,9 @@ createdb llmperf
 psql -v ON_ERROR_STOP=1 -d llmperf -f sql/postgresql/init.sql
 ```
 
-Version 1.0.0 is the first supported schema. Initialize it from
-`sql/postgresql/init.sql`; pre-release database layouts are not accepted or migrated.
+Release 1.0.3 requires a fresh schema initialized from `sql/postgresql/init.sql`.
+Earlier layouts are not migrated automatically. Preserve needed exports and backups
+before cutover, including the Runner log directory. Document versions remain `1.0.0`.
 
 ### 2. Configure a Provider and start the Backend
 

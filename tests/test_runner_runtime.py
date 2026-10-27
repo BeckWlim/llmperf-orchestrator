@@ -68,6 +68,11 @@ class MemoryMessages:
 
 
 class FakeScheduler:
+    async def create_workers(
+        self, runner_id: str, steps: Sequence[RequestStep]
+    ) -> None:
+        pass
+
     def __init__(self, bus: RunnerMessageBus, capacity: int):
         self.bus = bus
         self.capacity = asyncio.Semaphore(capacity)
@@ -576,6 +581,11 @@ def test_default_configuration():
 
 
 class MemoryJournal(MemoryMessages):
+    async def create_workers(
+        self, runner_id: str, steps: Sequence[RequestStep]
+    ) -> None:
+        pass
+
     def __init__(self):
         super().__init__()
         self.reserved: set[tuple[str, str]] = set()

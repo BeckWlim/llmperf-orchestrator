@@ -200,7 +200,7 @@ scheduler:
 
 
 def test_protocol_version():
-    assert {runtime_version, cli_version, RELEASE_VERSION} == {"1.0.1"}
+    assert {runtime_version, cli_version, RELEASE_VERSION} == {"1.0.3"}
     assert {PROTOCOL_VERSION, TASK_FORMAT_VERSION, RESULTS_VERSION} == {"1.0.0"}
     with pytest.raises(ConfigError, match="1.0.0"):
         load_config_text(VALID_CONFIG.replace('version: "1.0.0"', "version: 1"))

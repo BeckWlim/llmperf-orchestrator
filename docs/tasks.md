@@ -1,6 +1,6 @@
 # Task compiler and YAML definition rules
 
-LLMPerf 1.0.0 compiles finite task definitions into dependency graphs before execution.
+LLMPerf 1.0.3 compiles finite task definitions into dependency graphs before execution.
 Use `instances` to create independent copies of a workflow, `workflow` to describe their
 operations, and `runner` to configure the Runner created by each execution node.
 The compiler supports both single-request `invoke` nodes and multi-request `run` nodes.

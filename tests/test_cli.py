@@ -1377,6 +1377,21 @@ def test_status_projection(capsys):
             assert runner_id == "runner-1"
             return raw
 
+        def get_runner_workers(self, runner_id, limit=20, offset=0):
+            return {
+                "items": [
+                    {
+                        "worker_id": "step-1",
+                        "step_id": "first",
+                        "status": "submitted",
+                        "prompt": "must not be rendered",
+                    }
+                ],
+                "limit": limit,
+                "offset": offset,
+                "next_offset": 20,
+            }
+
     arguments = build_parser().parse_args(["runner", "status", "runner-1"])
     result = execute(RunnerClient(), arguments)
     render_result(adapt_cli_response(arguments, result))
@@ -1384,6 +1399,10 @@ def test_status_projection(capsys):
 
     assert result == summarize_runner(raw)
     assert "Runner: runner-1  Status: running" in default_output
+    assert "step-1  first  submitted" in default_output
+    assert "--worker WORKER_ID" in default_output
+    assert "--worker-limit 20 --worker-offset 20" in default_output
+    assert "must not be rendered" not in default_output
     assert '"summary"' not in default_output
 
     arguments = build_parser().parse_args(["runner", "status", "runner-1", "--json"])
@@ -1705,6 +1724,124 @@ def test_log_output(capsys):
     assert "Runner: runner-1  Status: failed" in output
     assert "[stdout]\nprogress\n" in output
     assert "[stderr]\nfailure\n" in output
+
+
+def test_worker_log_projection(monkeypatch, capsys):
+    requested_urls = []
+    payload = {
+        "runner_id": "runner-1",
+        "status": "running",
+        "stdout": "event\n",
+        "stderr": None,
+        "worker_log": {
+            "worker_id": "turn/1",
+            "step_id": "first",
+            "status": "succeeded",
+            "completion_available": True,
+            "input_messages": [
+                {"role": "system", "content": "Be concise", "authorization": "secret"},
+                {"role": "user", "content": "hello\nworld"},
+            ],
+            "output_text": "answer\n" + "x" * 10000,
+            "metrics": {"number_output_tokens": 12, "response_headers": "secret"},
+            "request": {"api_key": "secret"},
+        },
+    }
+
+    def fake_urlopen(request, timeout):
+        requested_urls.append(request.full_url)
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
+    client = LLMPerfClient("http://127.0.0.1:8000")
+    arguments = build_parser().parse_args(
+        ["runner", "logs", "runner-1", "--worker", "turn/1"]
+    )
+    document = execute(client, arguments)
+    projection = adapt_cli_response(arguments, document)
+    render_result(projection)
+    output = capsys.readouterr()
+    assert "Worker: turn/1  Status: succeeded" in output.out
+    assert "[system]\nBe concise" in output.out
+    assert "[user]\nhello\nworld" in output.out
+    assert payload["worker_log"]["output_text"] in output.out
+    assert output.err == ""
+    assert "secret" not in str(projection.payload)
+    assert requested_urls == [
+        "http://127.0.0.1:8000/api/v1/runners/runner-1/logs?worker_id=turn%2F1"
+    ]
+    json_arguments = build_parser().parse_args(
+        ["runner", "logs", "runner-1", "--worker", "turn/1", "--json"]
+    )
+    render_result(adapt_cli_response(json_arguments, document))
+    assert json.loads(capsys.readouterr().out) == projection.payload
+    payload["worker_log"] = {
+        "worker_id": "turn/1",
+        "step_id": "first",
+        "status": "submitted",
+        "completion_available": False,
+    }
+    render_result(adapt_cli_response(arguments, execute(client, arguments)))
+    assert "No committed completion" in capsys.readouterr().out
+    payload["worker_log"]["worker_id"] = "different"
+    with pytest.raises(ClientError, match="requested Worker"):
+        execute(client, arguments)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("input_messages", None),
+        ("output_text", None),
+        ("metrics", []),
+    ],
+)
+def test_worker_log_validation(field, value):
+    worker_log = {
+        "worker_id": "1",
+        "step_id": "first",
+        "status": "succeeded",
+        "completion_available": True,
+        "input_messages": [],
+        "output_text": "",
+        "metrics": {},
+        field: value,
+    }
+    arguments = build_parser().parse_args(["runner", "logs", "r", "--worker", "1"])
+    with pytest.raises(ClientError, match="invalid response shape"):
+        adapt_cli_response(
+            arguments,
+            {
+                "runner_id": "r",
+                "status": "succeeded",
+                "stdout": None,
+                "stderr": None,
+                "worker_log": worker_log,
+            },
+        )
+
+
+def test_worker_page_request(monkeypatch):
+    requested_urls = []
+
+    def fake_urlopen(request, timeout):
+        requested_urls.append(request.full_url)
+        return _FakeResponse(
+            {"items": [], "limit": 5, "offset": 10, "next_offset": None}
+        )
+
+    monkeypatch.setattr("llmperf_cli.transport.client.urlopen", fake_urlopen)
+    client = LLMPerfClient("http://127.0.0.1:8000")
+    client.get_runner_workers("runner-1", 5, 10)
+    assert requested_urls == [
+        "http://127.0.0.1:8000/api/v1/runners/runner-1/workers?limit=5&offset=10"
+    ]
+    for options in (["--worker-limit", "0"], ["--worker-offset", "-1"]):
+        arguments = build_parser().parse_args(
+            ["runner", "status", "runner-1", *options]
+        )
+        with pytest.raises(ClientError, match="Worker limit"):
+            execute(client, arguments)
 
 
 def test_datetime_payload(monkeypatch):
@@ -2222,6 +2359,9 @@ def test_campaign_wait_logs(caplog):
 
 def test_wait_runner_reconnect():
     class SucceededRunnerClient(StubClient):
+        def get_runner_workers(self, runner_id, limit=20, offset=0):
+            return {"items": [], "limit": limit, "offset": offset, "next_offset": None}
+
         def get_runner(self, runner_id):
             return {
                 "runner_id": runner_id,

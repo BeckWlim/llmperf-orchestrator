@@ -615,12 +615,35 @@ class LLMPerfClient:
     def get_runner(self, runner_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/api/v1/runners/{runner_id}")
 
-    def get_runner_logs(self, runner_id: str) -> Dict[str, Any]:
+    def get_runner_workers(
+        self, runner_id: str, limit: int = 20, offset: int = 0
+    ) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/api/v1/runners/{runner_id}/workers",
+            query={"limit": limit, "offset": offset},
+        )
+
+    def get_runner_logs(
+        self, runner_id: str, worker_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Return the stable log projection from the dedicated Backend API."""
 
-        return _validate_runner_logs(
-            self._request("GET", f"/api/v1/runners/{runner_id}/logs"), runner_id
+        document = self._request(
+            "GET",
+            f"/api/v1/runners/{runner_id}/logs",
+            query={"worker_id": worker_id} if worker_id is not None else None,
         )
+        validated_document = _validate_runner_logs(document, runner_id)
+        if worker_id is not None:
+            worker_log = document.get("worker_log")
+            if (
+                not isinstance(worker_log, dict)
+                or worker_log.get("worker_id") != worker_id
+            ):
+                raise ClientError("Runner logs did not return the requested Worker")
+            validated_document["worker_log"] = worker_log
+        return validated_document
 
     def cancel_runner(self, runner_id: str) -> Dict[str, Any]:
         return self._request("POST", f"/api/v1/runners/{runner_id}/cancel")

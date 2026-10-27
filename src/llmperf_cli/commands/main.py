@@ -1086,9 +1086,67 @@ def print_runner_summary(document: Dict[str, Any]) -> None:
     if message:
         print(f"Message: {_table_value(message)}")
 
+    page = document.get("worker_list")
+    if page is not None:
+        print("\nWorker ID  Step  Status  Submitted  Completed")
+        for item in page["items"]:
+            print(
+                "  ".join(
+                    _table_value(item.get(field))
+                    for field in (
+                        "worker_id",
+                        "step_id",
+                        "status",
+                        "submitted_at",
+                        "completed_at",
+                    )
+                )
+            )
+        if not page["items"]:
+            print("No Workers on this page.")
+        print(
+            f"Showing {len(page['items'])} Worker(s) "
+            f"(offset={page['offset']}, limit={page['limit']})."
+        )
+        print(
+            f"Inspect: llmperfctl runner logs {document['runner_id']} --worker WORKER_ID"
+        )
+        if page["next_offset"] is not None:
+            print(
+                f"Next page: llmperfctl runner status {document['runner_id']} "
+                f"--worker-limit {page['limit']} --worker-offset {page['next_offset']}"
+            )
+
 
 def print_runner_logs(document: Dict[str, Any]) -> None:
     """Render persisted Worker streams with unambiguous stream boundaries."""
+
+    worker_log = document.get("worker_log")
+    if worker_log is not None:
+        print(
+            f"Runner: {document['runner_id']}  Worker: {worker_log['worker_id']}  "
+            f"Status: {worker_log['status']}"
+        )
+        print(
+            f"Step: {worker_log['step_id']}  Created: {_table_value(worker_log['created_at'])}\n"
+            f"Submitted: {_table_value(worker_log['submitted_at'])}  "
+            f"Completed: {_table_value(worker_log['completed_at'])}"
+        )
+        print(f"Dependencies: {', '.join(worker_log['dependencies']) or '(none)'}")
+        if worker_log["cancellation_reason"]:
+            print(f"Cancellation: {worker_log['cancellation_reason']}")
+        if worker_log["completion_available"]:
+            print("\n[input messages]")
+            for message in worker_log["input_messages"]:
+                print(f"[{message['role']}]\n{message['content']}")
+            print(f"\n[output text]\n{worker_log['output_text']}")
+            print("\n[metrics]")
+            print_json(worker_log["metrics"])
+        else:
+            print("\nNo committed completion; input/output text is unavailable.")
+        print("\n[worker execution journal]")
+        print(document.get("stdout") or "(no saved events)")
+        return
 
     worker = document.get("worker") or {}
     print(
@@ -2364,7 +2422,7 @@ Examples:
         runner_commands,
         "status",
         help="Show one Runner",
-        description="Show current state and persisted details for one Runner.",
+        description="Show Runner state and a page of Worker IDs, steps, and states.",
         epilog="""\
 Examples:
   llmperfctl runner status <runner-id>
@@ -2375,6 +2433,18 @@ Examples:
     )
     runner_status.add_argument(
         "runner_id", metavar="RUNNER_ID", help="Runner identifier"
+    )
+    runner_status.add_argument(
+        "--worker-limit",
+        type=int,
+        default=20,
+        help="Workers per page (1-200; default: 20)",
+    )
+    runner_status.add_argument(
+        "--worker-offset",
+        type=int,
+        default=0,
+        help="Worker page offset (default: 0)",
     )
     runner_status_output = runner_status.add_mutually_exclusive_group()
     runner_status_output.add_argument(
@@ -2490,10 +2560,27 @@ Examples:
         runner_commands,
         "logs",
         help="Show captured Worker output",
-        description="Show Worker identity, exit code, stdout, and stderr for a Runner.",
-        epilog="Example:\n  llmperfctl runner logs <runner-id>",
+        description=(
+            "Show saved Runner streams. Select --worker for complete committed "
+            "input/output text and that Worker's execution events."
+        ),
+        epilog=(
+            "Examples:\n  llmperfctl runner logs <runner-id>\n"
+            "  llmperfctl runner logs <runner-id> --worker <worker-id>"
+        ),
     )
     runner_logs.add_argument("runner_id", metavar="RUNNER_ID", help="Runner identifier")
+    runner_logs.add_argument(
+        "--worker",
+        dest="worker_id",
+        metavar="WORKER_ID",
+        help="Show one Worker's committed input/output and saved execution events",
+    )
+    runner_logs.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the same log projection as JSON",
+    )
     runner_export = _command_parser(
         runner_commands,
         "export",
@@ -2711,16 +2798,26 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
                 full_output=arguments.full,
             )[0]
         if arguments.runner_command == "status":
+            if not 1 <= arguments.worker_limit <= 200 or arguments.worker_offset < 0:
+                raise ClientError(
+                    "Worker limit must be 1-200 and offset must be nonnegative"
+                )
             if arguments.wait:
-                return wait_for_runners(
+                status_document = wait_for_runners(
                     client,
                     [arguments.runner_id],
                     arguments.poll_interval,
                     arguments.timeout,
                     full_output=arguments.full,
                 )[0]
-            runner = client.get_runner(arguments.runner_id)
-            return runner if arguments.full else summarize_runner(runner)
+            else:
+                status_document = client.get_runner(arguments.runner_id)
+            status_document["worker_list"] = client.get_runner_workers(
+                arguments.runner_id, arguments.worker_limit, arguments.worker_offset
+            )
+            return (
+                status_document if arguments.full else summarize_runner(status_document)
+            )
         if arguments.runner_command == "list":
             document = client.list_runners(
                 arguments.status,
@@ -2742,6 +2839,8 @@ def execute(client: LLMPerfClient, arguments: argparse.Namespace) -> Any:
                 full_output=arguments.full,
             )
         if arguments.runner_command == "logs":
+            if arguments.worker_id is not None:
+                return client.get_runner_logs(arguments.runner_id, arguments.worker_id)
             return client.get_runner_logs(arguments.runner_id)
         document = client.export_runner(arguments.runner_id)
         write_json(Path(arguments.output), document)

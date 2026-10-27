@@ -119,11 +119,19 @@ llmperfctl runner start -f examples/example-smoke.yaml --wait
 llmperfctl runner list --limit 5
 llmperfctl runner status RUNNER_ID
 llmperfctl runner logs RUNNER_ID
+llmperfctl runner logs RUNNER_ID --worker WORKER_ID
 ```
 
 Use the Runner ID printed by the start command. A successful smoke test ends with
 `succeeded`; use `llmperfctl runner logs RUNNER_ID` to diagnose a failure. The first run
 may download the default tokenizer.
+
+`runner status` lists created Workers with global IDs, step IDs, states, and timestamps
+(20 per page; use `--worker-limit` and `--worker-offset` for more).
+Pass an ID to `runner logs --worker` to inspect its complete committed input messages,
+output text, numeric metrics, and saved execution events. Add `--json` for structured
+output. Text becomes available when the Worker completion commits, even if its Runner
+is still running; Workers without a committed completion show text as unavailable.
 
 To run scheduled rounds, update the Provider/model in `examples/example-runner-plan.yaml`,
 then submit and export a Campaign:
@@ -148,7 +156,8 @@ to prepare an HTML report.
 - [Performance guard: defaults, budgets, and runtime controls](docs/runtime.md#performance-guard)
 - [systemd deployment](deploy/systemd/README.md) · [Testing](docs/testing.md)
 
-Release 1.0.1 requires a schema cutover from older installations; workload and export
+Release 1.0.3 requires a fresh schema with independent Worker metadata and file references;
+Worker logs remain inside each Runner's log folder. Live scheduling stays in memory. Workload and export
 document-format markers remain `1.0.0`. The Backend checks required tables and columns. For older
 database layouts, follow the [cutover guidance](docs/runtime.md#recovery-and-cutover).
 Provider definitions now require a Provider file; migrate former `backend.env` profile

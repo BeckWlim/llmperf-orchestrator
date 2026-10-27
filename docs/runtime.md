@@ -54,10 +54,90 @@ An abrupt Backend stop can lose buffered events. Previously completed Runners wi
 logs cannot acquire these events retroactively; deploying this change requires a Backend
 restart and a new run.
 
-`workers` stores only reservation identity, generation, state, timestamps and a
-completion digest. The durable `runner_messages` mailbox holds the sole full Worker
-completion payload; no second request/result JSON copy is kept in the reservation row.
-The separate result metrics remain available for benchmark analysis.
+Release 1.0.3 gives each Worker a global UUID and a row in its own `workers` table.
+Rows contain the Runner/step identity, generation, creation/submission/completion
+milestones, dependency/input metadata, and a completion file key and digest. Worker
+creation is persisted in batches of at most 1,000 rows before admission. Prompt batches
+are not allocated during creation. The separate result metrics support benchmark analysis.
+
+Live ready queues, admission waits, executing handles, timers, and delivery buffers
+remain in memory. PostgreSQL records durable milestones rather than mirroring these
+runtime structures or receiving per-token updates. Submission checks use the indexed
+outstanding set only when a Runner declares a concurrency limit; they do not recount
+all historical Workers per request. Status queries aggregate durable counts on demand.
+
+Full executed inputs and outputs live under the owning Runner's log directory:
+
+```text
+runner-logs/
+└── RUNNER_ID/
+    ├── runner/CONTENT_HASH.json
+    └── workers/WORKER_ID/CONTENT_HASH.json
+```
+
+Completion sanitization, serialization, and file I/O run in a Backend thread before
+opening the completion transaction. PostgreSQL stores only the file reference in the
+`worker.completed` mailbox entry. Recovery hydrates that reference when a consumer
+needs the message; normal delivery uses the already prepared in-memory payload.
+
+```mermaid
+flowchart LR
+    Result[Worker result] --> File[Atomically write completion file]
+    File --> Transaction[Commit Worker milestone and mailbox reference]
+    Transaction --> Delivery[Deliver to bounded runtime mailbox]
+    Transaction --> Recovery[Recover missed delivery]
+    Recovery --> Read[Read referenced completion file]
+    Read --> Delivery
+```
+
+A file-write failure prevents completion publication. An interrupted or fenced database
+commit may leave an unreferenced file; no automatic file garbage collection is provided.
+Back up PostgreSQL and the log directory together. Missing or corrupt Worker files
+produce an explicit unavailable error; metadata/status remains readable.
+
+`llmperfctl runner status RUNNER_ID` also requests a bounded page from
+`GET /api/v1/runners/{runner_id}/workers`. Each item contains the global `worker_id`,
+Runner-local `step_id`, durable status, and milestone timestamps. The default
+page is 20; `--worker-limit` (1–200) and `--worker-offset` select subsequent pages.
+Created Workers appear before submission, including those waiting on dependencies.
+`submitted` includes queueing and physical execution;
+it is not a live per-Worker running indicator. Status with `--wait` loads the page after
+waiting finishes. The list never reads completion bodies or log files.
+
+`llmperfctl runner logs RUNNER_ID --worker WORKER_ID` extends the existing log projection
+and `/runners/{runner_id}/logs?worker_id=...` endpoint. It resolves the Worker's file
+reference directly and returns allow-listed input roles/content, the full
+generated text, selected metrics, timestamps, and saved journal lines for that Worker.
+`--json` exposes the same projection. Prompt/output text is not truncated by the journal's
+byte limit. Credentials, request configuration internals, Provider headers and raw error
+bodies are excluded. A committed failed request may contain empty or partial output.
+Workers without a completion explicitly report unavailable text; missing IDs return 404.
+Mailbox acknowledgment does not affect log inspection. Input/output is available as soon as
+the completion commits, while journal lines still become available only after Runner
+finalization and may have been truncated. Release 1.0.3 requires a fresh schema and
+Backend restart. There is no compatibility layer or automatic backfill for older storage.
+
+Example commands and an illustrative text excerpt:
+
+```bash
+llmperfctl runner status RUNNER_ID
+llmperfctl runner logs RUNNER_ID --worker WORKER_ID
+llmperfctl runner logs RUNNER_ID --worker WORKER_ID --json
+```
+
+```text
+[input messages]
+[system]
+Answer briefly.
+[user]
+What is 2 + 2?
+
+[output text]
+4
+```
+
+The complete projection also includes identity, milestone timestamps, dependencies,
+selected latency/token metrics, and saved execution journal lines.
 
 Campaign list progress uses grouped SQL totals and only merges live telemetry for
 resident Runners. It does not transfer every historical Runner to Python or read log
@@ -508,9 +588,12 @@ five seconds, or one third of the stale threshold when shorter. Refresh skips ro
 locked by other transactions; a skipped row is not interpreted as cancellation. Waiting
 Runners receive in-memory cancellation events rather than polling PostgreSQL themselves.
 Maintenance failure stops admission and execution supervision; it never authorizes replay.
+Failed reconciliation waits one polling interval before retrying. Shutdown stops the
+coordinator before draining execution, keeps lease renewal alive through durable cleanup,
+and stops maintenance before Ray teardown and lease release.
 
-These mailbox and maintenance changes use the existing schema. Updating an installation
-that already has these tables requires a Backend restart, not a database rebuild.
+Mailbox delivery and maintenance use in-memory coordination with durable checkpoints.
+Release 1.0.3 additionally changes Worker storage and requires a fresh schema.
 
 Completed results awaiting commit remain bounded by Scheduler admission while a transient database
 write failure is retried. Successors remain blocked until commit. A lost runtime lease
@@ -522,6 +605,6 @@ until its disposition is explicitly decided. `/health` and `llmperfctl health` d
 database connectivity from schema readiness; an incompatible schema cannot schedule work.
 Initializing an existing incomplete layout fails instead of silently adding new tables.
 The generic mailbox, receipts, Worker records, and joined conversation tables require a
-fresh schema or an explicit migration from older installations. Removing a version-marker
+fresh 1.0.3 schema. No compatibility migration is provided. Removing a version-marker
 table alone does not upgrade that layout. No live schema migration is performed by this
 source change.

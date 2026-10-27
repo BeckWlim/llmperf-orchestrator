@@ -23,6 +23,8 @@ prepare input only inside an admitted Ray request actor invocation.
 - `runtime/worker_input.py`: Worker recipes and actor-local input preparation/cache.
 - `runtime/dispatch.py`: bounded one-request Workers and durable output publication.
 - `runtime/messages.py`: durable Runner mailbox, completion and cancellation envelopes.
+- `storage/workers.py`: Worker identity, static metadata, and durable milestones.
+- `storage/logs.py`: immutable Runner journals and full Worker completion files.
 - `runtime/triggers.py`: readiness conditions and asynchronous timer event sources.
 - `runtime/worker.py`: benchmark calculation helpers and standalone execution handles.
 - `runtime/request_pool.py`: fair shared capacity and isolated per-request Ray adapters.
@@ -79,6 +81,12 @@ per-Runner polling on the managed path. Acknowledge processed batches only after
 Recovered backlogs request another pass after acknowledgment. Heartbeat writes and durable
 cancellation checks are batched by Backend maintenance. Preserve single-send reservations,
 committed-before-delivered ordering, and indeterminate recovery for interrupted Runners.
+
+Release 1.0.3 uses a fresh schema. Batch Worker creation, keep runtime queues/handles/timers
+in memory, and store only completion file references in PostgreSQL. Serialize/write full
+text off the event loop before acquiring completion locks. Ordinary status pages must
+not load metadata bodies or files. Avoid full Worker-count scans on each submission;
+an explicit concurrency window checks only the indexed outstanding set.
 
 ## Persistence
 

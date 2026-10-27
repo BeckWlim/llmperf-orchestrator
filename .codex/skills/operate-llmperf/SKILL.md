@@ -51,7 +51,9 @@ Apply these invariants:
    layouts need explicit migration or a fresh database; do not replay interrupted work.
 8. Distinguish Campaign lifecycle `status` from aggregate execution `outcome`.
    Never infer that `completed` means every Runner succeeded.
-9. The Runner message bus persists outputs and timer events. The reconciliation notifier
+9. Worker metadata belongs in its independent table; full outputs live in files under
+   the Runner log directory. The Runner message bus persists file references and timer events.
+   Runtime queues, handles, and waits stay in memory. The reconciliation notifier
    only carries disposable wakeup hints. An omitted `concurrent_workers` leaves capacity
    to Scheduler; an explicit value bounds outstanding Workers. Interrupted Runners are
    indeterminate, not resumed automatically from mailbox receipts.

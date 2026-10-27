@@ -119,6 +119,9 @@ class WorkerResult:
 
 
 class WorkerScheduler(Protocol):
+    async def create_workers(
+        self, runner_id: str, steps: Sequence[RequestStep]
+    ) -> None: ...
     async def submit(
         self, runner_id: str, step: RequestStep, window: Optional[int]
     ) -> None: ...
@@ -318,6 +321,7 @@ class RunnerRuntime:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.timeout_seconds
         pending = {step.step_id: step for step in self.logic.steps()}
+        await self.scheduler.create_workers(self.runner_id, tuple(pending.values()))
         known_steps = dict(pending)
         consumer = "task-progression"
         message_task = asyncio.create_task(self.bus.receive(consumer))
@@ -388,7 +392,8 @@ class RunnerRuntime:
                                 cancellation.step_id, cancellation
                             )
                             pending.pop(cancellation.step_id, None)
-                        for new_step in self.logic.on_message(message, self.results):
+                        new_steps = self.logic.on_message(message, self.results)
+                        for new_step in new_steps:
                             if new_step.step_id in known_steps:
                                 if known_steps[new_step.step_id] != new_step:
                                     raise ValueError(
@@ -401,6 +406,10 @@ class RunnerRuntime:
                                 )
                             known_steps[new_step.step_id] = new_step
                             pending[new_step.step_id] = new_step
+                        if new_steps:
+                            await self.scheduler.create_workers(
+                                self.runner_id, new_steps
+                            )
                     await self.bus.acknowledge_many(messages, consumer)
                     message_task = asyncio.create_task(self.bus.receive(consumer))
                 if submission_task is not None and submission_task.done():

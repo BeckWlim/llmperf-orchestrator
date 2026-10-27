@@ -27,6 +27,7 @@ llmperfctl runner start -f examples/example-smoke.yaml
 llmperfctl runner start -f examples/example-smoke.yaml --wait
 llmperfctl runner status RUNNER_ID
 llmperfctl runner logs RUNNER_ID
+llmperfctl runner logs RUNNER_ID --worker WORKER_ID
 llmperfctl runner cancel RUNNER_ID
 llmperfctl runner export RUNNER_ID -o runner.json
 ```
@@ -132,13 +133,28 @@ llmperfctl runner logs RUNNER_ID
 
 Do not dump complete stdout/stderr through ordinary status commands.
 
+`runner status RUNNER_ID` includes a page of created Worker IDs, step IDs, durable states,
+and timestamps. Use `--worker-limit` (1–200, default 20) and `--worker-offset` to page.
+Worker IDs are global UUIDs; step IDs remain Runner-local. Created Workers include
+unsubmitted steps; `submitted` covers queued and executing work. With `--wait`, the page is
+loaded after waiting. `--json` and `--full` retain the same allow-listed Worker page.
+
+Use `runner logs RUNNER_ID --worker WORKER_ID` to inspect the selected Worker's complete
+committed input messages and output text, selected metrics, and saved journal events.
+This extends the existing log projection; `--json` renders the same fields. Text is read
+from the Worker's completion file under its Runner log folder and is available
+before Runner finalization. Missing completions show unavailable text; failed requests
+may have empty/partial output. The text is not limited by the journal byte budget.
+Provider headers, credentials, request configuration internals, and raw error bodies
+remain excluded. Release 1.0.3 requires a fresh schema; no legacy log backfill is provided.
+
 For shared-worker runs, `runner logs` includes a bounded, timestamped execution journal
 with Worker IDs, submissions, outcomes, numeric latency/token metrics, timeout and
 dependency-cancellation events, and final counts. These events are persisted on completion
 or explicit cancellation, not streamed live. Earlier events may be omitted with a
 truncation notice. Old runs with empty logs are not backfilled, and abrupt Backend stops
 can lose buffered events. Do not expect prompts, responses, or raw Provider error bodies
-in this journal.
+in this journal. The explicit `--worker` view adds stored input/output separately.
 
 `campaign logs CAMPAIGN_ID` reads the same saved logs grouped by Runner, ordered by
 creation time and ID. It defaults to 20 Runners; `--limit` (1–200) and `--offset`

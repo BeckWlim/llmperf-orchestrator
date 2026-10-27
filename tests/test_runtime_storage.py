@@ -11,6 +11,7 @@ from llmperf.benchmark.execution import RequestStep
 from llmperf.clients.models import RequestConfig
 from llmperf_backend.runtime.runner import WorkerResult
 from llmperf_backend.storage.messages import MessageRecord
+from llmperf_backend.storage.workers import WorkerRecord, worker_identity
 from llmperf_backend.configuration.models import DatabaseConfig
 from llmperf_backend.storage.repository import (
     Base,
@@ -195,7 +196,7 @@ def test_dedicated_lease_renewal(postgresql_url):
     asyncio.run(exercise())
 
 
-def test_worker_mailbox(postgresql_url):
+def test_worker_mailbox(postgresql_url, tmp_path, monkeypatch):
     from llmperf.benchmark.execution import RequestStep
     from llmperf.clients.models import RequestConfig
     from llmperf_backend.runtime.runner import WorkerResult
@@ -207,7 +208,7 @@ def test_worker_mailbox(postgresql_url):
             async with database.engine.begin() as connection:
                 await connection.run_sync(Base.metadata.drop_all)
             await database.create_schema()
-            repository = RunnerRepository(database)
+            repository = RunnerRepository(database, log_directory=str(tmp_path))
             await repository.acquire_runtime("worker-test")
             runner = await repository.create_runner(
                 {
@@ -226,15 +227,56 @@ def test_worker_mailbox(postgresql_url):
             assert initial_progress[runner_id]["created"] == 0
             assert initial_progress[runner_id]["submitted"] == 0
             assert await repository.start_selected(runner_id, "test") is not None
-            request = RequestConfig(model="test", prompt=("hello", 1))
+            request = RequestConfig(
+                model="test",
+                prompt=("hello", 1),
+                sampling_params={
+                    "api_key": "must-not-export",
+                    "messages": [
+                        {"role": "system", "content": "Be concise"},
+                        {"role": "user", "content": "hello"},
+                    ],
+                },
+            )
             first = RequestStep("first", request)
+            await repository.create_workers(
+                runner_id, [first, RequestStep("second", request)]
+            )
+            created_page = await repository.list_workers(runner_id)
+            assert {item["status"] for item in created_page["items"]} == {"created"}
+            assert all(item["submitted_at"] is None for item in created_page["items"])
             assert await repository.reserve_worker(runner_id, first, None)
             assert not await repository.reserve_worker(runner_id, first, None)
             result = WorkerResult(
                 "first", ({}, "answer", request), datetime.now(timezone.utc)
             )
+
+            def failed_write(*args):
+                raise OSError("disk unavailable")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(repository.log_store, "write_worker", failed_write)
+                with pytest.raises(OSError, match="disk unavailable"):
+                    await repository.commit_worker(runner_id, result)
+            assert not await repository.pending_messages(
+                runner_id, "runner", "test", 10
+            )
+            failed_write_page = await repository.list_workers(runner_id)
+            assert {item["status"] for item in failed_write_page["items"]} == {
+                "created",
+                "submitted",
+            }
             assert await repository.commit_worker(runner_id, result)
             assert await repository.commit_worker(runner_id, result)
+            assert (
+                await repository.commit_worker(
+                    runner_id,
+                    WorkerResult(
+                        "first", ({}, "different", request), result.completed_at
+                    ),
+                )
+                is None
+            )
             messages = await repository.pending_messages(
                 runner_id, "runner", "test", 10
             )
@@ -247,19 +289,179 @@ def test_worker_mailbox(postgresql_url):
             assert await repository.reserve_worker(
                 runner_id, RequestStep("second", request), None
             )
+            worker_page = await repository.list_workers(runner_id, 1, 0)
+            assert worker_page["next_offset"] == 1
+            last_page = await repository.list_workers(runner_id, 1, 1)
+            assert {
+                item["step_id"] for item in worker_page["items"] + last_page["items"]
+            } == {"first", "second"}
+            assert last_page["next_offset"] is None
+            # Acknowledgment does not delete the diagnostic completion payload.
+            first_id = worker_identity(runner_id, "first")
+            worker_log = await repository.get_worker_log(runner_id, first_id)
+            assert worker_log is not None
+            assert worker_log["input_messages"] == [
+                {"role": "system", "content": "Be concise"},
+                {"role": "user", "content": "hello"},
+            ]
+            assert worker_log["output_text"] == "answer"
+            assert "must-not-export" not in str(worker_log)
+            pending_log = await repository.get_worker_log(
+                runner_id, worker_identity(runner_id, "second")
+            )
+            assert pending_log is not None
+            assert pending_log["completion_available"] is False
+            assert pending_log["output_text"] is None
+            assert await repository.get_worker_log(runner_id, "missing") is None
+            assert await repository.get_worker_log("other-runner", first_id) is None
             current_progress = await repository.worker_progress(runner_ids=[runner_id])
             assert current_progress[runner_id]["submitted"] == 2
             assert current_progress[runner_id]["pending_results"] == 1
             assert current_progress[runner_id]["succeeded"] == 1
-            assert current_progress[runner_id]["created"] is None
+            assert current_progress[runner_id]["created"] == 2
             assert current_progress[runner_id]["not_submitted"] == 0
             with pytest.raises(ValueError, match="declared request expansion"):
-                await repository.reserve_worker(
-                    runner_id, RequestStep("third", request), None
+                await repository.create_workers(
+                    runner_id, [RequestStep("third", request)]
                 )
             async with database.sessions() as session:
                 stored = (await session.execute(select(MessageRecord))).scalars().all()
                 assert len(stored) == 1
+                assert set(stored[0].payload) == {"worker_id", "log_key"}
+                metadata = await session.get(WorkerRecord, first_id)
+                assert metadata is not None and metadata.log_key is not None
+                assert (tmp_path / metadata.log_key).is_file()
+                assert (
+                    "must-not-export" not in (tmp_path / metadata.log_key).read_text()
+                )
+                (tmp_path / metadata.log_key).unlink()
+            assert len((await repository.list_workers(runner_id))["items"]) == 2
+            exported_results = await repository.get_results(
+                runner_id, include_requests=True
+            )
+            assert exported_results is not None
+            assert len(exported_results["workers"]) == 2
+            assert all("log_key" in item for item in exported_results["workers"])
+            with pytest.raises(FileNotFoundError):
+                await repository.get_worker_log(runner_id, first_id)
+        finally:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_worker_batches(postgresql_url, tmp_path):
+    async def exercise():
+        database = Database(DatabaseConfig(url=postgresql_url))
+        try:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.create_schema()
+            repository = RunnerRepository(database, log_directory=str(tmp_path))
+            await repository.acquire_runtime("worker-batches")
+            runner = await repository.create_runner(
+                {"provider": "test", "model": "test", "repeat": 2001}, {}, "test"
+            )
+            assert runner is not None
+            runner_id = runner["runner_id"]
+            assert await repository.start_selected(runner_id, "test") is not None
+            request = RequestConfig(model="test", prompt=("hello", 1))
+            steps = [RequestStep(str(index), request) for index in range(2001)]
+            await repository.create_workers(runner_id, steps)
+            await repository.create_workers(runner_id, steps[-2:])
+            assert await repository.reserve_worker(runner_id, steps[0], 2)
+            assert await repository.reserve_worker(runner_id, steps[1], 2)
+            final_page = await repository.list_workers(runner_id, 20, 2000)
+            assert len(final_page["items"]) == 1
+            assert final_page["next_offset"] is None
+            progress = (await repository.worker_progress(runner_ids=[runner_id]))[
+                runner_id
+            ]
+            assert progress["created"] == 2001
+            assert progress["submitted"] == 2
+            async with database.sessions() as session:
+                await session.execute(text("ANALYZE workers"))
+                count_plan = await session.scalar(
+                    text(
+                        "EXPLAIN (FORMAT JSON) SELECT count(*) FROM workers "
+                        "WHERE runner_id = :runner_id AND state = 'submitted'"
+                    ),
+                    {"runner_id": runner_id},
+                )
+                page_plan = await session.scalar(
+                    text(
+                        "EXPLAIN (FORMAT JSON) SELECT id, step_id, state FROM workers "
+                        "WHERE runner_id = :runner_id ORDER BY created_at, id LIMIT 21"
+                    ),
+                    {"runner_id": runner_id},
+                )
+                assert "ix_worker_runner_state" in str(count_plan)
+                assert "ix_worker_runner_created" in str(page_plan)
+        finally:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.dispose()
+
+    asyncio.run(exercise())
+
+
+def test_worker_milestones(postgresql_url, tmp_path):
+    async def exercise():
+        database = Database(DatabaseConfig(url=postgresql_url))
+        try:
+            async with database.engine.begin() as connection:
+                await connection.run_sync(Base.metadata.drop_all)
+            await database.create_schema()
+            repository = RunnerRepository(database, log_directory=str(tmp_path))
+            await repository.acquire_runtime("worker-milestones")
+            runner = await repository.create_runner(
+                {"provider": "test", "model": "test", "repeat": 3}, {}, "test"
+            )
+            assert runner is not None
+            runner_id = runner["runner_id"]
+            assert await repository.start_selected(runner_id, "test") is not None
+            request = RequestConfig(model="test", prompt=("hello", 1))
+            steps = [RequestStep(str(index), request) for index in range(3)]
+            await repository.create_workers(runner_id, steps)
+            await repository.create_workers(runner_id, steps)
+            assert await repository.reserve_worker(runner_id, steps[0], 1)
+            with pytest.raises(ValueError, match="window exceeded"):
+                await repository.reserve_worker(runner_id, steps[1], 1)
+            cancellation = RunnerMessage(
+                runner_id=runner_id,
+                topic="worker.cancelled",
+                payload={
+                    "step_id": "1",
+                    "reason": "dependency_failed",
+                    "failed_dependencies": ["0"],
+                },
+            )
+            assert await repository.publish_message(cancellation)
+            assert await repository.publish_message(cancellation)
+            cancelled = await repository.get_worker_log(
+                runner_id, worker_identity(runner_id, "1")
+            )
+            assert cancelled is not None
+            assert cancelled["status"] == "cancelled"
+            assert cancelled["cancellation_reason"] == "dependency_failed"
+            assert cancelled["submitted_at"] is None
+            assert await repository.finish_runner(
+                runner_id, "failed", "interrupted", None, "journal", ""
+            )
+            page = await repository.list_workers(runner_id)
+            assert {item["step_id"]: item["status"] for item in page["items"]} == {
+                "0": "indeterminate",
+                "1": "cancelled",
+                "2": "cancelled",
+            }
+            progress = (await repository.worker_progress(runner_ids=[runner_id]))[
+                runner_id
+            ]
+            assert progress["created"] == 3
+            assert progress["submitted"] == 1
+            assert progress["not_submitted"] == 2
         finally:
             async with database.engine.begin() as connection:
                 await connection.run_sync(Base.metadata.drop_all)
@@ -489,6 +691,9 @@ def test_history_recovery(postgresql_url):
                 not coordinator.order
             )  # A dependent turn is not an actor reservation.
             request = RequestConfig(model="test", prompt=("hello", 1))
+            await repository.create_workers(
+                first["runner_id"], [RequestStep("0", request)]
+            )
             assert await repository.reserve_worker(
                 first["runner_id"], RequestStep("0", request), None
             )
@@ -555,7 +760,9 @@ def test_history_recovery(postgresql_url):
                     .all()
                 )
                 assert len(messages) == 1
-                assert messages[0].payload["generated_text"] == "world"
+                assert set(messages[0].payload) == {"worker_id", "log_key"}
+                restored = await competitor._restore_message(messages[0])
+                assert restored.payload["generated_text"] == "world"
             await competitor.release_runtime()
         finally:
             async with database.engine.begin() as connection:

@@ -40,6 +40,7 @@ from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.orm import Mapped, load_only, mapped_column
 from llmperf_backend.storage.base import Base
 from llmperf_backend.storage.logs import RunnerLogStore
+from llmperf_backend.storage.workers import WorkerRecord, worker_identity
 from llmperf_backend.compiler.requests import planned_worker_count
 from llmperf_backend.storage.messages import (
     ConversationMessageRecord,
@@ -49,6 +50,7 @@ from llmperf_backend.storage.messages import (
 from sqlalchemy.sql import Select
 
 from llmperf.version import PROTOCOL_VERSION, TASK_FORMAT_VERSION
+from llmperf.worker_logs import WorkerLog, WorkerPage, WorkerSummary
 from llmperf.benchmark.execution import RequestStep
 from llmperf_backend.runtime.runner import WorkerResult
 from llmperf_backend.runtime.messages import RunnerMessage, WorkerCompletion
@@ -138,30 +140,6 @@ class TaskAttemptRecord(Base):
         DateTime(timezone=True), nullable=False
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-
-
-class WorkerStepRecord(Base):
-    """Durable single-send reservation and output mailbox for one Runner step."""
-
-    __tablename__ = "workers"
-    __table_args__ = (
-        CheckConstraint(
-            "state IN ('submitted', 'succeeded', 'failed', 'cancelled', 'indeterminate')",
-            name="ck_worker_step_state",
-        ),
-        Index("ix_worker_runner_state", "runner_id", "state"),
-    )
-    runner_id: Mapped[str] = mapped_column(
-        ForeignKey("runners.id", ondelete="CASCADE"), primary_key=True
-    )
-    step_id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    generation: Mapped[int] = mapped_column(Integer, nullable=False)
-    state: Mapped[str] = mapped_column(String(20), nullable=False)
-    submitted_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    completion_hash: Mapped[Optional[str]] = mapped_column(String(64))
 
 
 class SubmissionRuntimeRecord(Base):
@@ -452,7 +430,7 @@ class BenchmarkRunnerRecord(Base):
     request_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     planned_workers: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
-    log_key: Mapped[Optional[str]] = mapped_column(String(80))
+    log_key: Mapped[Optional[str]] = mapped_column(String(256))
 
 
 class RunnerRecordFactory:
@@ -1343,7 +1321,10 @@ class RunnerRepository:
                         raise ValueError(
                             "History source has no committed Worker message"
                         )
-                    completion = WorkerCompletion.model_validate(source_message.payload)
+                    restored_message = await self._restore_message(source_message)
+                    completion = WorkerCompletion.model_validate(
+                        restored_message.payload
+                    )
                     if completion.metrics.get("error_code") is not None:
                         raise ValueError("History source request failed")
                     reused_messages.extend(completion.messages())
@@ -2549,6 +2530,17 @@ class RunnerRepository:
             runner = await session.get(BenchmarkRunnerRecord, runner_id)
             return _runner_dict(runner) if runner is not None else None
 
+    async def runner_exists(self, runner_id: str) -> bool:
+        async with self.database.sessions() as session:
+            return (
+                await session.scalar(
+                    select(BenchmarkRunnerRecord.id).where(
+                        BenchmarkRunnerRecord.id == runner_id
+                    )
+                )
+                is not None
+            )
+
     async def campaign_worker_progress(
         self, campaign_ids: Sequence[str]
     ) -> Dict[str, Dict[str, Any]]:
@@ -2571,17 +2563,12 @@ class RunnerRepository:
         }
         if not campaign_ids:
             return {}
-        created = BenchmarkRunnerRecord.summary["worker_creation"][
-            "created"
-        ].as_integer()
         statement = (
             select(
                 BenchmarkRunnerRecord.campaign_id,
                 BenchmarkRunnerRecord.status,
                 func.count(),
                 func.sum(BenchmarkRunnerRecord.planned_workers),
-                func.sum(func.coalesce(created, 0)),
-                func.sum(case((created.is_(None), 1), else_=0)),
             )
             .where(BenchmarkRunnerRecord.campaign_id.in_(campaign_ids))
             .group_by(BenchmarkRunnerRecord.campaign_id, BenchmarkRunnerRecord.status)
@@ -2589,14 +2576,13 @@ class RunnerRepository:
         worker_statement = (
             select(
                 BenchmarkRunnerRecord.campaign_id,
-                WorkerStepRecord.state,
+                WorkerRecord.state,
                 func.count(),
+                func.count(WorkerRecord.submitted_at),
             )
-            .join(
-                WorkerStepRecord, WorkerStepRecord.runner_id == BenchmarkRunnerRecord.id
-            )
+            .join(WorkerRecord, WorkerRecord.runner_id == BenchmarkRunnerRecord.id)
             .where(BenchmarkRunnerRecord.campaign_id.in_(campaign_ids))
-            .group_by(BenchmarkRunnerRecord.campaign_id, WorkerStepRecord.state)
+            .group_by(BenchmarkRunnerRecord.campaign_id, WorkerRecord.state)
         )
         async with self.database.sessions() as session:
             for (
@@ -2604,21 +2590,21 @@ class RunnerRepository:
                 runner_state,
                 count,
                 planned,
-                known_created,
-                unknown,
             ) in await session.execute(statement):
                 item = progress[campaign_id]
                 item["planned"] += int(planned)
-                item["created"] += int(known_created)
-                item["unknown_created"] += int(unknown) if runner_state != QUEUED else 0
                 item["creation_phases"][
                     "waiting" if runner_state == QUEUED else runner_state
                 ] = int(count)
-            for campaign_id, worker_state, count in await session.execute(
-                worker_statement
-            ):
+            for (
+                campaign_id,
+                worker_state,
+                count,
+                submitted_count,
+            ) in await session.execute(worker_statement):
                 item = progress[campaign_id]
-                item["submitted"] += int(count)
+                item["created"] += int(count)
+                item["submitted"] += int(submitted_count)
                 if worker_state == "submitted":
                     item["pending_results"] += int(count)
                 elif worker_state == "succeeded":
@@ -2653,22 +2639,26 @@ class RunnerRepository:
                 func.nullif(config["steps"], text("'null'::jsonb"))
             ),
             config["cache_probe"],
-            BenchmarkRunnerRecord.summary["worker_creation"]["created"],
         ).where(selected)
         counts_statement = (
-            select(WorkerStepRecord.runner_id, WorkerStepRecord.state, func.count())
+            select(
+                WorkerRecord.runner_id,
+                WorkerRecord.state,
+                func.count(),
+                func.count(WorkerRecord.submitted_at),
+            )
             .join(
                 BenchmarkRunnerRecord,
-                BenchmarkRunnerRecord.id == WorkerStepRecord.runner_id,
+                BenchmarkRunnerRecord.id == WorkerRecord.runner_id,
             )
             .where(selected)
-            .group_by(WorkerStepRecord.runner_id, WorkerStepRecord.state)
+            .group_by(WorkerRecord.runner_id, WorkerRecord.state)
         )
         async with self.database.sessions() as session:
             rows = (await session.execute(statement)).all()
             count_rows = (await session.execute(counts_statement)).all()
         progress: Dict[str, Dict[str, Any]] = {}
-        for runner_id, campaign_id, status, repeat, step_count, probe, created in rows:
+        for runner_id, campaign_id, status, repeat, step_count, probe in rows:
             planned = (
                 int(probe["trials"]) * (1 + int(probe.get("repeats_after_prime", 1)))
                 if probe
@@ -2677,11 +2667,7 @@ class RunnerRepository:
             progress[runner_id] = {
                 "campaign_id": campaign_id,
                 "planned": planned,
-                "created": (
-                    int(created)
-                    if created is not None
-                    else (0 if status == QUEUED else None)
-                ),
+                "created": 0,
                 "phase": "waiting" if status == QUEUED else status,
                 "submitted": 0,
                 "pending_results": 0,
@@ -2690,11 +2676,13 @@ class RunnerRepository:
                 "cancelled": 0,
                 "indeterminate": 0,
             }
-        for runner_id, state, count in count_rows:
-            progress[runner_id]["submitted"] += int(count)
-            progress[runner_id][
-                "pending_results" if state == "submitted" else state
-            ] += int(count)
+        for runner_id, state, count, submitted_count in count_rows:
+            progress[runner_id]["created"] += int(count)
+            progress[runner_id]["submitted"] += int(submitted_count)
+            if state != "created":
+                progress[runner_id][
+                    "pending_results" if state == "submitted" else state
+                ] += int(count)
         for item in progress.values():
             item["not_submitted"] = max(0, item["planned"] - item["submitted"])
         return progress
@@ -2757,7 +2745,9 @@ class RunnerRepository:
     async def set_logs(
         self, runner_id: str, exit_code: int, stdout: str, stderr: str
     ) -> None:
-        log_key = await asyncio.to_thread(self.log_store.write, stdout, stderr)
+        log_key = await asyncio.to_thread(
+            self.log_store.write, runner_id, stdout, stderr
+        )
         async with self.database.sessions() as session, session.begin():
             await session.execute(
                 update(BenchmarkRunnerRecord)
@@ -3105,6 +3095,23 @@ class RunnerRepository:
                 ):
                     raise ValueError("Message ID reused with different content")
                 return True
+            if message.topic == "worker.cancelled":
+                step_id = message.payload.get("step_id")
+                if not isinstance(step_id, str):
+                    raise ValueError("Worker cancellation requires a step identifier")
+                worker = await session.get(
+                    WorkerRecord, worker_identity(message.runner_id, step_id)
+                )
+                if worker is None or worker.state != "created":
+                    raise ValueError(
+                        "Only an unsubmitted Worker can be cancelled by dependency"
+                    )
+                worker.state = CANCELLED
+                worker.completed_at = message.created_at
+                worker.worker_metadata = {
+                    **worker.worker_metadata,
+                    "cancellation": message.payload,
+                }
             session.add(
                 MessageRecord(
                     id=message.id,
@@ -3143,18 +3150,7 @@ class RunnerRepository:
                 .scalars()
                 .all()
             )
-            return [
-                RunnerMessage(
-                    runner_id=record.runner_id,
-                    topic=record.topic,
-                    payload=record.payload,
-                    id=record.id,
-                    source=record.source,
-                    destination=record.destination,
-                    created_at=record.created_at,
-                )
-                for record in records
-            ]
+        return [await self._restore_message(record) for record in records]
 
     async def acknowledge_message(
         self, runner_id: str, message_id: str, consumer: str
@@ -3204,18 +3200,7 @@ class RunnerRepository:
                 .scalars()
                 .all()
             )
-            return [
-                RunnerMessage(
-                    runner_id=record.runner_id,
-                    topic=record.topic,
-                    payload=record.payload,
-                    id=record.id,
-                    source=record.source,
-                    destination=record.destination,
-                    created_at=record.created_at,
-                )
-                for record in records
-            ]
+        return [await self._restore_message(record) for record in records]
 
     async def acknowledge_messages(
         self, runner_id: str, message_ids: Sequence[str], consumer: str
@@ -3258,6 +3243,61 @@ class RunnerRepository:
                 )
             )
 
+    async def create_workers(
+        self, runner_id: str, steps: Sequence[RequestStep]
+    ) -> None:
+        """Persist lightweight identities before dependency waits or admission."""
+        if not steps:
+            return
+        if any(not step.step_id or len(step.step_id) > 128 for step in steps):
+            raise ValueError("Invalid Worker step identifier")
+        if len({step.step_id for step in steps}) != len(steps):
+            raise ValueError("Duplicate Worker step identifiers")
+        async with self.database.sessions() as session, session.begin():
+            await self._check_runtime(session)
+            runner = await session.get(
+                BenchmarkRunnerRecord, runner_id, with_for_update=True
+            )
+            if runner is None or runner.status != RUNNING or runner.cancel_requested:
+                raise ValueError("Runner is not accepting Worker creation")
+            existing_ids = set(
+                (
+                    await session.execute(
+                        select(WorkerRecord.step_id).where(
+                            WorkerRecord.runner_id == runner_id
+                        )
+                    )
+                ).scalars()
+            )
+            new_steps = [step for step in steps if step.step_id not in existing_ids]
+            if len(existing_ids) + len(new_steps) > runner.planned_workers:
+                raise ValueError("Worker is outside the declared request expansion")
+            created_at = utcnow()
+            for batch_start in range(0, len(new_steps), 1000):
+                worker_rows = [
+                    dict(
+                        id=worker_identity(runner_id, step.step_id),
+                        runner_id=runner_id,
+                        step_id=step.step_id,
+                        generation=self.runtime_generation,
+                        state="created",
+                        created_at=created_at,
+                        worker_metadata={
+                            "dependencies": list(step.dependencies),
+                            "message_sources": list(step.message_sources),
+                            "delay_seconds": step.delay_seconds,
+                            "due_at": step.due_at.isoformat() if step.due_at else None,
+                            "input_name": (
+                                step.request.preparation.input_name
+                                if step.request.preparation
+                                else None
+                            ),
+                        },
+                    )
+                    for step in new_steps[batch_start : batch_start + 1000]
+                ]
+                await session.execute(insert(WorkerRecord), worker_rows)
+
     async def reserve_worker(
         self, runner_id: str, step: RequestStep, window: Optional[int]
     ) -> bool:
@@ -3276,39 +3316,42 @@ class RunnerRepository:
             )
             if runner is None or runner.status != RUNNING or runner.cancel_requested:
                 return False
-            existing = await session.get(WorkerStepRecord, (runner_id, step.step_id))
-            if existing is not None:
+            existing = await session.get(
+                WorkerRecord, worker_identity(runner_id, step.step_id)
+            )
+            if existing is None:
+                raise ValueError("Worker must be created before submission")
+            if (
+                existing.state != "created"
+                or existing.generation != self.runtime_generation
+            ):
                 # A repeated reservation is never authorization for another send.
                 return False
-            count_rows = (
-                await session.execute(
-                    select(WorkerStepRecord.state, func.count())
-                    .where(WorkerStepRecord.runner_id == runner_id)
-                    .group_by(WorkerStepRecord.state)
+            if window is not None:
+                submitted_count = await session.scalar(
+                    select(func.count())
+                    .select_from(WorkerRecord)
+                    .where(
+                        WorkerRecord.runner_id == runner_id,
+                        WorkerRecord.state == "submitted",
+                    )
                 )
-            ).all()
-            counts = {state: count for state, count in count_rows}
-            planned_workers = planned_worker_count(runner.benchmark_config)
-            if window is not None and counts.get("submitted", 0) >= window:
-                raise ValueError("Runner outstanding Worker window exceeded")
-            if sum(counts.values()) >= planned_workers:
-                raise ValueError("Worker is outside the declared request expansion")
-            session.add(
-                WorkerStepRecord(
-                    runner_id=runner_id,
-                    step_id=step.step_id,
-                    generation=self.runtime_generation,
-                    state="submitted",
-                    submitted_at=utcnow(),
-                )
-            )
+                if submitted_count is not None and submitted_count >= window:
+                    raise ValueError("Runner outstanding Worker window exceeded")
+            existing.state = "submitted"
+            existing.submitted_at = utcnow()
         return True
 
     async def commit_worker(
         self, runner_id: str, result: WorkerResult
     ) -> Optional[RunnerMessage]:
         """Commit output once; successors may read it only after this returns."""
-
+        worker_id = worker_identity(runner_id, result.step_id)
+        stored_log = await asyncio.to_thread(
+            self.log_store.write_worker, runner_id, worker_id, result.completion()
+        )
+        log_key = stored_log.key
+        completion_hash = log_key.rsplit("/", 1)[-1].removesuffix(".json")
         async with self.database.sessions() as session, session.begin():
             await self._check_runtime(session)
             runner = await session.get(
@@ -3316,19 +3359,9 @@ class RunnerRepository:
             )
             if runner is None or runner.status != RUNNING:
                 return None
-            record = await session.get(WorkerStepRecord, (runner_id, result.step_id))
+            record = await session.get(WorkerRecord, worker_id)
             if record is None or record.generation != self.runtime_generation:
                 return None
-            output = json_safe(
-                {
-                    "metrics": result.response[0],
-                    "generated_text": result.response[1],
-                    "request": result.response[2].model_dump(mode="json"),
-                }
-            )
-            completion_hash = hashlib.sha256(
-                json.dumps(output, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
             message_id = str(
                 uuid5(NAMESPACE_URL, f"llmperf:{runner_id}:{result.step_id}:completed")
             )
@@ -3341,21 +3374,22 @@ class RunnerRepository:
                 return RunnerMessage(
                     runner_id=runner_id,
                     id=stored_message.id,
-                    topic=stored_message.topic,
-                    payload=stored_message.payload,
                     source=stored_message.source,
+                    topic=stored_message.topic,
                     destination=stored_message.destination,
+                    payload=stored_log.payload,
                     created_at=stored_message.created_at,
                 )
             record.state = SUCCEEDED if result.succeeded else FAILED
             record.completed_at = result.completed_at
             record.completion_hash = completion_hash
+            record.log_key = log_key
             committed_message = RunnerMessage(
                 runner_id=runner_id,
                 id=message_id,
                 source=result.step_id,
                 topic="worker.completed",
-                payload=json_safe(result.completion().model_dump(mode="json")),
+                payload=stored_log.payload,
                 created_at=result.completed_at,
             )
             session.add(
@@ -3365,11 +3399,36 @@ class RunnerRepository:
                     source=result.step_id,
                     destination="runner",
                     topic="worker.completed",
-                    payload=committed_message.payload,
+                    payload={"worker_id": worker_id, "log_key": log_key},
                     created_at=result.completed_at,
                 )
             )
         return committed_message
+
+    async def _restore_message(self, record: MessageRecord) -> RunnerMessage:
+        """Hydrate Worker text only when a mailbox consumer needs the completion."""
+        if record.topic == "worker.completed":
+            worker_id = record.payload.get("worker_id")
+            log_key = record.payload.get("log_key")
+            if not isinstance(worker_id, str) or not isinstance(log_key, str):
+                raise ValueError("Invalid Worker completion reference")
+            completion = await asyncio.to_thread(
+                self.log_store.read_worker, record.runner_id, worker_id, log_key
+            )
+            if completion.step_id != record.source:
+                raise ValueError("Worker completion identity mismatch")
+            restored_payload = json_safe(completion.model_dump(mode="json"))
+        else:
+            restored_payload = record.payload
+        return RunnerMessage(
+            runner_id=record.runner_id,
+            id=record.id,
+            topic=record.topic,
+            payload=restored_payload,
+            source=record.source,
+            destination=record.destination,
+            created_at=record.created_at,
+        )
 
     async def complete_runner(
         self,
@@ -3384,7 +3443,9 @@ class RunnerRepository:
     ) -> bool:
         if terminal_status not in {SUCCEEDED, FAILED}:
             raise ValueError(f"Unsupported result status: {terminal_status}")
-        log_key = await asyncio.to_thread(self.log_store.write, stdout, stderr)
+        log_key = await asyncio.to_thread(
+            self.log_store.write, runner_id, stdout, stderr
+        )
         safe_summary = json_safe(summary)
         safe_requests = [json_safe(item) for item in request_metrics]
         async with self.database.sessions() as session, session.begin():
@@ -3407,12 +3468,19 @@ class RunnerRepository:
                     "Atomic invocation requires exactly one request result"
                 )
             await session.execute(
-                update(WorkerStepRecord)
+                update(WorkerRecord)
                 .where(
-                    WorkerStepRecord.runner_id == runner_id,
-                    WorkerStepRecord.state == "submitted",
+                    WorkerRecord.runner_id == runner_id,
+                    WorkerRecord.state == "submitted",
                 )
                 .values(state="indeterminate", completed_at=completed_at)
+            )
+            await session.execute(
+                update(WorkerRecord)
+                .where(
+                    WorkerRecord.runner_id == runner_id, WorkerRecord.state == "created"
+                )
+                .values(state=CANCELLED, completed_at=completed_at)
             )
             await session.execute(
                 update(TaskAttemptRecord)
@@ -3513,7 +3581,9 @@ class RunnerRepository:
     ) -> bool:
         if status not in {FAILED, CANCELLED}:
             raise ValueError(f"Unsupported terminal status: {status}")
-        log_key = await asyncio.to_thread(self.log_store.write, stdout, stderr)
+        log_key = await asyncio.to_thread(
+            self.log_store.write, runner_id, stdout, stderr
+        )
         async with self.database.sessions() as session, session.begin():
             await self._check_runtime(session)
             statement = (
@@ -3535,12 +3605,19 @@ class RunnerRepository:
             runner.error_message = message
             runner.log_key = log_key
             await session.execute(
-                update(WorkerStepRecord)
+                update(WorkerRecord)
                 .where(
-                    WorkerStepRecord.runner_id == runner_id,
-                    WorkerStepRecord.state == "submitted",
+                    WorkerRecord.runner_id == runner_id,
+                    WorkerRecord.state == "submitted",
                 )
                 .values(state="indeterminate", completed_at=finished_at)
+            )
+            await session.execute(
+                update(WorkerRecord)
+                .where(
+                    WorkerRecord.runner_id == runner_id, WorkerRecord.state == "created"
+                )
+                .values(state=CANCELLED, completed_at=finished_at)
             )
             await session.execute(
                 update(TaskAttemptRecord)
@@ -3587,6 +3664,113 @@ class RunnerRepository:
             )
         return len(runner_ids)
 
+    async def _export_workers(
+        self, session: AsyncSession, runner_ids: Sequence[str]
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Export Worker metadata and log keys without loading any log bodies."""
+        if not runner_ids:
+            return {}
+        statement = (
+            select(WorkerRecord)
+            .where(WorkerRecord.runner_id.in_(runner_ids))
+            .order_by(WorkerRecord.runner_id, WorkerRecord.created_at, WorkerRecord.id)
+        )
+        records = (await session.execute(statement)).scalars().all()
+        exported: Dict[str, List[Dict[str, Any]]] = {}
+        for record in records:
+            exported.setdefault(record.runner_id, []).append(
+                {
+                    "worker_id": record.id,
+                    "step_id": record.step_id,
+                    "status": record.state,
+                    "created_at": record.created_at,
+                    "submitted_at": record.submitted_at,
+                    "completed_at": record.completed_at,
+                    "metadata": record.worker_metadata,
+                    "log_key": record.log_key,
+                }
+            )
+        return exported
+
+    async def list_workers(
+        self, runner_id: str, limit: int = 20, offset: int = 0
+    ) -> Dict[str, Any]:
+        """Page durable identities without reading metadata or log bodies."""
+        statement = (
+            select(WorkerRecord)
+            .options(
+                load_only(
+                    WorkerRecord.id,
+                    WorkerRecord.step_id,
+                    WorkerRecord.state,
+                    WorkerRecord.created_at,
+                    WorkerRecord.submitted_at,
+                    WorkerRecord.completed_at,
+                )
+            )
+            .where(WorkerRecord.runner_id == runner_id)
+            .order_by(WorkerRecord.created_at, WorkerRecord.id)
+            .limit(limit + 1)
+            .offset(offset)
+        )
+        async with self.database.sessions() as session:
+            records = (await session.execute(statement)).scalars().all()
+        page = WorkerPage(
+            items=[
+                WorkerSummary.model_validate(
+                    {
+                        "worker_id": record.id,
+                        "step_id": record.step_id,
+                        "status": record.state,
+                        "created_at": record.created_at,
+                        "submitted_at": record.submitted_at,
+                        "completed_at": record.completed_at,
+                    }
+                )
+                for record in records[:limit]
+            ],
+            limit=limit,
+            offset=offset,
+            next_offset=offset + limit if len(records) > limit else None,
+        )
+        return page.model_dump(mode="json")
+
+    async def get_worker_log(
+        self, runner_id: str, worker_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a Worker-owned log reference without consulting the mailbox."""
+        async with self.database.sessions() as session:
+            record = await session.get(WorkerRecord, worker_id)
+            if record is None or record.runner_id != runner_id:
+                return None
+            document: Dict[str, Any] = {
+                "worker_id": record.id,
+                "step_id": record.step_id,
+                "status": record.state,
+                "created_at": record.created_at,
+                "submitted_at": record.submitted_at,
+                "completed_at": record.completed_at,
+                "completion_available": record.log_key is not None,
+                "dependencies": record.worker_metadata.get("dependencies", []),
+                "message_sources": record.worker_metadata.get("message_sources", []),
+                "input_name": record.worker_metadata.get("input_name"),
+            }
+            cancellation = record.worker_metadata.get("cancellation")
+            if isinstance(cancellation, dict):
+                document["cancellation_reason"] = cancellation.get("reason")
+        if record.log_key is not None:
+            completion = await asyncio.to_thread(
+                self.log_store.read_worker, runner_id, worker_id, record.log_key
+            )
+            if completion.step_id != record.step_id:
+                raise ValueError("Worker completion identity mismatch")
+            document.update(
+                input_messages=completion.messages()[:-1],
+                output_text=completion.generated_text,
+                metrics=completion.metrics,
+            )
+        return WorkerLog.model_validate(document).model_dump(mode="json")
+
     async def get_results(
         self, runner_id: str, include_requests: bool
     ) -> Optional[Dict[str, Any]]:
@@ -3608,6 +3792,9 @@ class RunnerRepository:
                 )
                 records = (await session.execute(statement)).scalars().all()
                 response["requests"] = [record.metrics for record in records]
+                response["workers"] = (
+                    await self._export_workers(session, [runner_id])
+                ).get(runner_id, [])
             return response
 
     async def get_events(self, runner_id: str) -> Optional[List[Dict[str, Any]]]:
@@ -3696,11 +3883,19 @@ class RunnerRepository:
                 records = (await session.execute(request_statement)).scalars().all()
                 for record in records:
                     request_map.setdefault(record.runner_id, []).append(record.metrics)
+            worker_map = (
+                await self._export_workers(
+                    session, [runner.id for runner in runner_records]
+                )
+                if include_requests
+                else {}
+            )
             for runner in runner_records:
                 status_counts[runner.status] = status_counts.get(runner.status, 0) + 1
                 item = _runner_dict(runner)
                 if include_requests:
                     item["requests"] = request_map.get(runner.id, [])
+                    item["workers"] = worker_map.get(runner.id, [])
                 runners.append(item)
             plan_status_counts = {
                 plan_status: sum(plan.status == plan_status for plan in plan_records)

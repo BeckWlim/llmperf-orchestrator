@@ -3,7 +3,7 @@
 import asyncio
 from datetime import datetime, timezone
 import time
-from typing import Dict, Mapping, Optional, Protocol
+from typing import Dict, Mapping, Optional, Protocol, Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -21,6 +21,9 @@ from llmperf_backend.runtime.runner import WorkerResult
 
 
 class DispatchRepository(MessageStore, Protocol):
+    async def create_workers(
+        self, runner_id: str, steps: Sequence[RequestStep]
+    ) -> None: ...
     async def reserve_worker(
         self, runner_id: str, step: RequestStep, window: Optional[int]
     ) -> bool: ...
@@ -67,6 +70,11 @@ class WorkerDispatcher:
         self.buses[runner_id] = bus
         self.environments[runner_id] = dict(environment)
         return bus
+
+    async def create_workers(
+        self, runner_id: str, steps: Sequence[RequestStep]
+    ) -> None:
+        await self.repository.create_workers(runner_id, steps)
 
     async def submit(
         self, runner_id: str, step: RequestStep, window: Optional[int]

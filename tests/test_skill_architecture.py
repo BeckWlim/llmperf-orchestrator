@@ -102,7 +102,7 @@ def test_reporting_skill():
 def test_deployment_cutover():
     text = _text(".codex/skills/deploy-llmperf/references/deployment.md")
 
-    assert "first supported database contract" in text
-    assert "pre-release schema" in text
-    assert "separate database and service port" in text
-    assert "clean 1.0.0 schema" in text
+    assert "independent Worker metadata/file-reference layout" in text
+    assert "No automatic compatibility migration" in text
+    assert "separate database" in text and "service port" in text
+    assert "clean 1.0.3 schema" in text

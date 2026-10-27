@@ -5,6 +5,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from llmperf_cli.transport.client import ClientError
 from llmperf.configuration.environment import display_environment_value
+from llmperf.worker_logs import WorkerLog, WorkerPage
+from pydantic import ValidationError
 
 Projector = Callable[[Any, bool], Any]
 
@@ -148,6 +150,15 @@ def project_runner(document: Any, detailed: bool = False) -> Dict[str, Any]:
     if "plan_occurrence" in source:
         projected["plan_occurrence"] = source.get("plan_occurrence")
     projected.update(_worker_progress(source))
+    if "worker_list" in source:
+        try:
+            projected["worker_list"] = WorkerPage.model_validate(
+                source["worker_list"]
+            ).model_dump(mode="json")
+        except ValidationError as exc:
+            raise ClientError(
+                "Runner worker list has an invalid response shape"
+            ) from exc
     if detailed:
         projected.update(
             _pick(
@@ -809,6 +820,15 @@ def _runner_logs(document: Any, detailed: bool) -> Dict[str, Any]:
     result = project_runner(source)
     result["stdout"] = source.get("stdout")
     result["stderr"] = source.get("stderr")
+    if "worker_log" in source:
+        try:
+            result["worker_log"] = WorkerLog.model_validate(
+                source["worker_log"]
+            ).model_dump(mode="json")
+        except ValidationError as exc:
+            raise ClientError(
+                "Runner Worker log has an invalid response shape"
+            ) from exc
     return result
 
 
@@ -911,7 +931,7 @@ def _renderer(route: str, arguments: Any) -> str:
         getattr(arguments, "json", False) or getattr(arguments, "full", False)
     ):
         return "runner_summary"
-    if route == "runner.logs":
+    if route == "runner.logs" and not getattr(arguments, "json", False):
         return "runner_logs"
     if route == "campaign.logs" and not getattr(arguments, "json", False):
         return "campaign_logs"

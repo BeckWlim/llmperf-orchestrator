@@ -51,10 +51,10 @@ Production should use a dedicated non-superuser role and explicit host/database/
 Never print database passwords. SQLAlchemy `create_all` does not migrate an existing
 schema. Review schema differences, active Campaigns, and backups before upgrades.
 
-Version 1.0.0 is the first supported database contract. Do not start it against a
-pre-release schema: export anything still needed, back up PostgreSQL, then initialize a
-clean 1.0.0 schema. A separate database and service port is the safe parallel deployment
-option.
+Release 1.0.3 requires the independent Worker metadata/file-reference layout. Export
+anything still needed, back up PostgreSQL and the Runner log directory, then initialize a
+clean 1.0.3 schema. No automatic compatibility migration is provided. A separate database
+and service port supports parallel deployment. YAML/export format versions remain 1.0.0.
 
 ## Persisted Backend configuration
 

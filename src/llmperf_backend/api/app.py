@@ -1374,27 +1374,74 @@ def create_app(
         )
         return runner
 
+    @api.get("/runners/{runner_id}/workers", tags=["runners"])
+    async def get_runner_workers(
+        request: Request,
+        runner_id: str,
+        limit: int = Query(default=20, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> Dict[str, Any]:
+        repository = request.app.state.runner_repository
+        if not await repository.runner_exists(runner_id):
+            raise HTTPException(status_code=404, detail="Runner not found")
+        return await repository.list_workers(runner_id, limit, offset)
+
     @api.get("/runners/{runner_id}/logs", tags=["runners"])
-    async def get_runner_logs(request: Request, runner_id: str) -> Dict[str, Any]:
-        """Return only the persisted Worker identity and captured output."""
+    async def get_runner_logs(
+        request: Request,
+        runner_id: str,
+        worker_id: Optional[str] = Query(default=None, min_length=1, max_length=128),
+    ) -> Dict[str, Any]:
+        """Return saved Runner streams or one Worker's committed input/output."""
 
         runner = await request.app.state.runner_repository.get_runner(runner_id)
         if runner is None:
             raise HTTPException(status_code=404, detail="Runner not found")
+        worker_log = None
+        if worker_id is not None:
+            try:
+                worker_log = await request.app.state.runner_repository.get_worker_log(
+                    runner_id, worker_id
+                )
+            except (OSError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=503, detail="Worker completion unavailable"
+                ) from exc
+            if worker_log is None:
+                raise HTTPException(status_code=404, detail="Worker not found")
         try:
-            logs = await request.app.state.runner_repository.read_logs(
+            saved_logs = await request.app.state.runner_repository.read_logs(
                 runner.get("log_key")
             )
         except (OSError, ValueError) as exc:
             raise HTTPException(
                 status_code=503, detail="Runner log file unavailable"
             ) from exc
+        selected_logs = saved_logs
+        if worker_log is not None:
+            # The journal escapes identifiers with json.dumps; match the complete
+            # field so Worker "1" cannot select Worker "10" or a different Runner.
+            worker_marker = re.compile(
+                rf" worker={re.escape(json.dumps(worker_log['step_id'], ensure_ascii=True))}(?:\s|$)"
+            )
+            selected_logs = {
+                "stdout": "".join(
+                    line
+                    for line in (saved_logs.get("stdout") or "").splitlines(
+                        keepends=True
+                    )
+                    if worker_marker.search(line) is not None
+                    or line.startswith("[Earlier Runner events omitted:")
+                ),
+                "stderr": None,
+            }
         return {
             "runner_id": runner["runner_id"],
             "status": runner["status"],
             "scheduler_id": runner.get("scheduler_id"),
             "worker": runner.get("worker"),
-            **logs,
+            **selected_logs,
+            **({"worker_log": worker_log} if worker_log is not None else {}),
         }
 
     @api.post("/runners/{runner_id}/cancel", tags=["runners"])

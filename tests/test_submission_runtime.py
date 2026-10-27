@@ -1,6 +1,7 @@
 """Submission identity, inherited quotas and compact durable metadata."""
 
 import asyncio
+from uuid import uuid4
 
 import pytest
 
@@ -16,11 +17,13 @@ from llmperf_backend.storage.repository import (
 
 def test_log_files(tmp_path):
     store = RunnerLogStore(str(tmp_path), byte_limit=12)
-    key = store.write("long output: abcdefghijkl", "failure")
+    runner_id = str(uuid4())
+    key = store.write(runner_id, "long output: abcdefghijkl", "failure")
     assert key is not None
     assert store.read(key) == {"stdout": "abcdefghijkl", "stderr": "failure"}
-    assert store.write("abcdefghijkl", "failure") == key
-    assert store.write("", "") is None
+    assert store.write(runner_id, "abcdefghijkl", "failure") == key
+    assert store.write(runner_id, "", "") is None
+    assert key.startswith(f"{runner_id}/runner/")
     with pytest.raises(ValueError):
         store.read("../../secret")
     (tmp_path / key).write_text("changed")
@@ -28,6 +31,50 @@ def test_log_files(tmp_path):
         store.read(key)
     (tmp_path / key).unlink()
     assert store.read(key) == {"stdout": None, "stderr": None}
+
+
+def test_worker_log_files(tmp_path):
+    from llmperf.clients.models import RequestConfig
+    from llmperf_backend.runtime.messages import WorkerCompletion
+
+    store = RunnerLogStore(str(tmp_path), byte_limit=8)
+    runner_id = str(uuid4())
+    worker_id = str(uuid4())
+    completion = WorkerCompletion(
+        step_id="one",
+        metrics={
+            "error_code": "provider_error",
+            "error_msg": "sensitive body",
+            "ttft_s": float("nan"),
+        },
+        generated_text="完整输出" * 100,
+        request=RequestConfig(
+            model="test",
+            prompt=("完整输入" * 100, 400),
+            sampling_params={"Authorization": "secret-token", "temperature": 0.5},
+        ),
+    )
+    stored_log = store.write_worker(runner_id, worker_id, completion)
+    assert stored_log.key.startswith(f"{runner_id}/workers/{worker_id}/")
+    assert store.write_worker(runner_id, worker_id, completion) == stored_log
+    restored = store.read_worker(runner_id, worker_id, stored_log.key)
+    assert restored.generated_text == completion.generated_text
+    assert restored.request.prompt == completion.request.prompt
+    assert restored.metrics == {"error_code": "provider_error", "ttft_s": None}
+    assert restored.request.sampling_params == {"temperature": 0.5}
+    assert restored.model_dump(mode="json") == stored_log.payload
+    log_file = tmp_path / stored_log.key
+    assert log_file.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(ValueError, match="key"):
+        store.read_worker(runner_id, str(uuid4()), stored_log.key)
+    with pytest.raises(ValueError, match="key"):
+        store.read_worker(runner_id, worker_id, "../outside.json")
+    log_file.write_text("corrupt")
+    with pytest.raises(ValueError, match="digest"):
+        store.read_worker(runner_id, worker_id, stored_log.key)
+    log_file.unlink()
+    with pytest.raises(FileNotFoundError):
+        store.read_worker(runner_id, worker_id, stored_log.key)
 
 
 @pytest.mark.postgresql

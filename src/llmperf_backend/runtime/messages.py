@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -14,6 +15,40 @@ from llmperf.clients.models import RequestConfig
 LOGGER = logging.getLogger(__name__)
 
 
+def _log_value(value: JsonValue) -> JsonValue:
+    """Exclude transport credentials and raw Provider bodies from durable logs."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, list):
+        return [_log_value(item) for item in value]
+    if isinstance(value, dict):
+        safe_document: dict[str, JsonValue] = {}
+        for name, item in value.items():
+            normalized_name = name.lower().replace("-", "_")
+            if normalized_name in {
+                "headers",
+                "response_headers",
+                "base_url",
+                "api_base",
+                "error_msg",
+            } or any(
+                fragment in normalized_name
+                for fragment in (
+                    "api_key",
+                    "apikey",
+                    "authorization",
+                    "password",
+                    "secret",
+                    "credential",
+                    "private_key",
+                )
+            ):
+                continue
+            safe_document[name] = _log_value(item)
+        return safe_document
+    return value
+
+
 class WorkerCompletion(BaseModel):
     """Durable message data used for both result aggregation and later request inputs."""
 
@@ -22,6 +57,12 @@ class WorkerCompletion(BaseModel):
     metrics: dict[str, Any]
     generated_text: str
     request: RequestConfig
+
+    def for_storage(self) -> "WorkerCompletion":
+        document = TypeAdapter(dict[str, JsonValue]).validate_python(
+            self.model_dump(mode="json")
+        )
+        return WorkerCompletion.model_validate(_log_value(document))
 
     def messages(self) -> list[dict[str, Any]]:
         """Reuse the executed request's message structure and append its response."""

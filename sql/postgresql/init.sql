@@ -164,7 +164,7 @@ CREATE TABLE runners (
 	summary JSONB,
 	request_count INTEGER NOT NULL,
 	error_message TEXT,
-	log_key VARCHAR(80),
+    log_key VARCHAR(256),
 	planned_workers INTEGER NOT NULL,
 	PRIMARY KEY (id),
 	CONSTRAINT uq_runner_plan_occurrence UNIQUE (runner_plan_id, plan_occurrence),
@@ -333,21 +333,28 @@ CREATE TABLE runner_attempts (
 
 
 CREATE TABLE workers (
+	id VARCHAR(36) NOT NULL,
 	runner_id VARCHAR(36) NOT NULL,
 	step_id VARCHAR(128) NOT NULL,
 	generation INTEGER NOT NULL,
 	state VARCHAR(20) NOT NULL,
-	submitted_at TIMESTAMP WITH TIME ZONE NOT NULL,
+	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+	submitted_at TIMESTAMP WITH TIME ZONE,
 	completed_at TIMESTAMP WITH TIME ZONE,
+	metadata JSONB NOT NULL,
+	log_key VARCHAR(256),
 	completion_hash VARCHAR(64),
-	PRIMARY KEY (runner_id, step_id),
-	CONSTRAINT ck_worker_step_state CHECK (state IN ('submitted', 'succeeded', 'failed', 'cancelled', 'indeterminate')),
+	PRIMARY KEY (id),
+	CONSTRAINT uq_worker_runner_step UNIQUE (runner_id, step_id),
+	CONSTRAINT ck_worker_state CHECK (state IN ('created', 'submitted', 'succeeded', 'failed', 'cancelled', 'indeterminate')),
 	FOREIGN KEY(runner_id) REFERENCES runners (id) ON DELETE CASCADE
 )
 
 ;
 
 CREATE INDEX ix_worker_runner_state ON workers (runner_id, state);
+
+CREATE INDEX ix_worker_runner_created ON workers (runner_id, created_at, id);
 
 
 CREATE TABLE conversation_messages (

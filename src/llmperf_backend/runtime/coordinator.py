@@ -257,3 +257,5 @@ class RuntimeCoordinator:
             except Exception as exc:
                 self.last_error = type(exc).__name__
                 LOGGER.exception("Runtime reconciliation failed; durable work retained")
+                # An expired deadline must not turn a failed read into a tight loop.
+                await asyncio.sleep(self.interval_seconds)

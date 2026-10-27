@@ -112,7 +112,7 @@ part of the release surface.
 
 | Surface | Version marker | Current version |
 |---|---|---|
-| Python distribution and CLI | package `version` | `1.0.1` |
+| Python distribution and CLI | package `version` | `1.0.3` |
 | Backend configuration YAML | root `version` | string `"1.0.0"` |
 | Runner and Campaign YAML/JSON | root `version` | string `"1.0.0"` |
 | HTTP control plane | route prefix | `/api/v1` |
@@ -124,8 +124,10 @@ part of the release surface.
 | Render plan and review | `render_plan_version` / `render_review_version` | string `"1.0.0"` |
 | Hugging Face cache-link manifest | `schema` suffix | `llmperf-huggingface-cache-links/1.0.0` |
 
-Release 1.0.1 introduces incompatible storage layouts and canonical Worker output fields.
-Existing installations require an explicit schema cutover. Document-format markers remain
+Release 1.0.3 introduces independent Worker metadata, global Worker IDs, and completion
+files within each Runner's log folder. Runtime queues and execution handles stay in memory;
+PostgreSQL stores durable milestones and file references. Existing installations require
+a fresh schema; no compatibility migration is provided. Document-format markers remain
 at 1.0.0 and are versioned independently from the package release.
 
 `llmperf.version` is the runtime authority for release, protocol, and compiled-task format

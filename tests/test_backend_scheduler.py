@@ -29,6 +29,9 @@ from llmperf_backend.runtime.messages import RunnerMessage
 class UnusedRepository:
     """Complete Scheduler repository stub that rejects unexpected persistence calls."""
 
+    async def create_workers(self, runner_id, steps) -> None:
+        raise AssertionError("create_workers is not expected")
+
     async def reserve_worker(self, runner_id, step, window) -> bool:
         raise AssertionError("reserve_worker is not expected")
 
@@ -661,6 +664,79 @@ def test_maintenance_failure_stops():
         assert scheduler._stop.is_set()
         assert scheduler.status()["runtime_error"] == "RuntimeError"
         scheduler._atomic_executor.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_shutdown_lease_cleanup():
+    async def exercise():
+        renewed = asyncio.Event()
+        executing = asyncio.Event()
+
+        class DrainRepository(UnusedRepository):
+            async def renew_runtime(self):
+                renewed.set()
+
+            async def release_runtime(self):
+                assert renewed.is_set()
+
+        scheduler = Scheduler(
+            DrainRepository(),
+            SchedulerConfig(),
+            DatabaseConfig(),
+            ProviderRegistry([], allow_empty=True),
+        )
+        scheduler._stop = asyncio.Event()
+
+        async def execution():
+            executing.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                assert scheduler.coordinator.task is None
+                await renewed.wait()
+
+        async def reconciliation():
+            await asyncio.Event().wait()
+
+        scheduler.coordinator.task = asyncio.create_task(reconciliation())
+        execution_task = asyncio.create_task(execution())
+        scheduler._execution_tasks.add(execution_task)
+        await executing.wait()
+        scheduler._maintenance_task = asyncio.create_task(scheduler._maintain_runtime())
+        await asyncio.wait_for(scheduler.stop(), 1)
+        assert execution_task.done()
+        assert scheduler._maintenance_task is None
+        assert scheduler._stop is None
+
+    asyncio.run(exercise())
+
+
+def test_reconciliation_backoff():
+    from llmperf_backend.runtime.coordinator import RuntimeCoordinator, ReconcileHint
+
+    async def exercise():
+        failed = asyncio.Event()
+
+        class FailingRepository(UnusedRepository):
+            attempts = 0
+
+            async def runtime_snapshot(self, runner_id=None):
+                self.attempts += 1
+                failed.set()
+                raise RuntimeError("fenced")
+
+        repository = FailingRepository()
+        coordinator = RuntimeCoordinator(repository, interval_seconds=0.2)
+        coordinator.notifier.publish(ReconcileHint())
+        coordinator.task = asyncio.create_task(coordinator._run())
+        try:
+            await asyncio.wait_for(failed.wait(), 1)
+            await asyncio.sleep(0.02)
+            assert repository.attempts == 1
+            assert coordinator.last_error == "RuntimeError"
+        finally:
+            await asyncio.wait_for(coordinator.stop(), 1)
 
     asyncio.run(exercise())
 

@@ -124,9 +124,10 @@ progression, and interrupted Runners remain indeterminate rather than being repl
 
 Pool telemetry is sampled separately from PostgreSQL counts and may briefly disagree.
 Its age is exposed. Unavailable or stale execution telemetry is null (`-`), not zero.
-Legacy or interrupted Runners without creation evidence have unknown creation counts.
-Reservation counts cover the durable Worker dispatcher; older execution paths may
-lack them. Campaign lifecycle and outcome remain separate from Worker progress.
+Durable creation counts come from the independent `workers` table. Live preparation
+counts may briefly precede the batched metadata commit. Queue, admission, and running
+counts remain runtime telemetry; they are not persisted as Worker states. Release 1.0.3
+requires a fresh schema. Campaign lifecycle and outcome remain separate from Worker progress.
 
 ## Deadlines and cache evidence
 

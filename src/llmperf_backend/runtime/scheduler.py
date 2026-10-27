@@ -212,6 +212,7 @@ class Scheduler:
         if self._stop is None:
             return
         self._stop.set()
+        await self.coordinator.stop()
         for task in self._runner_tasks:
             task.cancel()
         if self._runner_tasks:
@@ -226,7 +227,6 @@ class Scheduler:
             await asyncio.gather(self._ray_monitor_task, return_exceptions=True)
             self._ray_monitor_task = None
         await self._stop_ray_runtime()
-        await self.coordinator.stop()
         await self.repository.release_runtime()
         self._runner_tasks.clear()
         self._busy_runners.clear()
@@ -247,7 +247,9 @@ class Scheduler:
         next_heartbeat_at = loop.time()
         heartbeat_seconds = min(5.0, self.config.stale_after_seconds / 3.0)
         try:
-            while self._stop is not None and not self._stop.is_set():
+            # Stop admission first, but renew ownership until execution cleanup ends.
+            # stop() cancels this task explicitly after durable finalization.
+            while self._stop is not None:
                 if loop.time() >= next_renewal_at:
                     await self.repository.renew_runtime()
                     next_renewal_at = loop.time() + 5.0

@@ -73,7 +73,7 @@ credential fields, oversized values, and normal-command tracebacks.
 | default query | stable text projection | operation logs | allow-listed fields |
 | `--json` | same projection as JSON | operation logs | allow-listed fields |
 | `--full` | detailed projection | operation logs | expanded allow-list |
-| `logs` | bounded Worker streams | operation logs | stdout/stderr |
+| `logs` | bounded Worker streams; `--worker` also includes complete committed text | operation logs | stdout/stderr and selected Worker input/output |
 | `export -o` | silent by default | file/result status | versioned export |
 | start/cancel | silent by default | IDs and transitions | operation summary |
 
